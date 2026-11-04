@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
 namespace Microsoft.Management.Deployment.Projection
@@ -70,6 +70,18 @@ namespace Microsoft.Management.Deployment.Projection
                 }
             },
 
+            [typeof(DownloadOptions)] = new()
+            {
+                ProjectedClassType = typeof(DownloadOptions),
+                InterfaceType = typeof(IDownloadOptions),
+                Clsids = new Dictionary<ClsidContext, Guid>()
+                {
+                    [ClsidContext.InProc] = new Guid("4288DF96-FDC9-4B68-B403-193DBBF56A24"),
+                    [ClsidContext.OutOfProc] = new Guid("4CBABE76-7322-4BE4-9CEA-2589A80682DC"),
+                    [ClsidContext.OutOfProcDev] = new Guid("8EF324ED-367C-4880-83E5-BB2ABD0B72F6"),
+                }
+            },
+
             [typeof(PackageMatchFilter)] = new()
             {
                 ProjectedClassType = typeof(PackageMatchFilter),
@@ -82,6 +94,18 @@ namespace Microsoft.Management.Deployment.Projection
                 }
             },
 
+            [typeof(AuthenticationArguments)] = new()
+            {
+                ProjectedClassType = typeof(AuthenticationArguments),
+                InterfaceType = typeof(IAuthenticationArguments),
+                Clsids = new Dictionary<ClsidContext, Guid>()
+                {
+                    [ClsidContext.InProc] = new Guid("8D593114-1CF1-43B9-8722-4DBB30103296"),
+                    [ClsidContext.OutOfProc] = new Guid("BA580786-BDE3-4F6C-B8F3-44698AC8711A"),
+                    [ClsidContext.OutOfProcDev] = new Guid("6484A61D-50FA-41F0-B71E-F4370C6EB37C"),
+                }
+            },
+
             [typeof(PackageManagerSettings)] = new()
             {
                 ProjectedClassType = typeof(PackageManagerSettings),
@@ -89,6 +113,54 @@ namespace Microsoft.Management.Deployment.Projection
                 Clsids = new Dictionary<ClsidContext, Guid>()
                 {
                     [ClsidContext.InProc] = new Guid("80CF9D63-5505-4342-B9B4-BB87895CA8BB"),
+                }
+            },
+
+            [typeof(RepairOptions)] = new ()
+            {
+                ProjectedClassType = typeof(RepairOptions),
+                InterfaceType = typeof(IRepairOptions),
+                Clsids = new Dictionary<ClsidContext, Guid>()
+                {
+                    [ClsidContext.InProc] = new Guid("30C024C4-852C-4DD4-9810-1348C51EF9BB"),
+                    [ClsidContext.OutOfProc] = new Guid("0498F441-3097-455F-9CAF-148F28293865"),
+                    [ClsidContext.OutOfProcDev] = new Guid("E62BB1E7-C7B2-4AEC-9E28-FB649B30FF03"),
+                }
+            },
+
+            [typeof(AddPackageCatalogOptions)] = new()
+            {
+                ProjectedClassType = typeof(AddPackageCatalogOptions),
+                InterfaceType = typeof(IAddPackageCatalogOptions),
+                Clsids = new Dictionary<ClsidContext, Guid>()
+                {
+                    [ClsidContext.InProc] = new Guid("24E6F1FA-E4C3-4ACD-965D-DF213FD58F15"),
+                    [ClsidContext.OutOfProc] = new Guid("DB9D012D-00D7-47EE-8FB1-606E10AC4F51"),
+                    [ClsidContext.OutOfProcDev] = new Guid("D58C7E4C-70E6-476C-A5D4-80341ED80252"),
+                }
+            },
+
+            [typeof(RemovePackageCatalogOptions)] = new()
+            {
+                ProjectedClassType = typeof(RemovePackageCatalogOptions),
+                InterfaceType = typeof(IRemovePackageCatalogOptions),
+                Clsids = new Dictionary<ClsidContext, Guid>()
+                {
+                    [ClsidContext.InProc] = new Guid("1125D3A6-E2CE-479A-91D5-71A3F6F8B00B"),
+                    [ClsidContext.OutOfProc] = new Guid("032B1C58-B975-469B-A013-E632B6ECE8D8"),
+                    [ClsidContext.OutOfProcDev] = new Guid("87A96609-1A39-4955-BE72-7174E147B7DC"),
+                }
+            },
+
+            [typeof(EditPackageCatalogOptions)] = new()
+            {
+                ProjectedClassType = typeof(EditPackageCatalogOptions),
+                InterfaceType = typeof(IEditPackageCatalogOptions),
+                Clsids = new Dictionary<ClsidContext, Guid>()
+                {
+                    [ClsidContext.InProc] = new Guid("E8E12FE1-AB77-40C4-A562-E91FB51B4E82"),
+                    [ClsidContext.OutOfProc] = new Guid("A9F5E736-68CE-463C-BA6D-DE968F0CCE04"),
+                    [ClsidContext.OutOfProcDev] = new Guid("29B19238-81AD-4A8E-A2FC-ADF17C38CAEB"),
                 }
             }
         };

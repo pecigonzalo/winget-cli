@@ -142,7 +142,7 @@ void OutputAllArgumentAliases(Command& command, std::ostream& out, bool includeC
 
     for (const auto& a : args)
     {
-        if (a.Alias() != Argument::NoAlias)
+        if (a.Alias() != ArgumentCommon::NoAlias)
         {
             out << APPINSTALLER_CLI_ARGUMENT_IDENTIFIER_CHAR << a.Alias() << std::endl;
         }
@@ -230,6 +230,9 @@ struct CompletionTestCommand : public Command
     {
         return Arguments;
     }
+
+    CLI::Resource::LocString ShortDescription() const override { return {}; }
+    CLI::Resource::LocString LongDescription() const override { return {}; }
 
     using Command::Complete;
 

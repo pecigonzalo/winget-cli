@@ -2,12 +2,25 @@
 // Licensed under the MIT License.
 #include "pch.h"
 #include "ExecutionReporter.h"
+#include <AppInstallerErrors.h>
+#include <charconv>
+#include <limits>
 
 
 namespace AppInstaller::CLI::Execution
 {
     using namespace Settings;
     using namespace VirtualTerminal;
+
+#ifndef AICLI_DISABLE_TEST_HOOKS
+    using ReadConsoleFunction = std::function<BOOL(wchar_t*, DWORD, DWORD*)>;
+    static ReadConsoleFunction* s_readConsoleOverride = nullptr;
+
+    void TestHook_SetReadConsole_Override(ReadConsoleFunction* value)
+    {
+        s_readConsoleOverride = value;
+    }
+#endif
 
     const Sequence& HelpCommandEmphasis = TextFormat::Foreground::Bright;
     const Sequence& HelpArgumentEmphasis = TextFormat::Foreground::Bright;
@@ -17,6 +30,47 @@ namespace AppInstaller::CLI::Execution
     const Sequence& IdEmphasis = TextFormat::Foreground::BrightCyan;
     const Sequence& UrlEmphasis = TextFormat::Foreground::BrightBlue;
     const Sequence& PromptEmphasis = TextFormat::Foreground::Bright;
+    const Sequence& ConvertToUpgradeFlowEmphasis = TextFormat::Foreground::BrightYellow;
+    const Sequence& ConfigurationIntentEmphasis = TextFormat::Foreground::Bright;
+    const Sequence& ConfigurationUnitEmphasis = TextFormat::Foreground::BrightCyan;
+    const Sequence& AuthenticationEmphasis = TextFormat::Foreground::BrightYellow;
+
+    namespace
+    {
+        BOOL ReadConsoleChunk(wchar_t* buffer, DWORD size, DWORD* charactersRead)
+        {
+#ifndef AICLI_DISABLE_TEST_HOOKS
+            if (s_readConsoleOverride)
+            {
+                return (*s_readConsoleOverride)(buffer, size, charactersRead);
+            }
+#endif
+            return ReadConsoleW(GetStdHandle(STD_INPUT_HANDLE), buffer, size, charactersRead, nullptr);
+        }
+
+        DWORD GetStdHandleType(DWORD stdHandle)
+        {
+            DWORD result = FILE_TYPE_UNKNOWN;
+
+            HANDLE handle = GetStdHandle(stdHandle);
+            if (handle != INVALID_HANDLE_VALUE && handle != NULL)
+            {
+                result = GetFileType(handle);
+            }
+
+            return result;
+        }
+    }
+
+    Reporter::Reporter() :
+        Reporter(std::cout, std::cin)
+    {
+        m_outStreamFileType = GetStdHandleType(STD_OUTPUT_HANDLE);
+        m_inStreamFileType = GetStdHandleType(STD_INPUT_HANDLE);
+        DWORD mode = 0;
+        m_consoleStreams = GetConsoleMode(GetStdHandle(STD_INPUT_HANDLE), &mode) &&
+            GetConsoleMode(GetStdHandle(STD_OUTPUT_HANDLE), &mode);
+    }
 
     Reporter::Reporter(std::ostream& outStream, std::istream& inStream) :
         Reporter(std::make_shared<BaseStream>(outStream, true, ConsoleModeRestore::Instance().IsVTEnabled()), inStream)
@@ -26,10 +80,18 @@ namespace AppInstaller::CLI::Execution
 
     Reporter::Reporter(std::shared_ptr<BaseStream> outStream, std::istream& inStream) :
         m_out(outStream),
-        m_in(inStream),
-        m_progressBar(std::in_place, *m_out, ConsoleModeRestore::Instance().IsVTEnabled()),
-        m_spinner(std::in_place, *m_out, ConsoleModeRestore::Instance().IsVTEnabled())
+        m_in(inStream)
     {
+        // Only create spinner and progress bar when stdout is attached to a console.
+        // When output is redirected to a file or pipe, suppress all progress output
+        // so it does not appear in the redirected stream.
+        if (GetConsoleWidth().has_value())
+        {
+            auto sixelSupported = [&]() { return SixelsSupported(); };
+            m_spinner = IIndefiniteSpinner::CreateForStyle(*m_out, ConsoleModeRestore::Instance().IsVTEnabled(), VisualStyle::Accent, sixelSupported);
+            m_progressBar = IProgressBar::CreateForStyle(*m_out, ConsoleModeRestore::Instance().IsVTEnabled(), VisualStyle::Accent, sixelSupported);
+        }
+
         SetProgressSink(this);
     }
 
@@ -41,14 +103,38 @@ namespace AppInstaller::CLI::Execution
     Reporter::Reporter(const Reporter& other, clone_t) :
         Reporter(other.m_out, other.m_in)
     {
+        m_outStreamFileType = other.m_outStreamFileType;
+        m_inStreamFileType = other.m_inStreamFileType;
+        m_consoleStreams = other.m_consoleStreams;
+
+        SetChannel(other.m_channel);
+
         if (other.m_style.has_value())
         {
             SetStyle(*other.m_style);
         }
     }
 
+    std::optional<PrimaryDeviceAttributes> Reporter::GetPrimaryDeviceAttributes()
+    {
+        if (ConsoleModeRestore::Instance().IsVTEnabled())
+        {
+            return PrimaryDeviceAttributes{ m_out->Get(), m_in };
+        }
+        else
+        {
+            return std::nullopt;
+        }
+    }
+
     OutputStream Reporter::GetOutputStream(Level level)
     {
+        // If the level is not enabled, return a default stream which is disabled
+        if (WI_AreAllFlagsClear(m_enabledLevels, level))
+        {
+            return OutputStream(*m_out, false, false);
+        }
+
         OutputStream result = GetBasicOutputStream();
 
         switch (level)
@@ -92,29 +178,186 @@ namespace AppInstaller::CLI::Execution
     void Reporter::SetStyle(VisualStyle style)
     {
         m_style = style;
-        if (m_spinner)
+
+        if (m_channel == Channel::Output && GetConsoleWidth().has_value())
         {
-            m_spinner->SetStyle(style);
+            auto sixelSupported = [&]() { return SixelsSupported(); };
+            m_spinner = IIndefiniteSpinner::CreateForStyle(*m_out, ConsoleModeRestore::Instance().IsVTEnabled(), style, sixelSupported);
+            m_progressBar = IProgressBar::CreateForStyle(*m_out, ConsoleModeRestore::Instance().IsVTEnabled(), style, sixelSupported);
         }
-        if (m_progressBar)
-        {
-            m_progressBar->SetStyle(style);
-        }
+
         if (style == VisualStyle::NoVT)
         {
             m_out->SetVTEnabled(false);
         }
     }
 
-    bool Reporter::PromptForBoolResponse(Resource::LocString message, Level level)
+    std::istream& Reporter::RawInputStream()
     {
+        return m_in;
+    }
+
+    bool Reporter::InputStreamIsInteractive() const
+    {
+        AICLI_LOG(CLI, Verbose, << "Reporter::m_inStreamFileType is " << m_inStreamFileType);
+        return m_inStreamFileType == FILE_TYPE_CHAR;
+    }
+
+    bool Reporter::CanPrompt(Level level)
+    {
+        return m_consoleStreams && GetOutputStream(level).IsEnabled();
+    }
+
+    std::optional<std::string> Reporter::ReadLine(std::function<bool()> isCancelled)
+    {
+        THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), !m_consoleStreams);
+
+        if (isCancelled && isCancelled())
+        {
+            return std::nullopt;
+        }
+
+        wil::unique_handle inputThread;
+        THROW_IF_WIN32_BOOL_FALSE(DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(),
+            inputThread.put(), THREAD_TERMINATE, FALSE, 0));
+
+        std::string response;
+        bool readSucceeded = false;
+        DWORD readError = ERROR_SUCCESS;
+        ProgressCallback progress;
+        wil::unique_event readCompleted{ wil::EventOptions::ManualReset };
+        wil::unique_event cancellationCompleted{ wil::EventOptions::ManualReset };
+        auto cancellation = progress.SetCancellationFunction([&]()
+        {
+            // Retry until the read ends to cover cancellation immediately before it starts.
+            while (!readCompleted.wait(10))
+            {
+                if (!CancelSynchronousIo(inputThread.get()))
+                {
+                    DWORD error = GetLastError();
+                    if (error != ERROR_NOT_FOUND)
+                    {
+                        LOG_WIN32(error);
+                    }
+                }
+            }
+            cancellationCompleted.SetEvent();
+        });
+        SetProgressCallback(&progress);
+        {
+            auto unregister = wil::scope_exit([&]()
+            {
+                readCompleted.SetEvent();
+                SetProgressCallback(nullptr);
+            });
+            if (!isCancelled || !isCancelled())
+            {
+                if (m_inStreamFileType == FILE_TYPE_CHAR)
+                {
+                    std::wstring consoleResponse;
+                    do
+                    {
+                        wchar_t buffer[256];
+                        DWORD charactersRead = 0;
+                        SetLastError(ERROR_SUCCESS);
+                        // The CRT loses ERROR_OPERATION_ABORTED when Ctrl+C ends a console read.
+                        bool succeeded = ReadConsoleChunk(buffer, ARRAYSIZE(buffer), &charactersRead);
+                        readError = GetLastError();
+                        readSucceeded = succeeded && charactersRead != 0;
+                        if (!readSucceeded || readError == ERROR_OPERATION_ABORTED)
+                        {
+                            break;
+                        }
+                        consoleResponse.append(buffer, charactersRead);
+                    } while (consoleResponse.back() != L'\n');
+                    if (readError == ERROR_OPERATION_ABORTED)
+                    {
+                        readCompleted.SetEvent();
+                        // The console read can end before the Ctrl+C handler records cancellation.
+                        if (!isCancelled || !isCancelled())
+                        {
+                            cancellationCompleted.wait();
+                        }
+                    }
+                    response = Utility::ConvertToUTF8(consoleResponse);
+                    readSucceeded = readSucceeded && response.find('\x1a') == std::string::npos;
+                }
+                else
+                {
+                    SetLastError(ERROR_SUCCESS);
+                    readSucceeded = static_cast<bool>(std::getline(m_in, response));
+                    readError = GetLastError();
+                }
+            }
+        }
+        if (progress.IsCancelledBy(CancelReason::Any) || (isCancelled && isCancelled()) || readError == ERROR_OPERATION_ABORTED)
+        {
+            return std::nullopt;
+        }
+        THROW_HR_IF(APPINSTALLER_CLI_ERROR_PROMPT_INPUT_ERROR, !readSucceeded);
+        return response;
+    }
+
+    std::optional<uint64_t> Reporter::PromptForIntegerResponse(Resource::LocString message, Level level,
+        Resource::LocString invalid, std::function<bool()> isCancelled)
+    {
+        return PromptForIntegerResponseWithinRange(std::move(message), 0, std::numeric_limits<uint64_t>::max(),
+            level, std::move(invalid), std::move(isCancelled));
+    }
+
+    std::optional<uint64_t> Reporter::PromptForIntegerResponseWithinRange(Resource::LocString message, uint64_t minimum, uint64_t maximum,
+        Level level, Resource::LocString invalid, std::function<bool()> isCancelled)
+    {
+        THROW_HR_IF(E_INVALIDARG, minimum > maximum);
+
+        if (!CanPrompt(level))
+        {
+            AICLI_LOG(CLI, Verbose, << "Skipping integer prompt. Console streams or output are unavailable.");
+            return std::nullopt;
+        }
+
+        auto out = GetOutputStream(level);
+        for (;;)
+        {
+            if (isCancelled && isCancelled())
+            {
+                return std::nullopt;
+            }
+
+            out << message << ' ' << std::flush;
+            auto response = ReadLine(isCancelled);
+            if (!response || (isCancelled && isCancelled()))
+            {
+                return std::nullopt;
+            }
+
+            Utility::Trim(*response);
+            uint64_t value = 0;
+            auto result = std::from_chars(response->data(), response->data() + response->size(), value);
+            if (result.ec == std::errc{} && result.ptr == response->data() + response->size() && value >= minimum && value <= maximum)
+            {
+                return value;
+            }
+
+            out << invalid << std::endl;
+        }
+    }
+
+    bool Reporter::PromptForBoolResponse(Resource::LocString message, Level level, bool resultIfDisabled)
+    {
+        auto out = GetOutputStream(level);
+
+        if (!out.IsEnabled())
+        {
+            return resultIfDisabled;
+        }
+
         const std::vector<BoolPromptOption> options
         {
             BoolPromptOption{ Resource::String::PromptOptionYes, 'Y', true },
             BoolPromptOption{ Resource::String::PromptOptionNo, 'N', false },
         };
 
-        auto out = GetOutputStream(level);
         out << message << std::endl;
 
         // Try prompting until we get a recognized option
@@ -139,7 +382,6 @@ namespace AppInstaller::CLI::Execution
             std::string response;
             if (!std::getline(m_in, response))
             {
-                m_in.get();
                 THROW_HR(APPINSTALLER_CLI_ERROR_PROMPT_INPUT_ERROR);
             }
 
@@ -159,13 +401,23 @@ namespace AppInstaller::CLI::Execution
     void Reporter::PromptForEnter(Level level)
     {
         auto out = GetOutputStream(level);
+        if (!out.IsEnabled())
+        {
+            return;
+        }
+
         out << std::endl << Resource::String::PressEnterToContinue << std::endl;
         m_in.get();
     }
 
-    std::filesystem::path Reporter::PromptForPath(Resource::LocString message, Level level)
+    std::filesystem::path Reporter::PromptForPath(Resource::LocString message, Level level, std::filesystem::path resultIfDisabled)
     {
         auto out = GetOutputStream(level);
+
+        if (!out.IsEnabled())
+        {
+            return resultIfDisabled;
+        }
 
         // Try prompting until we get a valid answer
         for (;;)
@@ -213,6 +465,14 @@ namespace AppInstaller::CLI::Execution
         }
     }
 
+    void Reporter::SetProgressMessage(std::string_view message)
+    {
+        if (m_spinner)
+        {
+            m_spinner->SetMessage(message);
+        }
+    }
+
     void Reporter::BeginProgress()
     {
         GetBasicOutputStream() << VirtualTerminal::Cursor::Visibility::DisableShow;
@@ -226,16 +486,58 @@ namespace AppInstaller::CLI::Execution
         {
             m_progressBar->EndProgress(hideProgressWhenDone);
         }
+        SetProgressMessage({});
         GetBasicOutputStream() << VirtualTerminal::Cursor::Visibility::EnableShow;
     };
+
+    Reporter::AsyncProgressScope::AsyncProgressScope(Reporter& reporter, IProgressSink* sink, bool hideProgressWhenDone) :
+        m_reporter(reporter), m_callback(sink)
+    {
+        reporter.SetProgressCallback(&m_callback);
+        sink->BeginProgress();
+        m_hideProgressWhenDone = hideProgressWhenDone;
+    }
+
+    Reporter::AsyncProgressScope::~AsyncProgressScope()
+    {
+        m_reporter.get().SetProgressCallback(nullptr);
+        m_callback.GetSink()->EndProgress(m_hideProgressWhenDone);
+    }
+
+    ProgressCallback& Reporter::AsyncProgressScope::Callback()
+    {
+        return m_callback;
+    }
+
+    IProgressCallback* Reporter::AsyncProgressScope::operator->()
+    {
+        return &m_callback;
+    }
+
+    bool Reporter::AsyncProgressScope::HideProgressWhenDone() const
+    {
+        return m_hideProgressWhenDone;
+    }
+
+    void Reporter::AsyncProgressScope::HideProgressWhenDone(bool value)
+    {
+        m_hideProgressWhenDone.store(value);
+    }
+
+    std::unique_ptr<Reporter::AsyncProgressScope> Reporter::BeginAsyncProgress(bool hideProgressWhenDone)
+    {
+        return std::make_unique<AsyncProgressScope>(*this, m_progressSink.load(), hideProgressWhenDone);
+    }
 
     void Reporter::SetProgressCallback(ProgressCallback* callback)
     {
         auto lock = m_progressCallbackLock.lock_exclusive();
+        // Attempting two progress operations at the same time; not supported.
+        THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), m_progressCallback != nullptr && callback != nullptr);
         m_progressCallback = callback;
     }
 
-    void Reporter::CancelInProgressTask(bool force)
+    void Reporter::CancelInProgressTask(bool force, CancelReason reason)
     {
         // TODO: Maybe ask the user if they really want to cancel?
         UNREFERENCED_PARAMETER(force);
@@ -243,7 +545,11 @@ namespace AppInstaller::CLI::Execution
         ProgressCallback* callback = m_progressCallback.load();
         if (callback)
         {
-            callback->Cancel();
+            if (!callback->IsCancelledBy(CancelReason::Any))
+            {
+                callback->SetProgressMessage(Resource::String::CancellingOperation());
+                callback->Cancel(reason);
+            }
         }
     }
 
@@ -254,5 +560,28 @@ namespace AppInstaller::CLI::Execution
             m_out->Disable();
         }
         m_out->RestoreDefault();
+    }
+
+    void Reporter::SetLevelMask(Level reporterLevel, bool setEnabled) {
+
+        if (setEnabled)
+        {
+            WI_SetAllFlags(m_enabledLevels, reporterLevel);
+        }
+        else
+        {
+            WI_ClearAllFlags(m_enabledLevels, reporterLevel);
+        }
+    }
+
+    bool Reporter::SixelsSupported()
+    {
+        auto attributes = GetPrimaryDeviceAttributes();
+        return (attributes ? attributes->Supports(PrimaryDeviceAttributes::Extension::Sixel) : false);
+    }
+
+    bool Reporter::SixelsEnabled()
+    {
+        return Settings::User().Get<Settings::Setting::EnableSixelDisplay>() && SixelsSupported();
     }
 }

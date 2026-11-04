@@ -1,10 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 #pragma once
-#include "SQLiteWrapper.h"
+#include <winget/SQLiteWrapper.h>
 #include "Microsoft/Schema/ISQLiteIndex.h"
-#include "Microsoft/Schema/Version.h"
-#include "Microsoft/SQLiteStorageBase.h"
+#include <winget/SQLiteVersion.h>
+#include <winget/SQLiteStorageBase.h>
 #include "ISource.h"
 #include <AppInstallerLanguageUtilities.h>
 #include <AppInstallerVersions.h>
@@ -23,7 +23,7 @@
 namespace AppInstaller::Repository::Microsoft
 {
     // Holds the connection to the database, as well as the appropriate functionality to interface with it.
-    struct SQLiteIndex : SQLiteStorageBase
+    struct SQLiteIndex : SQLite::SQLiteStorageBase
     {
         // An id that refers to a specific application.
         using IdType = SQLite::rowid_t;
@@ -37,6 +37,9 @@ namespace AppInstaller::Repository::Microsoft
         // Options for creating a new index.
         using CreateOptions = Schema::ISQLiteIndex::CreateOptions;
 
+        // The type of version keys.
+        using VersionKey = Schema::ISQLiteIndex::VersionKey;
+
         SQLiteIndex(const SQLiteIndex&) = delete;
         SQLiteIndex& operator=(const SQLiteIndex&) = delete;
 
@@ -44,18 +47,52 @@ namespace AppInstaller::Repository::Microsoft
         SQLiteIndex& operator=(SQLiteIndex&&) = default;
 
         // Creates a new index database of the given version.
-        static SQLiteIndex CreateNew(const std::string& filePath, Schema::Version version = Schema::Version::Latest(), CreateOptions options = CreateOptions::None);
+        static SQLiteIndex CreateNew(const std::string& filePath, SQLite::Version version = SQLite::Version::Latest(), CreateOptions options = CreateOptions::None);
 
         // Opens an existing SQLiteIndex database.
-        static SQLiteIndex Open(const std::string& filePath, OpenDisposition disposition, Utility::ManagedFile&& indexFile = {})
-        {
-            return { filePath, disposition, std::move(indexFile) };
-        }
+        static SQLiteIndex Open(const std::string& filePath, OpenDisposition disposition, Utility::ManagedFile&& indexFile = {});
+
+        // Creates a copy of the given index.
+        static SQLiteIndex CopyFrom(const std::string& filePath, SQLiteIndex& source);
+
+        // Opens a delta index combined with its baseline for reading.
+        // The delta is the main connection; the baseline is attached and temp views are created
+        // so that existing search code operates transparently across both.
+        // The disposition applies to both files, because the pair is only meaningful as a unit.
+        // Both files may be given to be held open for the lifetime of the index, as the caller may
+        // have extracted either of them to a temporary location.
+        static SQLiteIndex OpenWithBaseline(
+            const std::string& deltaFilePath,
+            const std::string& baselineFilePath,
+            OpenDisposition disposition = OpenDisposition::Read,
+            Utility::ManagedFile&& deltaFile = {},
+            Utility::ManagedFile&& baselineFile = {});
+
+        // What a delta records about the baseline that it must be paired with.
+        using DeltaBaselineLocator = Schema::ISQLiteIndex::DeltaBaselineLocator;
+
+        // Gets what this delta records about the baseline that it must be paired with.
+        //
+        // Returns nothing when this is not a delta, or does not fully name a baseline. Safe to
+        // ask of any index, including one whose version predates deltas.
+        std::optional<DeltaBaselineLocator> GetDeltaBaselineLocator() const;
+
+        // Gets the identifier that designates this index as a baseline, if it carries one.
+        //
+        // Returns nothing for any index that has not been designated, which is every index not
+        // prepared with DeltaMarkAsBaseline. Such an index cannot be paired with a delta.
+        std::optional<std::string> GetBaselineIdentifier() const;
 
 #ifndef AICLI_DISABLE_TEST_HOOKS
         // Changes the version of the interface being used to operate on the database.
         // Should only be used for testing.
-        void ForceVersion(const Schema::Version& version);
+        void ForceVersion(const SQLite::Version& version);
+
+        // Gets the latest version of the index schema (the actual numbers, not just the latest sentinel values).
+        static SQLite::Version GetLatestVersion();
+
+        // Gets the context data for testing.
+        const Schema::SQLiteIndexContextData& GetContextData() const;
 #endif
 
         // Adds the manifest at the repository relative path to the index.
@@ -85,6 +122,18 @@ namespace AppInstaller::Repository::Microsoft
         // The return value indicates whether the index was modified by the function.
         bool UpdateManifest(const Manifest::Manifest& manifest);
 
+        // Adds or updates the manifest with matching { Id, Version, Channel } in the index.
+        // The return value indicates whether the manifest was added (true) or updated (false).
+        bool AddOrUpdateManifest(const std::filesystem::path& manifestPath, const std::filesystem::path& relativePath);
+
+        // Updates the manifest with matching { Id, Version, Channel } in the index.
+        // The return value indicates whether the manifest was added (true) or updated (false).
+        bool AddOrUpdateManifest(const Manifest::Manifest& manifest, const std::filesystem::path& relativePath);
+
+        // Updates the manifest with matching { Id, Version, Channel } in the index.
+        // The return value indicates whether the manifest was added (true) or updated (false).
+        bool AddOrUpdateManifest(const Manifest::Manifest& manifest);
+
         // Removes the manifest with matching { Id, Version, Channel } from the index.
         void RemoveManifest(const std::filesystem::path& manifestPath, const std::filesystem::path& relativePath);
 
@@ -102,16 +151,23 @@ namespace AppInstaller::Repository::Microsoft
 
         // Checks the consistency of the index to ensure that every referenced row exists.
         // Returns true if index is consistent; false if it is not.
+        //
+        // What that means depends on what the database is and on the properties that have been
+        // set. A delta is not an index in its own right: on its own only what it says about itself
+        // can be checked, and DeltaBaselineIndexPath additionally checks the merged form.
+        // DeltaComparisonIndexPath requires the result -- the merged form for such a delta, or the
+        // database itself for any other index -- to present the same data as the index it names.
+        // Equivalence includes package identity, so the two must share lineage.
         bool CheckConsistency(bool log = false) const;
 
         // Performs a search based on the given criteria.
         SearchResult Search(const SearchRequest& request) const;
 
-        // Gets the string for the given property and manifest id, if present.
-        std::optional<std::string> GetPropertyByManifestId(IdType manifestId, PackageVersionProperty property) const;
+        // Gets the string for the given property and primary id, if present.
+        std::optional<std::string> GetPropertyByPrimaryId(IdType primaryId, PackageVersionProperty property) const;
 
-        // Gets the string values for the given property and manifest id, if present.
-        std::vector<std::string> GetMultiPropertyByManifestId(IdType manifestId, PackageVersionMultiProperty property) const;
+        // Gets the string values for the given property and primary id, if present.
+        std::vector<std::string> GetMultiPropertyByPrimaryId(IdType primaryId, PackageVersionMultiProperty property) const;
 
         // Gets the manifest id for the given { id, version, channel }, if present.
         // If version is empty, gets the value for the 'latest' version.
@@ -121,7 +177,7 @@ namespace AppInstaller::Repository::Microsoft
         std::optional<IdType> GetManifestIdByManifest(const Manifest::Manifest& manifest) const;
 
         // Gets all versions and channels for the given id.
-        std::vector<Utility::VersionAndChannel> GetVersionKeysById(IdType id) const;
+        std::vector<VersionKey> GetVersionKeysById(IdType id) const;
 
         // Gets the string for the given metadata and manifest id, if present.
         MetadataResult GetMetadataByManifestId(SQLite::rowid_t manifestId) const;
@@ -136,20 +192,51 @@ namespace AppInstaller::Repository::Microsoft
         // Get all the dependencies for a specific manifest.
         std::set<std::pair<SQLite::rowid_t, Utility::NormalizedString>> GetDependenciesByManifestRowId(SQLite::rowid_t manifestRowId) const;
         std::vector<std::pair<SQLite::rowid_t, Utility::NormalizedString>> GetDependentsById(AppInstaller::Manifest::string_t packageId) const;
+
+        // Migrates the index to the target version.
+        // Returns false to indicate that the requested migration is not supported.
+        bool MigrateTo(SQLite::Version version);
+
+        // The property values that can be set.
+        enum class Property
+        {
+            PackageUpdateTrackingBaseTime,
+            IntermediateFileOutputPath,
+            DeltaBaselineIndexPath,
+            DeltaOutputPath,
+            DeltaBaselineRelativeSourcePath,
+            DeltaBaselinePackageVersion,
+            DeltaMarkAsBaseline,
+            DeltaComparisonIndexPath,
+        };
+
+        // Sets the given property.
+        // Some properties will persist into the database.
+        void SetProperty(Property property, const std::string& value);
+
     private:
         // Constructor used to create a new index.
-        SQLiteIndex(const std::string& target, Schema::Version version);
+        SQLiteIndex(const std::string& target, const SQLite::Version& version, CreateOptions options);
 
         // Constructor used to open an existing index.
         SQLiteIndex(const std::string& target, SQLiteStorageBase::OpenDisposition disposition, Utility::ManagedFile&& indexFile);
 
+        SQLiteIndex(const SQLite::DatabaseSpecifier& specifier, std::vector<Utility::ManagedFile>&& files);
+
+        // Constructor used to copy the given index.
+        SQLiteIndex(const std::string& target, SQLiteIndex& source);
+
+        // Sets the database file path in the context data if appropriate.
+        void SetDatabaseFilePath(const std::string& target);
+
         // Internal functions to normalize on the relativePath being present.
         IdType AddManifestInternal(const Manifest::Manifest& manifest, const std::optional<std::filesystem::path>& relativePath);
+        IdType AddManifestInternalHoldingLock(const Manifest::Manifest& manifest, const std::optional<std::filesystem::path>& relativePath);
         bool UpdateManifestInternal(const Manifest::Manifest& manifest, const std::optional<std::filesystem::path>& relativePath);
-
-        // Creates the ISQLiteIndex interface object for this version.
-        std::unique_ptr<Schema::ISQLiteIndex> CreateISQLiteIndex() const;
+        bool UpdateManifestInternalHoldingLock(const Manifest::Manifest& manifest, const std::optional<std::filesystem::path>& relativePath);
+        bool AddOrUpdateManifestInternal(const Manifest::Manifest& manifest, const std::optional<std::filesystem::path>& relativePath);
 
         std::unique_ptr<Schema::ISQLiteIndex> m_interface;
+        Schema::SQLiteIndexContextData m_contextData;
     };
 }

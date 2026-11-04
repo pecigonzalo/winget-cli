@@ -264,11 +264,13 @@
             "type": "string",
             "enum": [
               "packageInUse",
+              "packageInUseByApplication",
               "installInProgress",
               "fileInUse",
               "missingDependency",
               "diskFull",
               "insufficientMemory",
+              "invalidParameter",
               "noNetwork",
               "contactSupport",
               "rebootRequiredToFinish",
@@ -278,6 +280,7 @@
               "alreadyInstalled",
               "downgrade",
               "blockedByPolicy",
+              "systemNotSupported",
               "custom"
             ]
           },
@@ -285,7 +288,8 @@
             "$ref": "#/definitions/Url",
             "description": "The return response url to provide additional guidance for expected return codes"
           }
-        }
+        },
+        "required": [ "InstallerReturnCode", "ReturnResponse" ]
       },
       "maxItems": 128,
       "description": "Installer exit codes for common errors"
@@ -315,7 +319,7 @@
         "type": "string",
         "maxLength": 2048
       },
-      "maxItems": 16,
+      "maxItems": 64,
       "uniqueItems": true,
       "description": "List of protocols the package provides a handler for"
     },

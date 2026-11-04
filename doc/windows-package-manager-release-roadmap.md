@@ -24,7 +24,7 @@ The Windows Package Manager project is engineered and delivered as described bel
 
 #### Release
 
-* Available from to Windows Insiders through the [Microsoft Store](https://www.microsoft.com/p/app-installer/9nblggh4nns1) & [GitHub Releases](https://github.com/microsoft/winget-cli/releases)
+* Available from to Windows Insiders through the [Microsoft Store](https://apps.microsoft.com/detail/9nblggh4nns1) & [GitHub Releases](https://github.com/microsoft/winget-cli/releases)
 * Release Notes & Announcement Blog published
 * Engineering System Maintenance
 * Community Engagement
@@ -37,14 +37,17 @@ Releases will be available here on GitHub first. We will release to the App Inst
 
 ## GitHub Milestones
 
-We use [GitHub milestones](https://github.com/microsoft/winget-cli/milestones) to broadly organize what we intend to work on. Dates are only used for sequencing and do not represent a commitment.
+We use [GitHub Projects](https://github.com/orgs/microsoft/projects/137) to broadly organize what we intend to work on.  Issues will be added to milestones when we're reasonably confident they will land in the next milestone. Dates in [GitHub milestones](https://github.com/microsoft/winget-cli/milestones) are only used for sequencing and do not represent a commitment.
 
-| Milestone | Description |
-|    ---    |     ---     |
-| [v1.4-Client](https://github.com/microsoft/winget-cli/milestone/38) | Work Targeted for v1.4 |
-| [v1.5-Client](https://github.com/microsoft/winget-cli/milestone/39) | Work Targeted for v1.5 |
-| [v.Next-Client](https://github.com/microsoft/winget-cli/milestone/34) | Triage for the next Milestone |
-| [Backlog-Client](https://github.com/microsoft/winget-cli/milestone/2) | Work not yet assigned to a milestone or release |
+| Milestone                                                                                                     | Description                                     | Status             |
+| ------------------------------------------------------------------------------------------------------------- | ----------------------------------------------- | ------------------ |
+| [v1.12-Client](https://github.com/microsoft/winget-cli/milestone/47)                                          | Work Targeted for v1.12                         | :white_check_mark: |
+| [v1.28-Client](https://github.com/microsoft/winget-cli/milestone/48)                                          | Work Targeted for v1.28                         | :white_check_mark: |
+| [v1.29-Client](https://github.com/microsoft/winget-cli/milestone/49)                                          | Work Targeted for v1.29                         | :white_check_mark: |
+| [v2.0-Client](https://github.com/microsoft/winget-cli/milestone/41)                                           | Work Targeted for breaking-change Release       | :rocket:           |
+| [Backlog-Client](https://github.com/microsoft/winget-cli/issues?q=is%3Aissue%20state%3Aopen%20no%3Amilestone) | Work not yet assigned to a milestone or release | N/A                |
+
+Older milestones can be found in the [list of closed milestones](https://github.com/microsoft/winget-cli/milestones?state=closed).
 
 ## Issue Triage & Prioritization
 
@@ -55,3 +58,4 @@ Incoming issues/asks/etc. are triaged several times a week, labelled appropriate
 * Issues/features/asks not on our list of the features of next release is assigned to the [Windows Package Manager Backlog](https://github.com/microsoft/winget-cli/milestone/2) for subsequent triage, prioritization & scheduling.
 
 #### Feature Priorities will be influenced by community feedback on issues.
+

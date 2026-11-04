@@ -19,11 +19,27 @@ namespace AppInstaller::Repository
         SourceDetailsInternal() = default;
         SourceDetailsInternal(const SourceDetails& details) : SourceDetails(details) {}
 
-        // Copies the metadata fields from this to target.
+        // Copies the metadata fields to this target.
         void CopyMetadataFieldsTo(SourceDetailsInternal& target);
+
+        // Copies the metadata fields from this source. This only include partial metadata.
+        void CopyMetadataFieldsFrom(const SourceDetails& source);
+
+        // Resets all metadata fields to their default (clean-install) state.
+        void ResetMetadataFields();
+
+        // Copies the overridden fields from the target source to this source. This is only the supported override fields.
+        void CopyOverrideFieldsFrom(const SourceDetails& overrideSource);
+
+        // Sorts by Priority with higher values coming first in the order.
+        bool operator<(const SourceDetailsInternal& other) const;
 
         // If true, this is a tombstone, marking the deletion of a source at a lower priority origin.
         bool IsTombstone = false;
+
+        // If true, this is an override of a source at a lower priority. An override source only defines
+        // changes on top of the lower priority source, otherwise uses the same as the lower priority source.
+        bool IsOverride = false;
 
         // If false, this is not visible in GetCurrentSource or GetAllSources, it's only available when explicitly requested.
         bool IsVisible = true;
@@ -52,9 +68,14 @@ namespace AppInstaller::Repository
         // Source includes ones in tombstone
         SourceDetailsInternal* GetSource(std::string_view name);
 
-        // Add/remove a current source
+        // Add/remove/edit a current source
         void AddSource(const SourceDetailsInternal& details);
         void RemoveSource(const SourceDetailsInternal& details);
+        void EditSource(const SourceDetailsInternal& details);
+
+        // Reset a default source: removes any user-level entry (tombstone or override)
+        // and clears the source's metadata, restoring it to clean-install state.
+        void ResetSource(const SourceDetailsInternal& details);
 
         // Save source metadata; the particular source with the metadata update is given.
         // The given source must already be in the internal source list.
@@ -80,6 +101,9 @@ namespace AppInstaller::Repository
         // calls std::find_if and return the iterator.
         auto FindSource(std::string_view name, bool includeHidden = false);
 
+        // Tries to find a named source from the specified origin.
+        [[nodiscard]] bool TryFindSourceByOrigin(std::string_view name, SourceOrigin origin, SourceDetailsInternal& targetSourceOut, bool includeHidden = false);
+
         std::vector<SourceDetailsInternal> GetSourcesByOrigin(SourceOrigin origin);
         // Does *NOT* set metadata; call SaveMetadataInternal afterward.
         [[nodiscard]] bool SetSourcesByOrigin(SourceOrigin origin, const std::vector<SourceDetailsInternal>& sources);
@@ -90,6 +114,9 @@ namespace AppInstaller::Repository
         // Save source metadata; the particular source with the metadata update is given.
         // If remove is true, the given source is being removed.
         void SaveMetadataInternal(const SourceDetailsInternal& details, bool remove = false);
+
+        // Clears all metadata for the named source and persists the change.
+        void ResetMetadataInternal(const SourceDetailsInternal& details);
 
         std::vector<SourceDetailsInternal> m_sourceList;
         Settings::Stream m_userSourcesStream;

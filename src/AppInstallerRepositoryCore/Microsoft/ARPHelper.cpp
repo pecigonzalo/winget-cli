@@ -77,35 +77,63 @@ namespace AppInstaller::Repository::Microsoft
             AICLI_LOG(Repo, Info, << "Reading MSI UpgradeCodes");
             std::map<std::string, std::string> upgradeCodes;
 
-            // There is no UpgradeCodes key on the x86 view of the registry
-            Registry::Key upgradeCodesKey = Registry::Key::OpenIfExists(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Installer\\UpgradeCodes", 0, KEY_READ | KEY_WOW64_64KEY);
-
-            if (upgradeCodesKey)
+            try
             {
-                for (const auto& upgradeCodeKeyRef : upgradeCodesKey)
+                // There is no UpgradeCodes key on the x86 view of the registry
+                Registry::Key upgradeCodesKey = Registry::Key::OpenIfExists(HKEY_LOCAL_MACHINE, "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Installer\\UpgradeCodes", 0, KEY_READ | KEY_WOW64_64KEY);
+
+                if (upgradeCodesKey)
                 {
-                    auto upgradeCode = TryUnpackUpgradeCodeGuid(upgradeCodeKeyRef.Name());
-                    if (upgradeCode)
+                    for (const auto& upgradeCodeKeyRef : upgradeCodesKey)
                     {
-                        auto upgradeCodeKey = upgradeCodeKeyRef.Open();
-                        for (const auto& productCodeValue : upgradeCodeKey.Values())
+                        std::string keyName;
+
+                        try
                         {
-                            auto productCode = TryUnpackUpgradeCodeGuid(productCodeValue.Name());
-                            if (productCode)
+                            keyName = upgradeCodeKeyRef.Name();
+                            auto upgradeCode = TryUnpackUpgradeCodeGuid(keyName);
+                            if (upgradeCode)
                             {
-                                upgradeCodes[*productCode] = *upgradeCode;
+                                auto upgradeCodeKey = upgradeCodeKeyRef.Open();
+                                for (const auto& productCodeValue : upgradeCodeKey.Values())
+                                {
+                                    auto productCode = TryUnpackUpgradeCodeGuid(productCodeValue.Name());
+                                    if (productCode)
+                                    {
+                                        upgradeCodes[*productCode] = *upgradeCode;
+                                    }
+                                }
                             }
                         }
+                        CATCH_LOG_MSG("Failed to read upgrade code: %hs", keyName.c_str());
                     }
                 }
             }
+            CATCH_LOG_MSG("Failed to read upgrade codes.");
 
             return upgradeCodes;
         }
     }
 
+#ifndef AICLI_DISABLE_TEST_HOOKS
+    using GetARPKeyFunc = std::function<Registry::Key(Manifest::ScopeEnum, Utility::Architecture)>;
+    static GetARPKeyFunc s_GetARPKey_Override;
+
+    void SetGetARPKeyOverride(GetARPKeyFunc value)
+    {
+        s_GetARPKey_Override = value;
+    }
+#endif
+
     Registry::Key ARPHelper::GetARPKey(Manifest::ScopeEnum scope, Utility::Architecture architecture) const
     {
+#ifndef AICLI_DISABLE_TEST_HOOKS
+        if (s_GetARPKey_Override)
+        {
+            return s_GetARPKey_Override(scope, architecture);
+        }
+#endif
+
         HKEY rootKey = NULL;
 
         switch (scope)
@@ -188,6 +216,44 @@ namespace AppInstaller::Repository::Microsoft
         {
             return {};
         }
+    }
+
+    Registry::Key ARPHelper::FindARPEntry(const std::string& productCode, Manifest::ScopeEnum scope) const
+    {
+        if (productCode.empty())
+        {
+            return {};
+        }
+
+        std::vector<Manifest::ScopeEnum> scopesToSearch;
+        if (scope == Manifest::ScopeEnum::Unknown)
+        {
+            scopesToSearch = { Manifest::ScopeEnum::User, Manifest::ScopeEnum::Machine };
+        }
+        else
+        {
+            scopesToSearch = { scope };
+        }
+
+        for (auto scopeToSearch : scopesToSearch)
+        {
+            for (auto architecture : Utility::GetApplicableArchitectures())
+            {
+                Registry::Key arpRootKey = GetARPKey(scopeToSearch, architecture);
+                if (arpRootKey)
+                {
+                    for (const auto& entry : arpRootKey)
+                    {
+                        if (Utility::CaseInsensitiveEquals(productCode, entry.Name()))
+                        {
+                            return entry.Open();
+                        }
+                    }
+                }
+            }
+        }
+
+        return {};
     }
 
     bool ARPHelper::GetBoolValue(const Registry::Key& arpKey, const std::wstring& name)
@@ -319,7 +385,7 @@ namespace AppInstaller::Repository::Microsoft
 
     void ARPHelper::PopulateIndexFromKey(SQLiteIndex& index, const Registry::Key& key, std::string_view scope, std::string_view architecture, const std::map<std::string, std::string>& upgradeCodes) const
     {
-        AICLI_LOG(Repo, Info, << "Examining ARP entries for " << scope << " | " << architecture);
+        AICLI_LOG(Repo, Verbose, << "Examining ARP entries for " << scope << " | " << architecture);
 
         for (const auto& arpEntry : key)
         {
@@ -332,12 +398,13 @@ namespace AppInstaller::Repository::Microsoft
                 Manifest::Manifest manifest;
                 manifest.DefaultLocalization.Add<Manifest::Localization::Tags>({ "ARP" });
 
-                // Use the key name as the Id, as it is supposed to be unique.
-                // TODO: We probably want something better here, like constructing the value as
-                //       `Publisher.DisplayName`. We would need to ensure that there are no matches
-                //       against the rest of the data however (might happen if same package is
-                //       installed for multiple architectures/languages).
-                manifest.Id = productCode;
+                // Construct a unique name for this entry
+                const char separator = '\\';
+
+                std::ostringstream stream;
+                stream << "ARP" << separator << scope << separator << architecture << separator << productCode;
+
+                manifest.Id = stream.str();
 
                 manifest.Installers.emplace_back();
                 // TODO: This likely needs some cleanup applied, as it looks like INNO tends to append an "_is#"
@@ -363,12 +430,18 @@ namespace AppInstaller::Repository::Microsoft
                     continue;
                 }
                 auto displayNameValue = displayName->GetValue<Registry::Value::Type::String>();
-                manifest.DefaultLocalization.Add<Manifest::Localization::PackageName>(displayNameValue);
                 if (displayNameValue.empty())
                 {
                     AICLI_LOG(Repo, Verbose, << "Skipping " << productCode << " because DisplayName is empty");
                     continue;
                 }
+
+                manifest.DefaultLocalization.Add<Manifest::Localization::PackageName>(displayNameValue);
+                // Add DisplayName to ARP entries too
+                // This is to help normalized publisher and name correlation where ARP DisplayName matching
+                // will be getting improved in future iterations.
+                manifest.Installers[0].AppsAndFeaturesEntries.emplace_back();
+                manifest.Installers[0].AppsAndFeaturesEntries[0].DisplayName = displayNameValue;
 
                 // If no version can be determined, ignore this entry
                 manifest.Version = DetermineVersion(arpKey);
@@ -404,7 +477,6 @@ namespace AppInstaller::Repository::Microsoft
                     auto upgradeCodeItr = upgradeCodes.find(productCode);
                     if (upgradeCodeItr != upgradeCodes.end())
                     {
-                        manifest.Installers[0].AppsAndFeaturesEntries.emplace_back();
                         manifest.Installers[0].AppsAndFeaturesEntries[0].UpgradeCode = upgradeCodeItr->second;
                     }
                 }
@@ -420,7 +492,7 @@ namespace AppInstaller::Repository::Microsoft
                 try
                 {
                     // Use the ProductCode as a unique key for the path
-                    manifestIdOpt = index.AddManifest(manifest, Utility::ConvertToUTF16(manifest.Installers[0].ProductCode));
+                    manifestIdOpt = index.AddManifest(manifest);
                 }
                 catch (...)
                 {
@@ -459,6 +531,11 @@ namespace AppInstaller::Repository::Microsoft
                 AddMetadataIfPresent(arpKey, UninstallString, index, manifestId, PackageVersionMetadata::StandardUninstallCommand);
                 AddMetadataIfPresent(arpKey, QuietUninstallString, index, manifestId, PackageVersionMetadata::SilentUninstallCommand);
 
+                // Pick up ModifyPath for repair.
+                AddMetadataIfPresent(arpKey, ModifyPath, index, manifestId, PackageVersionMetadata::StandardModifyCommand);
+                AddMetadataIfPresent(arpKey, NoModify, index, manifestId, PackageVersionMetadata::NoModify);
+                AddMetadataIfPresent(arpKey, NoRepair, index, manifestId, PackageVersionMetadata::NoRepair);
+
                 // Pick up Language to enable proper selection of language for upgrade.
                 AddMetadataIfPresent(arpKey, Language, index, manifestId, PackageVersionMetadata::InstalledLocale);
 
@@ -477,5 +554,35 @@ namespace AppInstaller::Repository::Microsoft
                 LOG_CAUGHT_EXCEPTION();
             }
         }
+    }
+
+    std::vector<wil::unique_registry_watcher> ARPHelper::CreateRegistryWatchers(Manifest::ScopeEnum scope, std::function<void(Manifest::ScopeEnum, Utility::Architecture, wil::RegistryChangeKind)> callback)
+    {
+        std::vector<wil::unique_registry_watcher> result;
+
+        auto addToResult = [&](Manifest::ScopeEnum scopeToUse)
+            {
+                for (auto architecture : Utility::GetApplicableArchitectures())
+                {
+                    Registry::Key arpRootKey = GetARPKey(scopeToUse, architecture);
+
+                    if (arpRootKey)
+                    {
+                        result.emplace_back(wil::make_registry_watcher(arpRootKey, L"", true, [scopeToUse, architecture, callback](wil::RegistryChangeKind change) { callback(scopeToUse, architecture, change); }));
+                    }
+                }
+            };
+
+        if (scope == Manifest::ScopeEnum::Unknown)
+        {
+            addToResult(Manifest::ScopeEnum::User);
+            addToResult(Manifest::ScopeEnum::Machine);
+        }
+        else
+        {
+            addToResult(scope);
+        }
+
+        return result;
     }
 }

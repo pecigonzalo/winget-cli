@@ -2,67 +2,204 @@
 // Licensed under the MIT License.
 #include "pch.h"
 #include "Microsoft/PreIndexedPackageSourceFactory.h"
-#include "Microsoft/SQLiteIndex.h"
+#include "Microsoft/PreIndexed/IndexForm.h"
+#include "Microsoft/PreIndexed/PackageStore.h"
+#include "Microsoft/PreIndexed/SourceData.h"
 #include "Microsoft/SQLiteIndexSource.h"
+#include "SourceUpdateChecks.h"
 
-#include <AppInstallerDeployment.h>
-#include <AppInstallerMsixInfo.h>
-#include <winget/ManagedFile.h>
+#include <AppInstallerDateTime.h>
+#include <winget/ExperimentalFeature.h>
 
 using namespace std::string_literals;
 using namespace std::string_view_literals;
+using namespace AppInstaller::Repository::Microsoft::PreIndexed;
 
 namespace AppInstaller::Repository::Microsoft
 {
     namespace
     {
-        static constexpr std::string_view s_PreIndexedPackageSourceFactory_PackageFileName = "source.msix"sv;
-        static constexpr std::string_view s_PreIndexedPackageSourceFactory_IndexFileName = "index.db"sv;
-        // TODO: This being hard coded to force using the Public directory name is not ideal.
-        static constexpr std::string_view s_PreIndexedPackageSourceFactory_IndexFilePath = "Public\\index.db"sv;
-
-        // Construct the package location from the given details.
-        // Currently expects that the arg is an https uri pointing to the root of the data.
-        std::string GetPackageLocation(const SourceDetails& details)
+        // Whether a source may be composed of a delta and a baseline rather than a full index.
+        bool IsDeltaIndexEnabled()
         {
-            THROW_HR_IF(E_INVALIDARG, details.Arg.empty());
-            std::string result = details.Arg;
-            if (result.back() != '/')
+            return Settings::ExperimentalFeature::IsEnabled(Settings::ExperimentalFeature::Feature::DeltaIndex);
+        }
+
+        // Selects the form to use when opening a source.
+        std::unique_ptr<IIndexForm> SelectFormForOpen(const SourceDetails& details)
+        {
+            if (IsDeltaIndexEnabled())
             {
-                result += '/';
+                auto deltaForm = CreateDeltaIndexForm(details);
+
+                // While experimental, lock on to delta if we have the bare minimum.
+                // Falling back to the full form is quite complex and may result in hiding issues.
+                if (deltaForm->HasIdentities())
+                {
+                    return deltaForm;
+                }
             }
-            result += s_PreIndexedPackageSourceFactory_PackageFileName;
-            return result;
+
+            return CreateFullIndexForm(details);
         }
 
-        // Gets the package family name from the details.
-        std::string GetPackageFamilyNameFromDetails(const SourceDetails& details)
+        // Measures how long opening a source took, and which path got there.
+        struct SourceOpenTimer
         {
-            THROW_HR_IF(E_UNEXPECTED, details.Data.empty());
-            return details.Data;
-        }
+            using clock = std::chrono::steady_clock;
 
-        // Creates a name for the cross process reader-writer lock given the details.
-        std::string CreateNameForCPRWL(const SourceDetails& details)
-        {
-            // The only relevant data is the package family name
-            return "PreIndexedSourceCPRWL_"s + GetPackageFamilyNameFromDetails(details);
-        }
+            SourceOpenTimer(const std::string& sourceName) : m_sourceName(sourceName), m_start(clock::now()) {}
 
-        // The base class for a package that comes from a preindexed packaged source.
-        struct PreIndexedFactoryBase : public ISourceFactory
+            ~SourceOpenTimer()
+            {
+                const auto totalMs = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - m_start).count();
+                AICLI_LOG(Repo, Info, << "Packaged source open for '" << m_sourceName << "' " << (m_succeeded ? "succeeded" : "failed") <<
+                    " in " << totalMs << " ms [mode=" << (m_usedLockFallback ? "fallbackLocked" : "optimistic") << "]");
+            }
+
+            void MarkFallbackLocked() { m_usedLockFallback = true; }
+            void MarkSucceeded() { m_succeeded = true; }
+
+        private:
+            const std::string& m_sourceName;
+            clock::time_point m_start;
+            bool m_succeeded = false;
+            bool m_usedLockFallback = false;
+        };
+
+        // A reference to a preindexed package source.
+        struct PreIndexedSourceReference : public ISourceReference
         {
-            std::shared_ptr<ISourceReference> Create(const SourceDetails& details) override final
+            PreIndexedSourceReference(const SourceDetails& details) : m_details(details)
+            {
+                if (m_details.Identifier.empty() && !m_details.Data.empty())
+                {
+                    // We didn't use to store the source identifier, so we compute it here in case
+                    // it's missing from the details.
+                    m_details.Identifier = SourceData{ m_details.Data }.SourceIdentity();
+                }
+
+                m_form = SelectFormForOpen(m_details);
+            }
+
+            std::string GetIdentifier() override { return m_details.Identifier; }
+
+            SourceDetails& GetDetails() override { return m_details; };
+
+            bool ShouldUpdateBeforeOpen(const std::optional<TimeSpan>& requestedUpdateInterval) override
+            {
+                // Nothing here reports progress, but deciding whether the source holds usable data
+                // can require reading what it holds.
+                ProgressCallback progress;
+
+                auto store = CreateCompositeStore(m_details);
+                auto currentVersion = m_form->GetHeldVersion(*store);
+
+                // If we can't find a good package, then we have to update to operate
+                if (!currentVersion)
+                {
+                    AICLI_LOG(Repo, Verbose, << "Source `" << m_details.Name << "` has no data");
+                    return true;
+                }
+
+                // Check that the form is consistent with itself
+                if (!m_form->IsUsable(*store, progress))
+                {
+                    AICLI_LOG(Repo, Verbose, << "Source `" << m_details.Name << "` is not currently usable");
+                    return true;
+                }
+
+                using namespace std::chrono_literals;
+                using clock = std::chrono::system_clock;
+
+                // Attempt to convert the package version to a time_point
+                clock::time_point versionTime = Utility::GetTimePointFromVersion(currentVersion.value());
+
+                // Since we expect that the version time indicates creation time, don't let it be far in the future.
+                auto now = clock::now();
+                if (versionTime > now && versionTime - now > 24h)
+                {
+                    versionTime = clock::time_point::min();
+                }
+
+                // Use the later of the version and last update times
+                clock::time_point timeToCheck = (versionTime > m_details.LastUpdateTime ? versionTime : m_details.LastUpdateTime);
+
+                return IsAfterUpdateCheckTime(m_details.Name, timeToCheck, requestedUpdateInterval);
+            }
+
+            std::shared_ptr<ISource> Open(IProgressCallback& progress) override
+            {
+                SourceOpenTimer openTimer{ m_details.Name };
+
+                auto store = CreateCompositeStore(m_details);
+
+                std::optional<SQLiteIndex> index;
+
+                if (store->AllowsUnlockedRead())
+                {
+                    // The optimistic open reads in place, so it is attempted without the lock and
+                    // retried under it only when that fails.
+                    try
+                    {
+                        index.emplace(m_form->Open(*store, progress));
+                    }
+                    catch (...)
+                    {
+                        if (progress.IsCancelledBy(CancelReason::Any))
+                        {
+                            throw;
+                        }
+
+                        LOG_CAUGHT_EXCEPTION_MSG("Optimistic packaged source open failed, retrying under lock for source: %hs", m_details.Name.c_str());
+                    }
+                }
+
+                if (!index)
+                {
+                    openTimer.MarkFallbackLocked();
+
+                    auto lock = store->Lock(progress);
+                    if (!lock)
+                    {
+                        return {};
+                    }
+
+                    index.emplace(m_form->Open(*store, progress));
+                }
+
+                if (progress.IsCancelledBy(CancelReason::Any))
+                {
+                    AICLI_LOG(Repo, Info, << "Cancelling open upon request");
+                    return {};
+                }
+
+                openTimer.MarkSucceeded();
+                return std::make_shared<SQLiteIndexSource>(m_details, std::move(index.value()), false, true);
+            }
+
+        private:
+            SourceDetails m_details;
+            std::unique_ptr<IIndexForm> m_form;
+        };
+
+        // The factory for a preindexed package source.
+        struct PreIndexedFactory : public ISourceFactory
+        {
+            std::string_view TypeName() const override
+            {
+                return PreIndexedPackageSourceFactory::Type();
+            }
+
+            std::shared_ptr<ISourceReference> Create(const SourceDetails& details) override
             {
                 // With more than one source implementation, we will probably need to probe first
                 THROW_HR_IF(E_INVALIDARG, !details.Type.empty() && details.Type != PreIndexedPackageSourceFactory::Type());
 
-                return CreateInternal(details);
+                return std::make_shared<PreIndexedSourceReference>(details);
             }
 
-            virtual std::shared_ptr<ISourceReference> CreateInternal(const SourceDetails& details) = 0;
-
-            bool Add(SourceDetails& details, IProgressCallback& progress) override final
+            bool Add(SourceDetails& details, IProgressCallback& progress) override
             {
                 if (details.Type.empty())
                 {
@@ -75,441 +212,268 @@ namespace AppInstaller::Repository::Microsoft
                     THROW_HR_IF(E_INVALIDARG, details.Type != PreIndexedPackageSourceFactory::Type());
                 }
 
-                std::string packageLocation = GetPackageLocation(details);
+                // Adding is the only operation that can establish what a source's packages are, so
+                // it is the only one that discovers them and writes the result back.
+                UpdateReport report;
+                UpdateResult result = UpdateResult::Unusable;
 
-                THROW_HR_IF(APPINSTALLER_CLI_ERROR_SOURCE_NOT_SECURE, Utility::IsUrlRemote(packageLocation) && !Utility::IsUrlSecure(packageLocation));
-
-                AICLI_LOG(Repo, Info, << "Initializing source from: " << details.Name << " => " << packageLocation);
-
-                Msix::MsixInfo packageInfo(packageLocation);
-                THROW_HR_IF(APPINSTALLER_CLI_ERROR_PACKAGE_IS_BUNDLE, packageInfo.GetIsBundle());
-
-                auto fullName = packageInfo.GetPackageFullName();
-                AICLI_LOG(Repo, Info, << "Found package full name: " << details.Name << " => " << fullName);
-
-                details.Data = Msix::GetPackageFamilyNameFromFullName(fullName);
-                details.Identifier = Msix::GetPackageFamilyNameFromFullName(fullName);
-
-                auto lock = LockExclusive(details, progress);
-                if (!lock)
-                {
-                    return false;
-                }
-
-                return UpdateInternal(packageLocation, packageInfo, details, progress);
-            }
-
-            bool Update(const SourceDetails& details, IProgressCallback& progress) override final
-            {
-                return UpdateBase(details, false, progress);
-            }
-
-            bool BackgroundUpdate(const SourceDetails& details, IProgressCallback& progress) override final
-            {
-                return UpdateBase(details, true, progress);
-            }
-
-            virtual bool UpdateInternal(const std::string& packageLocation, Msix::MsixInfo& packageInfo, const SourceDetails& details, IProgressCallback& progress) = 0;
-
-            bool Remove(const SourceDetails& details, IProgressCallback& progress) override final
-            {
-                THROW_HR_IF(E_INVALIDARG, details.Type != PreIndexedPackageSourceFactory::Type());
-                auto lock = LockExclusive(details, progress);
-                if (!lock)
-                {
-                    return false;
-                }
-
-                return RemoveInternal(details, progress);
-            }
-
-            virtual bool RemoveInternal(const SourceDetails& details, IProgressCallback&) = 0;
-
-        private:
-            Synchronization::CrossProcessReaderWriteLock LockExclusive(const SourceDetails& details, IProgressCallback& progress, bool isBackground = false)
-            {
-                if (isBackground)
-                {
-                    // If this is a background update, don't wait on the lock.
-                    return Synchronization::CrossProcessReaderWriteLock::LockExclusive(CreateNameForCPRWL(details), 0ms);
-                }
-                else
-                {
-                    return Synchronization::CrossProcessReaderWriteLock::LockExclusive(CreateNameForCPRWL(details), progress);
-                }
-            }
-
-            bool UpdateBase(const SourceDetails& details, bool isBackground, IProgressCallback& progress)
-            {
-                THROW_HR_IF(E_INVALIDARG, details.Type != PreIndexedPackageSourceFactory::Type());
-
-                std::string packageLocation = GetPackageLocation(details);
-                Msix::MsixInfo packageInfo(packageLocation);
-
-                // The package should not be a bundle
-                THROW_HR_IF(APPINSTALLER_CLI_ERROR_PACKAGE_IS_BUNDLE, packageInfo.GetIsBundle());
-
-                // Ensure that family name has not changed
-                THROW_HR_IF(APPINSTALLER_CLI_ERROR_SOURCE_DATA_INTEGRITY_FAILURE,
-                    GetPackageFamilyNameFromDetails(details) != Msix::GetPackageFamilyNameFromFullName(packageInfo.GetPackageFullName()));
-
-                if (progress.IsCancelled())
-                {
-                    AICLI_LOG(Repo, Info, << "Cancelling update upon request");
-                    return false;
-                }
-
-                auto lock = LockExclusive(details, progress, isBackground);
-                if (!lock)
-                {
-                    return false;
-                }
-
-                return UpdateInternal(packageLocation, packageInfo, details, progress);
-            }
-        };
-
-        // *Should only be called when under a CrossProcessReaderWriteLock*
-        std::optional<Deployment::Extension> GetExtensionFromDetails(const SourceDetails& details)
-        {
-            Deployment::ExtensionCatalog catalog(Deployment::SourceExtensionName);
-            return catalog.FindByPackageFamilyAndId(GetPackageFamilyNameFromDetails(details), Deployment::IndexDBId);
-        }
-
-        struct PackagedContextSourceReference : public ISourceReference
-        {
-            PackagedContextSourceReference(const SourceDetails& details) : m_details(details)
-            {
-                if (!m_details.Data.empty())
-                {
-                    m_details.Identifier = GetPackageFamilyNameFromDetails(details);
-                }
-            }
-
-            std::string GetIdentifier() override { return m_details.Identifier; }
-
-            SourceDetails& GetDetails() override { return m_details; };
-
-            std::shared_ptr<ISource> Open(IProgressCallback& progress) override
-            {
-                auto lock = Synchronization::CrossProcessReaderWriteLock::LockShared(CreateNameForCPRWL(m_details), progress);
-                if (!lock)
-                {
-                    return {};
-                }
-
-                auto extension = GetExtensionFromDetails(m_details);
-                if (!extension)
-                {
-                    AICLI_LOG(Repo, Info, << "Package not found " << m_details.Data);
-                    THROW_HR(APPINSTALLER_CLI_ERROR_SOURCE_DATA_MISSING);
-                }
-
-                THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_NEEDS_REMEDIATION), !extension->VerifyContentIntegrity(progress));
-
-                // To work around an issue with accessing the public folder, we are temporarily
-                // constructing the location ourself.  This was already the case for the non-packaged
-                // runtime, and we can fix both in the future.  The only problem with this is that
-                // the directory in the extension *must* be Public, rather than one set by the creator.
-                std::filesystem::path indexLocation = extension->GetPackagePath();
-                indexLocation /= s_PreIndexedPackageSourceFactory_IndexFilePath;
-
-                SQLiteIndex index = SQLiteIndex::Open(indexLocation.u8string(), SQLiteIndex::OpenDisposition::Immutable);
-
-                // We didn't use to store the source identifier, so we compute it here in case it's
-                // missing from the details.
-                m_details.Identifier = GetPackageFamilyNameFromDetails(m_details);
-                return std::make_shared<SQLiteIndexSource>(m_details, std::move(index), std::move(lock));
-            }
-
-        private:
-            SourceDetails m_details;
-        };
-
-        // Source factory for running within a packaged context
-        struct PackagedContextFactory : public PreIndexedFactoryBase
-        {
-            std::shared_ptr<ISourceReference> CreateInternal(const SourceDetails& details) override
-            {
-                return std::make_shared<PackagedContextSourceReference>(details);
-            }
-
-            bool UpdateInternal(const std::string& packageLocation, Msix::MsixInfo& packageInfo, const SourceDetails& details, IProgressCallback& progress) override
-            {
-                // Check if the package is newer before calling into deployment.
-                // This can save us a lot of time over letting deployment detect same version.
-                auto extension = GetExtensionFromDetails(details);
-                if (extension)
-                {
-                    if (!packageInfo.IsNewerThan(extension->GetPackageVersion()))
-                    {
-                        AICLI_LOG(Repo, Info, << "Remote source data was not newer than existing, no update needed");
-                        return true;
-                    }
-                }
-
-                if (progress.IsCancelled())
-                {
-                    AICLI_LOG(Repo, Info, << "Cancelling update upon request");
-                    return false;
-                }
-
-                // Due to complications with deployment, download the file and deploy from
-                // a local source while we investigate further.
-                bool download = Utility::IsUrlRemote(packageLocation);
-                std::filesystem::path tempFile;
-                winrt::Windows::Foundation::Uri uri = nullptr;
-
-                if (download)
-                {
-                    tempFile = Runtime::GetPathTo(Runtime::PathName::Temp);
-                    tempFile /= GetPackageFamilyNameFromDetails(details) + ".msix";
-
-                    Utility::Download(packageLocation, tempFile, Utility::DownloadType::Index, progress);
-
-                    uri = winrt::Windows::Foundation::Uri(tempFile.c_str());
-                }
-                else
-                {
-                    uri = winrt::Windows::Foundation::Uri(Utility::ConvertToUTF16(packageLocation));
-                }
-
-                Deployment::AddPackage(
-                    uri,
-                    winrt::Windows::Management::Deployment::DeploymentOptions::None,
-                    WI_IsFlagSet(details.TrustLevel, SourceTrustLevel::Trusted),
-                    progress);
-
-                if (download)
+                if (IsDeltaIndexEnabled())
                 {
                     try
                     {
-                        // If successful, delete the file
-                        std::filesystem::remove(tempFile);
+                        auto form = CreateDeltaIndexForm(details);
+                        auto data = form->DiscoverIdentities(progress);
+
+                        if (data)
+                        {
+                            WriteDiscoveredIdentities(details, data.value());
+
+                            auto store = CreateStore(details);
+                            result = form->Update(*store, false, progress, report);
+
+                            if (report.LearnedIdentities)
+                            {
+                                // The update learned the baseline identity. The full identity
+                                // that the source is keyed on was already known.
+                                WriteDiscoveredIdentities(details, report.LearnedIdentities.value());
+                            }
+
+                            if (result != UpdateResult::Success)
+                            {
+                                // The source is about to settle on the full index instead, and a
+                                // form that was given up on is not something the source will ever
+                                // come back to. Acquiring the full index would not displace the
+                                // delta and baseline packages, so discard them first.
+                                DiscardPackagesOf(details, *store, *form, progress);
+                            }
+                        }
+                    }
+                    catch (...)
+                    {
+                        if (progress.IsCancelledBy(CancelReason::Any))
+                        {
+                            throw;
+                        }
+
+                        LOG_CAUGHT_EXCEPTION_MSG("Delta discovery failed while adding source: %hs", details.Name.c_str());
+                        result = UpdateResult::Unusable;
+                    }
+                }
+
+                if (result == UpdateResult::Unusable)
+                {
+                    // Either the source publishes no delta, or the one it publishes cannot serve
+                    // it. Adding must still succeed, so the full index is acquired instead.
+                    report = {};
+
+                    // Nothing of the delta attempt is kept: the source is settling on the full
+                    // index, and Data naming a delta is what would send it back to the other form.
+                    details.Data.clear();
+                    details.Identifier.clear();
+
+                    auto form = CreateFullIndexForm(details);
+                    auto data = form->DiscoverIdentities(progress);
+                    THROW_HR_IF(APPINSTALLER_CLI_ERROR_SOURCE_DATA_MISSING, !data);
+
+                    WriteDiscoveredIdentities(details, data.value());
+
+                    auto store = CreateStore(details);
+                    result = form->Update(*store, false, progress, report);
+                }
+
+                // Unlike an update, an add reports only when something was transferred.
+                if (report.DownloadedBytes && report.NewIndexPublishedAt)
+                {
+                    try
+                    {
+                        Logging::Telemetry().LogPreindexedPackageUpdate(
+                            details.Identifier,
+                            report.PreviousIndexPublishedAt,
+                            report.NewIndexPublishedAt.value(),
+                            report.UsedDeltaDownload,
+                            report.PreviousBaselinePublishedAt,
+                            report.NewBaselinePublishedAt,
+                            report.BaselineUpdated,
+                            report.DownloadedBytes.value(),
+                            true);
                     }
                     CATCH_LOG();
                 }
 
-                // Ensure origin if necessary
-                // TODO: Move to checking this before deploying it. That requires significant code to be written though
-                //       as there is no public API to check the origin directly.
-                if (WI_IsFlagSet(details.TrustLevel, SourceTrustLevel::StoreOrigin))
-                {
-                    std::wstring pfn = packageInfo.GetPackageFullNameWide();
-
-                    PackageOrigin origin = PackageOrigin::PackageOrigin_Unknown;
-                    if (SUCCEEDED_WIN32_LOG(GetStagedPackageOrigin(pfn.c_str(), &origin)))
-                    {
-                        if (origin != PackageOrigin::PackageOrigin_Store)
-                        {
-                            Deployment::RemovePackage(Utility::ConvertToUTF8(pfn), progress);
-                            THROW_HR(APPINSTALLER_CLI_ERROR_SOURCE_DATA_INTEGRITY_FAILURE);
-                        }
-                    }
-                }
-
-                return true;
+                return result == UpdateResult::Success;
             }
 
-            bool RemoveInternal(const SourceDetails& details, IProgressCallback& callback) override
+            bool Update(const SourceDetails& details, IProgressCallback& progress) override
             {
-                auto fullName = Msix::GetPackageFullNameFromFamilyName(GetPackageFamilyNameFromDetails(details));
-
-                if (!fullName)
-                {
-                    AICLI_LOG(Repo, Info, << "No full name found for family name: " << GetPackageFamilyNameFromDetails(details));
-                }
-                else
-                {
-                    AICLI_LOG(Repo, Info, << "Removing package: " << *fullName);
-                    Deployment::RemovePackage(*fullName, callback);
-                }
-
-                return true;
-            }
-        };
-
-        // Constructs the location that we will write files to.
-        std::filesystem::path GetStatePathFromDetails(const SourceDetails& details)
-        {
-            std::filesystem::path result = Runtime::GetPathTo(Runtime::PathName::LocalState);
-            result /= PreIndexedPackageSourceFactory::Type();
-            result /= GetPackageFamilyNameFromDetails(details);
-            return result;
-        }
-
-        struct DesktopContextSourceReference : public ISourceReference
-        {
-            DesktopContextSourceReference(const SourceDetails& details) : m_details(details)
-            {
-                if (!m_details.Data.empty())
-                {
-                    m_details.Identifier = GetPackageFamilyNameFromDetails(details);
-                }
+                return UpdateBase(details, false, progress);
             }
 
-            std::string GetIdentifier() override { return m_details.Identifier; }
-
-            SourceDetails& GetDetails() override { return m_details; };
-
-            std::shared_ptr<ISource> Open(IProgressCallback& progress) override
+            bool BackgroundUpdate(const SourceDetails& details, IProgressCallback& progress) override
             {
-                auto lock = Synchronization::CrossProcessReaderWriteLock::LockShared(CreateNameForCPRWL(m_details), progress);
+                return UpdateBase(details, true, progress);
+            }
+
+            bool Remove(const SourceDetails& details, IProgressCallback& progress) override
+            {
+                THROW_HR_IF(E_INVALIDARG, details.Type != PreIndexedPackageSourceFactory::Type());
+
+                auto store = CreateCompositeStore(details);
+
+                auto lock = store->Lock(progress);
                 if (!lock)
                 {
-                    return {};
+                    return false;
                 }
 
-                std::filesystem::path packageLocation = GetStatePathFromDetails(m_details);
-                packageLocation /= s_PreIndexedPackageSourceFactory_PackageFileName;
+                // Every form that the details name packages for contributes, so that a delta
+                // capable source does not leave its delta behind.
+                std::vector<PackageKey> packages;
+                std::set<std::string> seenIdentities;
 
-                if (!std::filesystem::exists(packageLocation))
-                {
-                    AICLI_LOG(Repo, Info, << "Data not found at " << packageLocation);
-                    THROW_HR(APPINSTALLER_CLI_ERROR_SOURCE_DATA_MISSING);
-                }
+                auto addPackagesFrom = [&](const std::unique_ptr<IIndexForm>& form)
+                    {
+                        if (!form->HasIdentities())
+                        {
+                            return;
+                        }
 
-                // Put a write exclusive lock on the index package.
-                Msix::WriteLockedMsixFile indexPackage{ packageLocation };
+                        for (auto& package : form->GetPackages())
+                        {
+                            if (seenIdentities.insert(package.Identity).second)
+                            {
+                                packages.emplace_back(std::move(package));
+                            }
+                        }
+                    };
 
-                // Validate index package trust info.
-                THROW_HR_IF(APPINSTALLER_CLI_ERROR_SOURCE_DATA_INTEGRITY_FAILURE, !indexPackage.ValidateTrustInfo(WI_IsFlagSet(m_details.TrustLevel, SourceTrustLevel::StoreOrigin)));
+                addPackagesFrom(CreateFullIndexForm(details));
+                addPackagesFrom(CreateDeltaIndexForm(details));
 
-                // Create a temp lock exclusive index file.
-                auto tempIndexFilePath = Runtime::GetNewTempFilePath();
-                auto tempIndexFile = Utility::ManagedFile::CreateWriteLockedFile(tempIndexFilePath, GENERIC_WRITE, true);
+                store->Remove(packages, progress);
 
-                // Populate temp index file.
-                Msix::MsixInfo packageInfo(packageLocation);
-                packageInfo.WriteToFileHandle(s_PreIndexedPackageSourceFactory_IndexFilePath, tempIndexFile.GetFileHandle(), progress);
-
-                if (progress.IsCancelled())
-                {
-                    AICLI_LOG(Repo, Info, << "Cancelling open upon request");
-                    return {};
-                }
-
-                SQLiteIndex index = SQLiteIndex::Open(tempIndexFile.GetFilePath().u8string(), SQLiteIndex::OpenDisposition::Immutable, std::move(tempIndexFile));
-
-                // We didn't use to store the source identifier, so we compute it here in case it's
-                // missing from the details.
-                m_details.Identifier = GetPackageFamilyNameFromDetails(m_details);
-                return std::make_shared<SQLiteIndexSource>(m_details, std::move(index), std::move(lock));
+                return true;
             }
 
         private:
-            SourceDetails m_details;
-        };
-
-        // Source factory for running outside of a package.
-        struct DesktopContextFactory : public PreIndexedFactoryBase
-        {
-            std::shared_ptr<ISourceReference> CreateInternal(const SourceDetails& details) override
+            // Records what a form discovered about the source's packages.
+            static void WriteDiscoveredIdentities(SourceDetails& details, const std::string& data)
             {
-                return std::make_shared<DesktopContextSourceReference>(details);
+                details.Data = data;
+
+                // The identity of the source itself is derived from what it is made of rather
+                // than chosen, so that it is the same every time it is computed. The local state
+                // directory and the cross process lock are both derived from it, which is why it
+                // must not depend on how much has been learned so far; see
+                // SourceData::SourceIdentity.
+                details.Identifier = SourceData{ data }.SourceIdentity();
             }
 
-            bool UpdateInternal(const std::string& packageLocation, Msix::MsixInfo& packageInfo, const SourceDetails& details, IProgressCallback& progress) override
+            // Drops everything a form left behind, for a form that the source is not going to use.
+            //
+            // Best effort: the source is still going to be added, and leaving a package behind is
+            // not a reason to refuse it.
+            static void DiscardPackagesOf(const SourceDetails& details, IPackageStore& store, IIndexForm& form, IProgressCallback& progress)
             {
-                // We will extract the manifest and index files directly to this location
-                std::filesystem::path packageState = GetStatePathFromDetails(details);
-                std::filesystem::create_directories(packageState);
-
-                std::filesystem::path packagePath = packageState / s_PreIndexedPackageSourceFactory_PackageFileName;
-
-                if (std::filesystem::exists(packagePath))
+                try
                 {
-                    // If we already have a trusted index package, use it to determine if we need to update or not.
-                    Msix::WriteLockedMsixFile indexPackage{ packagePath };
-                    if (indexPackage.ValidateTrustInfo(WI_IsFlagSet(details.TrustLevel, SourceTrustLevel::StoreOrigin)) &&
-                        !packageInfo.IsNewerThan(packagePath))
+                    auto lock = store.Lock(progress);
+                    if (!lock)
                     {
-                        AICLI_LOG(Repo, Info, << "Remote source data was not newer than existing, no update needed");
+                        return;
+                    }
+
+                    // Only the failed form's packages have been acquired at this point.
+                    store.Remove(form.GetPackages(), progress);
+                }
+                catch (...)
+                {
+                    LOG_CAUGHT_EXCEPTION_MSG("Could not discard the packages of an unused form for source: %hs", details.Name.c_str());
+                }
+            }
+
+            bool UpdateBase(const SourceDetails& details, bool isBackground, IProgressCallback& progress)
+
+            {
+                THROW_HR_IF(E_INVALIDARG, details.Type != PreIndexedPackageSourceFactory::Type());
+
+                auto store = CreateStore(details);
+
+                if (IsDeltaIndexEnabled())
+                {
+                    UpdateReport report;
+                    UpdateResult result = UpdateResult::Unusable;
+
+                    auto form = CreateDeltaIndexForm(details);
+
+                    // An update never probes for a delta: the details say whether the source
+                    // has one. A source configured with only a full index identity names no
+                    // delta and uses the full index, which is what it did before deltas existed.
+                    if (form->HasIdentities())
+                    {
+                        result = form->Update(*store, isBackground, progress, report);
+
+                        // While the feature is experimental, fail if things are not as they are expected
+                        // When moving off of experimental, consider if we should support fallback.
+                        // Fallback complicates the open side considerably.
+                        if (IsDeltaIndexEnabled())
+                        {
+                            THROW_HR_IF(APPINSTALLER_CLI_ERROR_SOURCE_DATA_INTEGRITY_FAILURE, result == UpdateResult::Unusable);
+                        }
+                    }
+
+                    if (result == UpdateResult::Success)
+                    {
+                        LogUpdate(details, report, isBackground);
                         return true;
                     }
-                }
 
-                std::filesystem::path tempPackagePath = packagePath.u8string() + ".dnld.msix";
-                if (Utility::IsUrlRemote(packageLocation))
-                {
-                    AppInstaller::Utility::Download(packageLocation, tempPackagePath, AppInstaller::Utility::DownloadType::Index, progress);
-                }
-                else
-                {
-                    std::filesystem::copy(packageLocation, tempPackagePath);
-                    progress.OnProgress(100, 100, ProgressType::Percent);
-                }
-
-                bool updateSuccess = false;
-                if (progress.IsCancelled())
-                {
-                    AICLI_LOG(Repo, Info, << "Cancelling update upon request");
-                }
-                else
-                {
-                    bool tempIndexPackageTrusted = false;
-
+                    if (result == UpdateResult::Aborted)
                     {
-                        // Extra scope to release the file lock right after trust validation.
-                        Msix::WriteLockedMsixFile tempIndexPackage{ tempPackagePath };
-                        tempIndexPackageTrusted = tempIndexPackage.ValidateTrustInfo(WI_IsFlagSet(details.TrustLevel, SourceTrustLevel::StoreOrigin));
+                        // The operation did not complete, so nothing was learned about whether the
+                        // delta would have served. Falling back here would acquire a full index
+                        // that the source may not have needed.
+                        return false;
                     }
 
-                    if (tempIndexPackageTrusted)
-                    {
-                        std::filesystem::rename(tempPackagePath, packagePath);
-                        AICLI_LOG(Repo, Info, << "Source update success.");
-                        updateSuccess = true;
-                    }
-                    else
-                    {
-                        AICLI_LOG(Repo, Error, << "Source update failed. Source package failed trust validation.");
-                    }
+                    // Only a delta that cannot serve the source falls back; the delta is an
+                    // optimization, never a correctness dependency.
+                    AICLI_LOG(Repo, Info, << "Falling back to the full index for source: " << details.Name);
                 }
 
-                if (!updateSuccess)
-                {
-                    try
-                    {
-                        std::filesystem::remove(tempPackagePath);
-                    }
-                    catch (...)
-                    {
-                        AICLI_LOG(Repo, Info, << "Failed to remove temp index file at: " << tempPackagePath);
-                    }
-                }
+                auto form = CreateFullIndexForm(details);
 
-                return updateSuccess;
+                UpdateReport report;
+                UpdateResult result = form->Update(*store, isBackground, progress, report);
+
+                LogUpdate(details, report, isBackground);
+
+                return result == UpdateResult::Success;
             }
 
-            bool RemoveInternal(const SourceDetails& details, IProgressCallback&) override
+            // Whether an update is reported is the form's decision; see UpdateReport::Reportable.
+            void LogUpdate(const SourceDetails& details, const UpdateReport& report, bool isBackground)
             {
-                std::filesystem::path packageState = GetStatePathFromDetails(details);
-
-                if (!std::filesystem::exists(packageState))
+                if (!report.Reportable || !report.NewIndexPublishedAt)
                 {
-                    AICLI_LOG(Repo, Info, << "No state found for source: " << packageState.u8string());
-                }
-                else
-                {
-                    AICLI_LOG(Repo, Info, << "Removing state found for source: " << packageState.u8string());
-                    std::filesystem::remove_all(packageState);
+                    return;
                 }
 
-                return true;
+                Logging::Telemetry().LogPreindexedPackageUpdate(
+                    details.Identifier,
+                    report.PreviousIndexPublishedAt,
+                    report.NewIndexPublishedAt.value(),
+                    report.UsedDeltaDownload,
+                    report.PreviousBaselinePublishedAt,
+                    report.NewBaselinePublishedAt,
+                    report.BaselineUpdated,
+                    report.DownloadedBytes.value_or(0),
+                    !isBackground);
             }
         };
     }
 
     std::unique_ptr<ISourceFactory> PreIndexedPackageSourceFactory::Create()
     {
-        if (Runtime::IsRunningInPackagedContext())
-        {
-            return std::make_unique<PackagedContextFactory>();
-        }
-        else
-        {
-            return std::make_unique<DesktopContextFactory>();
-        }
+        return std::make_unique<PreIndexedFactory>();
     }
 }

@@ -2,22 +2,24 @@
 // Licensed under the MIT License.
 #include "pch.h"
 #include "TestCommon.h"
-#include <SQLiteWrapper.h>
-#include <Microsoft/SQLiteStorageBase.h>
+#include <winget/SQLiteWrapper.h>
+#include <winget/SQLiteStorageBase.h>
 #include <Microsoft/Schema/IPortableIndex.h>
-#include <Microsoft/PortableIndex.h>
+#include <winget/PortableIndex.h>
 #include <Microsoft/Schema/Portable_1_0/PortableTable.h>
+#include <winget/PortableFileEntry.h>
 
 using namespace std::string_literals;
 using namespace TestCommon;
+using namespace AppInstaller::Portable;
 using namespace AppInstaller::Repository::Microsoft;
-using namespace AppInstaller::Repository::SQLite;
+using namespace AppInstaller::SQLite;
 using namespace AppInstaller::Repository::Microsoft::Schema;
 
-void CreateFakePortableFile(IPortableIndex::PortableFile& file)
+void CreateFakePortableFile(PortableFileEntry& file)
 {
     file.SetFilePath("testPortableFile.exe");
-    file.FileType = IPortableIndex::PortableFileType::File;
+    file.FileType = PortableFileType::File;
     file.SHA256 = "f0e4c2f76c58916ec258f246851bea091d14d4247a2fc3e18694461b1816e13b";
     file.SymlinkTarget = "testSymlinkTarget.exe";
 }
@@ -27,11 +29,11 @@ TEST_CASE("PortableIndexCreateLatestAndReopen", "[portableIndex]")
     TempFile tempFile{ "repolibtest_tempdb"s, ".db"s };
     INFO("Using temporary file named: " << tempFile.GetPath());
 
-    Schema::Version versionCreated;
+    Version versionCreated;
 
     // Create the index
     {
-        PortableIndex index = PortableIndex::CreateNew(tempFile, Schema::Version::Latest());
+        PortableIndex index = PortableIndex::CreateNew(tempFile, Version::Latest());
         versionCreated = index.GetVersion();
     }
 
@@ -39,7 +41,7 @@ TEST_CASE("PortableIndexCreateLatestAndReopen", "[portableIndex]")
     {
         INFO("Trying with Read");
         PortableIndex index = PortableIndex::Open(tempFile, SQLiteStorageBase::OpenDisposition::Read);
-        Schema::Version versionRead = index.GetVersion();
+        Version versionRead = index.GetVersion();
         REQUIRE(versionRead == versionCreated);
     }
 
@@ -47,7 +49,7 @@ TEST_CASE("PortableIndexCreateLatestAndReopen", "[portableIndex]")
     {
         INFO("Trying with ReadWrite");
         PortableIndex index = PortableIndex::Open(tempFile, SQLiteStorageBase::OpenDisposition::ReadWrite);
-        Schema::Version versionRead = index.GetVersion();
+        Version versionRead = index.GetVersion();
         REQUIRE(versionRead == versionCreated);
     }
 
@@ -55,7 +57,7 @@ TEST_CASE("PortableIndexCreateLatestAndReopen", "[portableIndex]")
     {
         INFO("Trying with Immutable");
         PortableIndex index = PortableIndex::Open(tempFile, SQLiteStorageBase::OpenDisposition::Immutable);
-        Schema::Version versionRead = index.GetVersion();
+        Version versionRead = index.GetVersion();
         REQUIRE(versionRead == versionCreated);
     }
 }
@@ -65,7 +67,7 @@ TEST_CASE("PortableIndexAddEntryToTable", "[portableIndex]")
     TempFile tempFile{ "repolibtest_tempdb"s, ".db"s };
     INFO("Using temporary file named: " << tempFile.GetPath());
 
-    IPortableIndex::PortableFile portableFile;
+    PortableFileEntry portableFile;
     CreateFakePortableFile(portableFile);
 
     {
@@ -96,7 +98,7 @@ TEST_CASE("PortableIndex_AddUpdateRemove", "[portableIndex]")
     TempFile tempFile{ "repolibtest_tempdb"s, ".db"s };
     INFO("Using temporary file named: " << tempFile.GetPath());
 
-    IPortableIndex::PortableFile portableFile;
+    PortableFileEntry portableFile;
     CreateFakePortableFile(portableFile);
 
     PortableIndex index = PortableIndex::CreateNew(tempFile, { 1, 0 });
@@ -104,7 +106,7 @@ TEST_CASE("PortableIndex_AddUpdateRemove", "[portableIndex]")
 
     // Apply changes to portable file
     std::string updatedHash = "2db8ae7657c6622b04700137740002c51c36588e566651c9f67b4b096c8ad18b";
-    portableFile.FileType = IPortableIndex::PortableFileType::Symlink;
+    portableFile.FileType = PortableFileType::Symlink;
     portableFile.SHA256 = updatedHash;
     portableFile.SymlinkTarget = "fakeSymlinkTarget.exe";
 
@@ -114,8 +116,8 @@ TEST_CASE("PortableIndex_AddUpdateRemove", "[portableIndex]")
         Connection connection = Connection::Create(tempFile, Connection::OpenDisposition::ReadOnly);
         auto fileFromIndex = Schema::Portable_V1_0::PortableTable::GetPortableFileById(connection, 1);
         REQUIRE(fileFromIndex.has_value());
-        REQUIRE(fileFromIndex->GetFilePath() == "testPortableFile.exe");
-        REQUIRE(fileFromIndex->FileType == IPortableIndex::PortableFileType::Symlink);
+        REQUIRE(fileFromIndex->GetFilePath() == portableFile.GetFilePath());
+        REQUIRE(fileFromIndex->FileType == PortableFileType::Symlink);
         REQUIRE(fileFromIndex->SHA256 == updatedHash);
         REQUIRE(fileFromIndex->SymlinkTarget == "fakeSymlinkTarget.exe");
     }
@@ -137,7 +139,7 @@ TEST_CASE("PortableIndex_UpdateFile_CaseInsensitive", "[portableIndex]")
     TempFile tempFile{ "repolibtest_tempdb"s, ".db"s };
     INFO("Using temporary file named: " << tempFile.GetPath());
 
-    IPortableIndex::PortableFile portableFile;
+    PortableFileEntry portableFile;
     CreateFakePortableFile(portableFile);
 
     PortableIndex index = PortableIndex::CreateNew(tempFile, { 1, 0 });
@@ -147,7 +149,7 @@ TEST_CASE("PortableIndex_UpdateFile_CaseInsensitive", "[portableIndex]")
     // Change file path to all upper case should still successfully update.
     portableFile.SetFilePath("TESTPORTABLEFILE.exe");
     std::string updatedHash = "2db8ae7657c6622b04700137740002c51c36588e566651c9f67b4b096c8ad18b";
-    portableFile.FileType = IPortableIndex::PortableFileType::Symlink;
+    portableFile.FileType = PortableFileType::Symlink;
     portableFile.SHA256 = updatedHash;
     portableFile.SymlinkTarget = "fakeSymlinkTarget.exe";
 
@@ -157,8 +159,8 @@ TEST_CASE("PortableIndex_UpdateFile_CaseInsensitive", "[portableIndex]")
         Connection connection = Connection::Create(tempFile, Connection::OpenDisposition::ReadOnly);
         auto fileFromIndex = Schema::Portable_V1_0::PortableTable::GetPortableFileById(connection, 1);
         REQUIRE(fileFromIndex.has_value());
-        REQUIRE(fileFromIndex->GetFilePath() == "TESTPORTABLEFILE.exe");
-        REQUIRE(fileFromIndex->FileType == IPortableIndex::PortableFileType::Symlink);
+        REQUIRE(fileFromIndex->GetFilePath() == portableFile.GetFilePath());
+        REQUIRE(fileFromIndex->FileType == PortableFileType::Symlink);
         REQUIRE(fileFromIndex->SHA256 == updatedHash);
         REQUIRE(fileFromIndex->SymlinkTarget == "fakeSymlinkTarget.exe");
     }
@@ -169,7 +171,7 @@ TEST_CASE("PortableIndex_AddDuplicateFile", "[portableIndex]")
     TempFile tempFile{ "repolibtest_tempdb"s, ".db"s };
     INFO("Using temporary file named: " << tempFile.GetPath());
 
-    IPortableIndex::PortableFile portableFile;
+    PortableFileEntry portableFile;
     CreateFakePortableFile(portableFile);
 
     PortableIndex index = PortableIndex::CreateNew(tempFile, { 1, 0 });
@@ -185,7 +187,7 @@ TEST_CASE("PortableIndex_RemoveWithId", "[portableIndex]")
     TempFile tempFile{ "repolibtest_tempdb"s, ".db"s };
     INFO("Using temporary file named: " << tempFile.GetPath());
 
-    IPortableIndex::PortableFile portableFile;
+    PortableFileEntry portableFile;
     CreateFakePortableFile(portableFile);
 
     PortableIndex index = PortableIndex::CreateNew(tempFile, { 1, 0 });

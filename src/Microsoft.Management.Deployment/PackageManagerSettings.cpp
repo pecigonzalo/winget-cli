@@ -11,6 +11,8 @@
 #pragma warning( pop )
 #include "PackageManagerSettings.g.cpp"
 #include "Helpers.h"
+#include "Public/CanUnload.h"
+#include "Public/ShutdownMonitoring.h"
 #include <winget/UserSettings.h>
 #include <AppInstallerRuntime.h>
 
@@ -48,8 +50,33 @@ namespace winrt::Microsoft::Management::Deployment::implementation
             [&]()
             {
                 success = AppInstaller::Settings::TryInitializeCustomUserSettings(AppInstaller::Utility::ConvertToUTF8(settingsContent));
+                if (success)
+                {
+                    AppInstaller::Logging::Log().SetEnabledChannels(AppInstaller::Settings::User().Get<AppInstaller::Settings::Setting::LoggingChannelPreference>());
+                    AppInstaller::Logging::Log().SetLevel(AppInstaller::Settings::User().Get<AppInstaller::Settings::Setting::LoggingLevelPreference>());
+                }
             });
         return success;
+    }
+
+    bool PackageManagerSettings::CanUnloadPreference() const
+    {
+        return GetCanUnload();
+    }
+
+    void PackageManagerSettings::CanUnloadPreference(bool value)
+    {
+        SetCanUnload(value);
+    }
+
+    bool PackageManagerSettings::TerminationSignalMonitoring() const
+    {
+        return AppInstaller::ShutdownMonitoring::TerminationSignalHandler::Enabled();
+    }
+
+    void PackageManagerSettings::TerminationSignalMonitoring(bool value)
+    {
+        AppInstaller::ShutdownMonitoring::TerminationSignalHandler::Enabled(value);
     }
 
     CoCreatableMicrosoftManagementDeploymentClass(PackageManagerSettings);

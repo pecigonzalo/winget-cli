@@ -9,12 +9,15 @@ namespace AppInstaller::Repository::Microsoft::Schema::Portable_V1_0
     struct PortableIndexInterface : public IPortableIndex
     {
         // Version 1.0
-        Schema::Version GetVersion() const override;
+        SQLite::Version GetVersion() const override;
         void CreateTable(SQLite::Connection& connection) override;
 
     private:
-        SQLite::rowid_t AddPortableFile(SQLite::Connection& connection, const PortableFile& file) override;
-        SQLite::rowid_t RemovePortableFile(SQLite::Connection& connection, const PortableFile& file) override;
-        std::pair<bool, SQLite::rowid_t> UpdatePortableFile(SQLite::Connection& connection, const PortableFile& file) override;
+        SQLite::rowid_t AddPortableFile(SQLite::Connection& connection, const Portable::PortableFileEntry& file) override;
+        SQLite::rowid_t RemovePortableFile(SQLite::Connection& connection, const Portable::PortableFileEntry& file) override;
+        std::pair<bool, SQLite::rowid_t> UpdatePortableFile(SQLite::Connection& connection, const Portable::PortableFileEntry& file) override;
+        bool Exists(SQLite::Connection& connection, const Portable::PortableFileEntry& file) override;
+        bool IsEmpty(SQLite::Connection& connection) override;
+        std::vector<Portable::PortableFileEntry> GetAllPortableFiles(SQLite::Connection& connection) override;
     };
 }

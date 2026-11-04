@@ -1,11 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 #include "pch.h"
+#include "Rest/Schema/CommonRestConstants.h"
 #include "Rest/Schema/IRestClient.h"
 #include "SearchResponseDeserializer.h"
+#include <AppInstallerStrings.h>
 #include <winget/JsonUtil.h>
-#include "Rest/Schema/RestHelper.h"
-#include "Rest/Schema/CommonRestConstants.h"
+#include <winget/ManifestValidation.h>
+#include <winget/Rest.h>
 
 namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
 {
@@ -20,6 +22,24 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
         constexpr std::string_view Versions = "Versions"sv;
         constexpr std::string_view PackageVersion = "PackageVersion"sv;
         constexpr std::string_view Channel = "Channel"sv;
+
+        // The package identifier and version flow into file system paths, so the manifest schema restrictions
+        // on them are enforced here as well; the schema itself is not applied to REST responses.
+        bool CheckPathFieldValueValidation(std::string_view fieldName, const std::vector<AppInstaller::Manifest::ValidationError>& validationErrors)
+        {
+            bool result = true;
+
+            for (const auto& error : validationErrors)
+            {
+                if (error.ErrorLevel == AppInstaller::Manifest::ValidationError::Level::Error)
+                {
+                    AICLI_LOG(Repo, Error, << "Invalid " << fieldName << " received from rest source: " << error.GetErrorMessage());
+                    result = false;
+                }
+            }
+
+            return result;
+        }
     }
 
     IRestClient::SearchResult SearchResponseDeserializer::Deserialize(const web::json::value& searchResponseObject) const
@@ -62,6 +82,15 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
                     return {};
                 }
 
+                // The YAML parser trims these values, so do the same here before validating; the schema excludes
+                // whitespace from the identifier, but surrounding whitespace should be tolerated identically.
+                Utility::Trim(packageId.value());
+
+                if (!CheckPathFieldValueValidation(PackageIdentifier, AppInstaller::Manifest::ValidatePackageIdentifier(packageId.value())))
+                {
+                    return {};
+                }
+
                 std::optional<std::reference_wrapper<const web::json::array>> versionValue = JSON::GetRawJsonArrayFromJsonNode(manifestItem, JSON::GetUtilityString(Versions));
                 std::vector<IRestClient::VersionInfo> versionList;
 
@@ -69,19 +98,14 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
                 {
                     for (auto& versionItem : versionValue.value().get())
                     {
-                        std::optional<std::string> version = JSON::GetRawStringValueFromJsonNode(versionItem, JSON::GetUtilityString(PackageVersion));
-                        if (!JSON::IsValidNonEmptyStringValue(version))
+                        auto versionInfo = DeserializeVersionInfo(versionItem);
+                        if (!versionInfo.has_value())
                         {
                             AICLI_LOG(Repo, Error, << "Received incomplete package version in package: " << packageId.value());
                             return {};
                         }
 
-                        std::string channel = JSON::GetRawStringValueFromJsonNode(versionItem, JSON::GetUtilityString(Channel)).value_or("");
-                        std::vector<std::string> packageFamilyNames = RestHelper::GetUniqueItems(JSON::GetRawStringArrayFromJsonNode(versionItem, JSON::GetUtilityString(PackageFamilyNames)));
-                        std::vector<std::string> productCodes = RestHelper::GetUniqueItems(JSON::GetRawStringArrayFromJsonNode(versionItem, JSON::GetUtilityString(ProductCodes)));
-
-                        versionList.emplace_back(IRestClient::VersionInfo{
-                                AppInstaller::Utility::VersionAndChannel{std::move(version.value()), std::move(channel)}, {}, std::move(packageFamilyNames), std::move(productCodes)});
+                        versionList.emplace_back(std::move(*versionInfo));
                     }
                 }
 
@@ -109,5 +133,35 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
         }
 
         return {};
+    }
+
+    std::optional<IRestClient::VersionInfo> SearchResponseDeserializer::DeserializeVersionInfo(const web::json::value& versionInfoJsonObject) const
+    {
+        std::optional<std::string> version = JSON::GetRawStringValueFromJsonNode(versionInfoJsonObject, JSON::GetUtilityString(PackageVersion));
+        if (!JSON::IsValidNonEmptyStringValue(version))
+        {
+            AICLI_LOG(Repo, Error, << "Received incomplete package version");
+            return {};
+        }
+
+        // The schema allows surrounding whitespace in the version, but the value is used to construct file system
+        // paths and version comparison trims, so trim it here as the YAML parser does. Trim before validating so
+        // that a value which is only path unsafe because of its surrounding whitespace is still accepted.
+        Utility::Trim(version.value());
+
+        if (!CheckPathFieldValueValidation(PackageVersion, AppInstaller::Manifest::ValidatePackageVersion(version.value())))
+        {
+            return {};
+        }
+
+        std::string channel = JSON::GetRawStringValueFromJsonNode(versionInfoJsonObject, JSON::GetUtilityString(Channel)).value_or("");
+        std::vector<std::string> packageFamilyNames = AppInstaller::Rest::GetUniqueItems(JSON::GetRawStringArrayFromJsonNode(versionInfoJsonObject, JSON::GetUtilityString(PackageFamilyNames)));
+        std::vector<std::string> productCodes = AppInstaller::Rest::GetUniqueItems(JSON::GetRawStringArrayFromJsonNode(versionInfoJsonObject, JSON::GetUtilityString(ProductCodes)));
+
+        return IRestClient::VersionInfo{
+            AppInstaller::Utility::VersionAndChannel{std::move(version.value()), std::move(channel)},
+            {},
+            std::move(packageFamilyNames),
+            std::move(productCodes) };
     }
 }

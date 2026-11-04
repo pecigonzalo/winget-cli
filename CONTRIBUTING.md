@@ -6,9 +6,9 @@ Below is our guidance for how to report issues, propose new features, and submit
 
 The Windows Package Manager team is VERY active in this GitHub Repository. In fact, we live in it all day long and carry out all our development in the open!
 
-When the team finds issues we file them in the repository. When we propose new ideas or think-up new features, we file new feature requests. When we work on fixes or features, we create branches and work on those improvements. And when PRs are reviewed, we review in public - including all the good, the bad, and the ugly parts.
+When the team finds issues we file them in the repository. When we propose new ideas or think up new features, we file new feature requests. When we work on fixes or features, we create branches and work on those improvements. And when PRs are reviewed, we review them in public - including all the good, the bad, and the ugly parts.
 
-The point of doing all this work in public is to ensure that we are holding ourselves to a high degree of transparency, and so that the community sees that we apply the same processes and hold ourselves to the same quality-bar as we do to community-submitted issues and PRs. We also want to make sure that we expose our team culture and "tribal knowledge" that is inherent in any closely-knit team, which often contains considerable value to those new to the project who are trying to figure out "why the heck does this thing look/work like this???"
+The point of doing all this work in public is to ensure that we are holding ourselves to a high degree of transparency, and so that the community sees that we apply the same processes and hold ourselves to the same quality bar as we do to community-submitted issues and PRs. We also want to make sure that we expose our team culture and "tribal knowledge" that is inherent in any closely-knit team, which often contains considerable value to those new to the project who are trying to figure out "why the heck does this thing look/work like this???"
 
 ### Repository Bot
 
@@ -24,6 +24,14 @@ Therefore, if you do file issues, or create PRs, please keep an eye on your GitH
 ## Reporting Security Issues
 
 **Please do not report security vulnerabilities through public GitHub issues.** Instead, please report them to the Microsoft Security Response Center (MSRC). See [SECURITY.md](./SECURITY.md) for more information.
+
+## AI-assisted contributions
+
+AI assistance is welcome, but contributors remain fully responsible for the submitted work. If AI contributes to a change, you are accountable for that content exactly as if you wrote it yourself: you must understand it, ensure it follows project conventions, and provide the same testing and validation evidence expected for any other contribution.
+
+When opening or updating a PR, disclose material AI-generated assistance and briefly describe which parts were assisted.
+
+Opening a PR requires real engineering review time. Please keep this in mind and submit contributions that are complete, reviewed, and ready for meaningful feedback. Low-effort, unreviewed, or unverifiable AI-generated submissions may be closed at maintainer discretion.
 
 ## Before you start, file an issue
 
@@ -79,19 +87,19 @@ For those able & willing to help fix issues and/or implement features ...
 
 Some issues/features may be quick and simple to describe and understand. For such scenarios, once a team member has agreed with your approach, skip ahead to the section headed "Fork, Branch, and Create your PR", below.
 
-Small issues that do not require a spec will be labelled Issue-Bug or Issue-Task.
+Small issues that do not require a spec will be labeled Issue-Bug or Issue-Task.
 
 However, some issues/features will require careful thought & formal design before implementation. For these scenarios, we'll request that a spec is written and the associated issue will be labeled Issue-Feature.
 
-Specs help collaborators discuss different approaches to solve a problem, describe how the feature will behave, how the feature will impact the user, what happens if something goes wrong, etc. Driving towards agreement in a spec, before any code is written, often results in simpler code, and less wasted effort in the long run.
+Specs help collaborators discuss different approaches to solving a problem, describe how the feature will behave, how the feature will impact the user, what happens if something goes wrong, etc. Driving towards agreement in a spec, before any code is written, often results in simpler code, and less wasted effort in the long run.
 
-Specs will be managed in a very similar manner as code contributions so please follow the "Fork, Branch and Create your PR" below.
+Specs will be managed in a very similar manner as code contributions so please follow the "Fork, Branch, and Create your PR" below.
 
 ### Writing / Contributing-to a Spec
 
-To write/contribute to a spec: fork, branch and commit via PRs, as you would with any code changes.
+To write/contribute to a spec: fork, branch, and commit via PRs, as you would with any code changes.
 
-Specs are written in markdown, stored under the `/doc/spec` folder and named `[issue id] - [spec description].md`.
+Specs are written in markdown, stored under the `/doc/specs` folder, and named `[issue id] - [spec description].md`.
 
 👉 **It is important to follow the spec templates and complete the requested information**. The available spec templates will help ensure that specs contain the minimum information & decisions necessary to permit development to begin. In particular, specs require you to confirm that you've already discussed the issue/idea with the team in an issue and that you provide the issue ID for reference.
 
@@ -99,7 +107,7 @@ Team members will be happy to help review specs and guide them to completion.
 
 ### Help Wanted
 
-Once the team have approved an issue/spec, development can proceed. If no developers are immediately available, the spec can be parked ready for a developer to get started. Parked specs' issues will be labeled "Help Wanted". To find a list of development opportunities waiting for developer involvement, visit the Issues and filter on [the Help-Wanted label](https://github.com/microsoft/winget-cli/labels/Help%20Wanted).
+Once the team has approved an issue/spec, development can proceed. If no developers are immediately available, the spec can be parked ready for a developer to get started. Parked specs' issues will be labeled "Help Wanted". To find a list of development opportunities waiting for developer involvement, visit the Issues and filter on [the Help-Wanted label](https://github.com/microsoft/winget-cli/labels/Help%20Wanted).
 
 ---
 
@@ -116,15 +124,31 @@ Once you've discussed your proposed feature/fix/etc. with a team member, and you
 1. Work on your changes.
 1. Build and see if it works.
 
+### Coding Standards
+
+Before writing code, review [doc/Standards.md](./doc/Standards.md) for the conventions used in this codebase — naming, formatting, error handling, casts, `std::move()` usage, and resource strings. PRs that diverge from these conventions will be asked to bring their changes into line before review completes.
+
 ### Testing
 
-Testing is a key component in the development workflow.
+Testing is a key part of getting a change ready for review.
+
+If your contribution changes behavior or implementation, please plan to add or update automated tests alongside the code.
+
+As a quick rule of thumb: unit tests in `AppInstallerCLITests` focus on the code and logic, while end-to-end tests in `AppInstallerCLIE2ETests` focus on actual `winget` command behavior and the resulting system outcomes.
+
+For non-trivial code changes, the bar is high. Where practical, include both unit tests and end-to-end coverage. If you believe that tests aren't needed for your change, please call that out in your PR and explain why.
+
+Documentation-only updates and non-functional metadata changes generally do not require new tests.
+
+For build and test execution details, see [Running Unit Tests](./doc/Developing.md#running-unit-tests) and [Running End-to-End Tests](./doc/Developing.md#running-end-to-end-tests) in [doc/Developing.md](./doc/Developing.md).
+
+PRs without appropriate coverage may be asked to add tests before review completes.
 
 ### Code Review
 
-When you'd like the team to take a look, (even if the work is not yet fully-complete), mark the Draft PR as 'Ready For Review' so that the team can review your work and provide comments, suggestions, and request changes. It may take several cycles, but the end result will be solid, testable, conformant code that is safe for us to merge.
+When you'd like the team to take a look, (even if the work is not yet fully-complete), mark the Draft PR as 'Ready For Review' so that the team can review your work and provide comments, suggestions, and request changes. It may take several cycles, but the result will be solid, testable, conformant code that is safe for us to merge.
 
-> ⚠ Remember: **changes you make may affect both the Windows Package Manager and the schema support implemented in our validation pipelines!** Because of this, we will treat community PR's with the same level of scrutiny and rigor as commits submitted to the official Windows source by team members and partners.
+> ⚠ Remember: **changes you make may affect both the Windows Package Manager and the schema support implemented in our validation pipelines!** Because of this, we will treat community PRs with the same level of scrutiny and rigor as commits submitted to the official Windows source by team members and partners.
 
 ### Merge
 

@@ -14,7 +14,7 @@ namespace AppInstaller::CLI
         Resource::LocString ShortDescription() const override;
         Resource::LocString LongDescription() const override;
 
-        std::string HelpLink() const override;
+        Utility::LocIndView HelpLink() const override;
 
     protected:
         void ExecuteInternal(Execution::Context& context) const override;
@@ -29,15 +29,16 @@ namespace AppInstaller::CLI
         Resource::LocString ShortDescription() const override;
         Resource::LocString LongDescription() const override;
 
-        std::string HelpLink() const override;
+        Utility::LocIndView HelpLink() const override;
 
     protected:
+        void ValidateArgumentsInternal(Execution::Args& execArgs) const override;
         void ExecuteInternal(Execution::Context& context) const override;
     };
 
     struct SourceListCommand final : public Command
     {
-        SourceListCommand(std::string_view parent) : Command("list", parent) {}
+        SourceListCommand(std::string_view parent) : Command("list", { "ls" }, parent) {}
 
         std::vector<Argument> GetArguments() const override;
 
@@ -46,7 +47,7 @@ namespace AppInstaller::CLI
 
         void Complete(Execution::Context& context, Execution::Args::Type valueType) const override;
 
-        std::string HelpLink() const override;
+        Utility::LocIndView HelpLink() const override;
 
     protected:
         void ExecuteInternal(Execution::Context& context) const override;
@@ -63,7 +64,7 @@ namespace AppInstaller::CLI
 
         void Complete(Execution::Context& context, Execution::Args::Type valueType) const override;
 
-        std::string HelpLink() const override;
+        Utility::LocIndView HelpLink() const override;
 
     protected:
         void ExecuteInternal(Execution::Context& context) const override;
@@ -81,7 +82,7 @@ namespace AppInstaller::CLI
 
         void Complete(Execution::Context& context, Execution::Args::Type valueType) const override;
 
-        std::string HelpLink() const override;
+        Utility::LocIndView HelpLink() const override;
 
     protected:
         void ExecuteInternal(Execution::Context& context) const override;
@@ -98,7 +99,7 @@ namespace AppInstaller::CLI
 
         void Complete(Execution::Context& context, Execution::Args::Type valueType) const override;
 
-        std::string HelpLink() const override;
+        Utility::LocIndView HelpLink() const override;
 
     protected:
         void ExecuteInternal(Execution::Context& context) const override;
@@ -106,7 +107,7 @@ namespace AppInstaller::CLI
 
     struct SourceExportCommand final : public Command
     {
-        SourceExportCommand(std::string_view parent) : Command("export", parent) {}
+        SourceExportCommand(std::string_view parent) : Command("export", parent, CommandOutputFlags::IgnoreSettingsWarnings) {}
 
         std::vector<Argument> GetArguments() const override;
 
@@ -115,9 +116,25 @@ namespace AppInstaller::CLI
 
         void Complete(Execution::Context& context, Execution::Args::Type valueType) const override;
 
-        std::string HelpLink() const override;
+        Utility::LocIndView HelpLink() const override;
 
     protected:
+        void ExecuteInternal(Execution::Context& context) const override;
+    };
+
+    struct SourceEditCommand final : public Command
+    {
+        SourceEditCommand(std::string_view parent) : Command("edit", { "config", "set" }, parent) {}
+
+        std::vector<Argument> GetArguments() const override;
+
+        Resource::LocString ShortDescription() const override;
+        Resource::LocString LongDescription() const override;
+
+        Utility::LocIndView HelpLink() const override;
+
+    protected:
+        void ValidateArgumentsInternal(Execution::Args& execArgs) const override;
         void ExecuteInternal(Execution::Context& context) const override;
     };
 }

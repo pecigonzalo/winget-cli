@@ -37,4 +37,8 @@
   <ItemGroup>
     <CopyFileToFolders Include="Microsoft.Management.Deployment.InProc.dll.manifest" />
   </ItemGroup>
+  <ItemGroup>
+    <Natvis Include="$(MSBuildThisFileDirectory)..\..\natvis\wil.natvis" />
+    <Natvis Include="$(MSBuildThisFileDirectory)..\..\natvis\wil.natstepfilter" />
+  </ItemGroup>
 </Project>

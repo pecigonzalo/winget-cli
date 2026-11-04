@@ -3,6 +3,7 @@
 #include "pch.h"
 #include "winget/PackageTrackingCatalog.h"
 #include "PackageTrackingCatalogSourceFactory.h"
+#include "winget/Pin.h"
 #include "winget/RepositorySource.h"
 #include "Microsoft/SQLiteIndexSource.h"
 #include "AppInstallerDateTime.h"
@@ -16,10 +17,11 @@ namespace AppInstaller::Repository
     namespace
     {
         constexpr std::string_view c_PackageTrackingFileName = "installed.db";
+        constexpr std::string_view c_PackageTrackingCorruptedFileName = "installed-corrupted.db";
 
-        std::string CreateNameForCPRWL(const std::string& pathName)
+        std::string CreateNameForCPL(const std::string& pathName)
         {
-            return "PackageTrackingCPRWL_"s + pathName;
+            return "PackageTrackingCPL_"s + pathName;
         }
 
         std::filesystem::path GetPackageTrackingFilePath(const std::string& pathName)
@@ -28,6 +30,42 @@ namespace AppInstaller::Repository
             result /= pathName;
             result /= c_PackageTrackingFileName;
             return result;
+        }
+
+        // Call while holding the CrossProcessLock
+        SQLiteIndex CreateOnlyTrackingIndex(const std::filesystem::path& trackingDB)
+        {
+            return SQLiteIndex::CreateNew(trackingDB.u8string(), SQLite::Version::Latest(), SQLiteIndex::CreateOptions::SupportPathless | SQLiteIndex::CreateOptions::DisableDependenciesSupport);
+        }
+
+        // Call while holding the CrossProcessLock
+        SQLiteIndex CreateOrOpenTrackingIndex(const std::filesystem::path& trackingDB)
+        {
+            if (!std::filesystem::exists(trackingDB))
+            {
+                std::filesystem::create_directories(trackingDB.parent_path());
+                return CreateOnlyTrackingIndex(trackingDB);
+            }
+            else
+            {
+                try
+                {
+                    // TODO: Check schema version and upgrade as necessary when there is a relevant new schema.
+                    //       Could write this all now but it will be better tested when there is a new schema.
+                    return SQLiteIndex::Open(trackingDB.u8string(), SQLiteIndex::OpenDisposition::ReadWrite);
+                }
+                catch(...)
+                {
+                    LOG_CAUGHT_EXCEPTION_MSG("Exception opening tracking catalog");
+                }
+
+                // Move existing database and create a new one
+                std::filesystem::path destination{ trackingDB };
+                destination.replace_filename(c_PackageTrackingCorruptedFileName);
+                SQLite::SQLiteStorageBase::RenameSQLiteDatabase(trackingDB, destination, true);
+
+                return CreateOnlyTrackingIndex(trackingDB);
+            }
         }
 
         struct PackageTrackingCatalogSourceReference : public ISourceReference
@@ -44,32 +82,18 @@ namespace AppInstaller::Repository
                 return m_details.Identifier;
             }
 
-            std::shared_ptr<ISource> Open(IProgressCallback&) override
+            std::shared_ptr<ISource> Open(IProgressCallback& callback) override
             {
                 m_details.Arg = Utility::MakeSuitablePathPart(m_details.Data);
                 std::filesystem::path trackingDB = GetPackageTrackingFilePath(m_details.Arg);
 
-                std::string lockName = CreateNameForCPRWL(m_details.Arg);
-
-                if (!std::filesystem::exists(trackingDB))
+                Synchronization::CrossProcessLock lock(CreateNameForCPL(m_details.Arg));
+                if (!lock.Acquire(callback))
                 {
-                    auto exclusiveLock = Synchronization::CrossProcessReaderWriteLock::LockExclusive(lockName);
-
-                    if (!std::filesystem::exists(trackingDB))
-                    {
-                        std::filesystem::create_directories(trackingDB.parent_path());
-                        SQLiteIndex::CreateNew(trackingDB.u8string(), Schema::Version::Latest(), SQLiteIndex::CreateOptions::SupportPathless | SQLiteIndex::CreateOptions::DisableDependenciesSupport);
-                    }
+                    return {};
                 }
 
-                auto lock = Synchronization::CrossProcessReaderWriteLock::LockShared(lockName);
-
-                SQLiteIndex index = SQLiteIndex::Open(trackingDB.u8string(), SQLiteIndex::OpenDisposition::ReadWrite);
-
-                // TODO: Check schema version and upgrade as necessary when there is a relevant new schema.
-                //       Could write this all now but it will be better tested when there is a new schema.
-
-                return std::make_shared<SQLiteIndexSource>(m_details, std::move(index), std::move(lock));
+                return std::make_shared<SQLiteIndexSource>(m_details, CreateOrOpenTrackingIndex(trackingDB));
             }
 
         private:
@@ -79,6 +103,11 @@ namespace AppInstaller::Repository
 
         struct PackageTrackingCatalogSourceFactoryImpl : public ISourceFactory
         {
+            std::string_view TypeName() const override final
+            {
+                return PackageTrackingCatalogSourceFactory::Type();
+            }
+
             std::shared_ptr<ISourceReference> Create(const SourceDetails& details) override final
             {
                 THROW_HR_IF(E_INVALIDARG, !Utility::CaseInsensitiveEquals(details.Type, PackageTrackingCatalogSourceFactory::Type()));
@@ -102,10 +131,8 @@ namespace AppInstaller::Repository
 
                 std::string pathName = Utility::MakeSuitablePathPart(details.Data);
 
-                std::string lockName = CreateNameForCPRWL(pathName);
-                auto lock = Synchronization::CrossProcessReaderWriteLock::LockExclusive(lockName, progress);
-
-                if (!lock)
+                Synchronization::CrossProcessLock lock(CreateNameForCPL(pathName));
+                if (!lock.Acquire(progress))
                 {
                     return false;
                 }
@@ -155,7 +182,7 @@ namespace AppInstaller::Repository
 
         PackageTrackingCatalog result;
         result.m_implementation = std::make_shared<PackageTrackingCatalog::implementation>();
-        result.m_implementation->Source = std::dynamic_pointer_cast<SQLiteIndexSource>(ISourceFactory::GetForType(details.Type)->Create(details)->Open(dummyProgress));
+        result.m_implementation->Source = SourceCast<SQLiteIndexSource>(ISourceFactory::GetForType(details.Type)->Create(details)->Open(dummyProgress));
 
         return result;
     }
@@ -192,25 +219,23 @@ namespace AppInstaller::Repository
         SQLiteIndex::IdType Id;
     };
 
-    PackageTrackingCatalog::Version::Version() = default;
     PackageTrackingCatalog::Version::Version(const Version&) = default;
     PackageTrackingCatalog::Version& PackageTrackingCatalog::Version::operator=(const Version&) = default;
     PackageTrackingCatalog::Version::Version(Version&&) noexcept = default;
     PackageTrackingCatalog::Version& PackageTrackingCatalog::Version::operator=(Version&&) noexcept = default;
     PackageTrackingCatalog::Version::~Version() = default;
 
-    PackageTrackingCatalog::Version::Version(std::shared_ptr<implementation>&& value) :
-        m_implementation(std::move(value)) {}
+    PackageTrackingCatalog::Version::Version(PackageTrackingCatalog& catalog, std::shared_ptr<implementation>&& value) :
+        m_catalog(&catalog), m_implementation(std::move(value)) {}
 
     void PackageTrackingCatalog::Version::SetMetadata(PackageVersionMetadata metadata, const Utility::NormalizedString& value)
     {
-        UNREFERENCED_PARAMETER(metadata);
-        UNREFERENCED_PARAMETER(value);
-        THROW_HR(E_NOTIMPL);
+        auto& index = m_catalog->m_implementation->Source->GetIndex();
+        index.SetMetadataByManifestId(m_implementation->Id, metadata, value);
     }
 
     PackageTrackingCatalog::Version PackageTrackingCatalog::RecordInstall(
-        const Manifest::Manifest& manifest,
+        Manifest::Manifest& manifest,
         const Manifest::ManifestInstaller& installer,
         bool isUpgrade)
     {
@@ -218,6 +243,15 @@ namespace AppInstaller::Repository
         UNREFERENCED_PARAMETER(isUpgrade);
 
         auto& index = m_implementation->Source->GetIndex();
+
+        // Strip ARP version information from the manifest if it is present
+        for (auto& arpRangeRemovedInstaller : manifest.Installers)
+        {
+            for (auto& arpRangeRemovedEntry : arpRangeRemovedInstaller.AppsAndFeaturesEntries)
+            {
+                arpRangeRemovedEntry.DisplayVersion.clear();
+            }
+        }
 
         // Check for an existing manifest that matches this one (could be reinstalling)
         auto manifestIdOpt = index.GetManifestIdByManifest(manifest);
@@ -240,12 +274,19 @@ namespace AppInstaller::Repository
 
         if (installer.RequireExplicitUpgrade)
         {
-            index.SetMetadataByManifestId(manifestId, PackageVersionMetadata::PinnedState, ToString(PackagePinnedState::PinnedByManifest));
+            index.SetMetadataByManifestId(manifestId, PackageVersionMetadata::PinnedState, ToString(Pinning::PinType::PinnedByManifest));
+        }
+
+        // Record installed architecture and locale if applicable
+        index.SetMetadataByManifestId(manifestId, PackageVersionMetadata::InstalledArchitecture, ToString(installer.Arch));
+        if (!installer.Locale.empty())
+        {
+            index.SetMetadataByManifestId(manifestId, PackageVersionMetadata::InstalledLocale, installer.Locale);
         }
 
         std::shared_ptr<Version::implementation> result = std::make_shared<Version::implementation>();
         result->Id = manifestId;
-        return { std::move(result) };
+        return { *this, std::move(result) };
     }
 
     void PackageTrackingCatalog::RecordUninstall(const Utility::LocIndString& packageIdentifier)
@@ -262,15 +303,17 @@ namespace AppInstaller::Repository
 
             for (const auto& version : versions)
             {
-                auto manifestId = index.GetManifestIdByKey(match.first, version.GetVersion().ToString(), version.GetChannel().ToString());
-
-                if (manifestId)
-                {
-                    index.RemoveManifestById(manifestId.value());
-                }
+                index.RemoveManifestById(version.ManifestId);
             }
         }
     }
+
+#ifndef AICLI_DISABLE_TEST_HOOKS
+    std::filesystem::path PackageTrackingCatalog::GetFilePath() const
+    {
+        return m_implementation->Source->GetIndex().GetContextData().Get<Schema::Property::DatabaseFilePath>();
+    }
+#endif
 
     std::unique_ptr<ISourceFactory> PackageTrackingCatalogSourceFactory::Create()
     {

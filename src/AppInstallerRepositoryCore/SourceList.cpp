@@ -4,6 +4,7 @@
 #include "SourceList.h"
 #include "SourcePolicy.h"
 #include "Microsoft/PreIndexedPackageSourceFactory.h"
+#include "Microsoft/PreIndexed/SourceData.h"
 #include "Rest/RestSourceFactory.h"
 
 #include <winget/AdminSettings.h>
@@ -24,17 +25,41 @@ namespace AppInstaller::Repository
         constexpr std::string_view s_SourcesYaml_Source_Data = "Data"sv;
         constexpr std::string_view s_SourcesYaml_Source_Identifier = "Identifier"sv;
         constexpr std::string_view s_SourcesYaml_Source_IsTombstone = "IsTombstone"sv;
+        constexpr std::string_view s_SourcesYaml_Source_IsOverride = "IsOverride"sv;
+        constexpr std::string_view s_SourcesYaml_Source_Explicit = "Explicit"sv;
+        constexpr std::string_view s_SourcesYaml_Source_TrustLevel = "TrustLevel"sv;
+        constexpr std::string_view s_SourcesYaml_Source_Priority = "Priority"sv;
 
         constexpr std::string_view s_MetadataYaml_Sources = "Sources"sv;
         constexpr std::string_view s_MetadataYaml_Source_Name = "Name"sv;
         constexpr std::string_view s_MetadataYaml_Source_LastUpdate = "LastUpdate"sv;
+        constexpr std::string_view s_MetadataYaml_Source_DoNotUpdateBefore = "DoNotUpdateBefore"sv;
         constexpr std::string_view s_MetadataYaml_Source_AcceptedAgreementsIdentifier = "AcceptedAgreementsIdentifier"sv;
         constexpr std::string_view s_MetadataYaml_Source_AcceptedAgreementFields = "AcceptedAgreementFields"sv;
 
         constexpr std::string_view s_Source_WingetCommunityDefault_Name = "winget"sv;
         constexpr std::string_view s_Source_WingetCommunityDefault_Arg = "https://cdn.winget.microsoft.com/cache"sv;
-        constexpr std::string_view s_Source_WingetCommunityDefault_Data = "Microsoft.Winget.Source_8wekyb3d8bbwe"sv;
+        constexpr std::string_view s_Source_WingetCommunityDefault_FullIdentity = "Microsoft.Winget.Source_8wekyb3d8bbwe"sv;
+        constexpr std::string_view s_Source_WingetCommunityDefault_DeltaIdentity = "Microsoft.Winget.Source.Delta_8wekyb3d8bbwe"sv;
+        constexpr std::string_view s_Source_WingetCommunityDefault_BaselineIdentity = "Microsoft.Winget.Source.Baseline_8wekyb3d8bbwe"sv;
         constexpr std::string_view s_Source_WingetCommunityDefault_Identifier = "Microsoft.Winget.Source_8wekyb3d8bbwe"sv;
+
+        // The Data of the built in winget source, which names its delta and baseline as well as
+        // its full index.
+        //
+        // This is the one source that names all three. A source that is added settles on one form
+        // or the other, but this one is declared rather than discovered, and naming the full index
+        // is what keeps it known by the identity it has always had: the local state directory and
+        // the cross process lock are derived from that, and every machine the client has ever run
+        // on already has state under it.
+        std::string GetWingetCommunityDefaultData()
+        {
+            Microsoft::PreIndexed::SourceData data;
+            data.FullIdentity(std::string{ s_Source_WingetCommunityDefault_FullIdentity });
+            data.DeltaIdentity(std::string{ s_Source_WingetCommunityDefault_DeltaIdentity });
+            data.BaselineIdentity(std::string{ s_Source_WingetCommunityDefault_BaselineIdentity });
+            return data.Serialize();
+        }
 
         constexpr std::string_view s_Source_MSStoreDefault_Name = "msstore"sv;
         constexpr std::string_view s_Source_MSStoreDefault_Arg = "https://storeedgefd.dsx.mp.microsoft.com/v9.0"sv;
@@ -44,6 +69,11 @@ namespace AppInstaller::Repository
         constexpr std::string_view s_Source_DesktopFrameworks_Arg = "https://cdn.winget.microsoft.com/platform"sv;
         constexpr std::string_view s_Source_DesktopFrameworks_Data = "Microsoft.Winget.Platform.Source_8wekyb3d8bbwe"sv;
         constexpr std::string_view s_Source_DesktopFrameworks_Identifier = "Microsoft.Winget.Platform.Source_8wekyb3d8bbwe"sv;
+
+        constexpr std::string_view s_Source_WingetCommunityFont_Name = "winget-font"sv;
+        constexpr std::string_view s_Source_WingetCommunityFont_Arg = "https://cdn.winget.microsoft.com/fonts"sv;
+        constexpr std::string_view s_Source_WingetCommunityFont_Data = "Microsoft.Winget.Fonts.Source_8wekyb3d8bbwe"sv;
+        constexpr std::string_view s_Source_WingetCommunityFont_Identifier = "Microsoft.Winget.Fonts.Source_8wekyb3d8bbwe"sv;
 
         // Attempts to read a single scalar value from the node.
         template<typename Value>
@@ -144,7 +174,10 @@ namespace AppInstaller::Repository
             else
             {
                 std::vector<SourceDetailsInternal> result;
-                THROW_HR_IF(APPINSTALLER_CLI_ERROR_SOURCES_INVALID, !TryReadSourceDetails(setting.GetName(), *sourcesStream, rootName, parse, result));
+                if (!TryReadSourceDetails(setting.GetName(), *sourcesStream, rootName, parse, result))
+                {
+                    AICLI_LOG(YAML, Error, << "Ignoring corrupted source data.");
+                }
                 return result;
             }
         }
@@ -177,6 +210,10 @@ namespace AppInstaller::Repository
                     out << YAML::Key << s_SourcesYaml_Source_Data << YAML::Value << details.Data;
                     out << YAML::Key << s_SourcesYaml_Source_Identifier << YAML::Value << details.Identifier;
                     out << YAML::Key << s_SourcesYaml_Source_IsTombstone << YAML::Value << details.IsTombstone;
+                    out << YAML::Key << s_SourcesYaml_Source_IsOverride << YAML::Value << details.IsOverride;
+                    out << YAML::Key << s_SourcesYaml_Source_Explicit << YAML::Value << details.Explicit;
+                    out << YAML::Key << s_SourcesYaml_Source_TrustLevel << YAML::Value << static_cast<int64_t>(details.TrustLevel);
+                    out << YAML::Key << s_SourcesYaml_Source_Priority << YAML::Value << details.Priority;
                     out << YAML::EndMap;
                 }
             }
@@ -203,9 +240,45 @@ namespace AppInstaller::Repository
 
     void SourceDetailsInternal::CopyMetadataFieldsTo(SourceDetailsInternal& target)
     {
-        target.LastUpdateTime = LastUpdateTime;
+        if (LastUpdateTime > target.LastUpdateTime)
+        {
+            target.LastUpdateTime = LastUpdateTime;
+        }
+
+        if (DoNotUpdateBefore > target.DoNotUpdateBefore)
+        {
+            target.DoNotUpdateBefore = DoNotUpdateBefore;
+        }
+
         target.AcceptedAgreementFields = AcceptedAgreementFields;
         target.AcceptedAgreementsIdentifier = AcceptedAgreementsIdentifier;
+    }
+
+    void SourceDetailsInternal::CopyMetadataFieldsFrom(const SourceDetails& source)
+    {
+        LastUpdateTime = source.LastUpdateTime;
+        DoNotUpdateBefore = source.DoNotUpdateBefore;
+    }
+
+    void SourceDetailsInternal::ResetMetadataFields()
+    {
+        LastUpdateTime = {};
+        DoNotUpdateBefore = {};
+        AcceptedAgreementFields = 0;
+        AcceptedAgreementsIdentifier = {};
+    }
+
+    void SourceDetailsInternal::CopyOverrideFieldsFrom(const SourceDetails& overrideSource)
+    {
+        // These are the supported Override fields.
+        Explicit = overrideSource.Explicit;
+        Priority = overrideSource.Priority;
+    }
+
+    bool SourceDetailsInternal::operator<(const SourceDetailsInternal& other) const
+    {
+        // Higher values come first in ordering and must be "less than" for standard sorting
+        return Priority > other.Priority;
     }
 
     std::string_view GetWellKnownSourceName(WellKnownSource source)
@@ -218,6 +291,8 @@ namespace AppInstaller::Repository
             return s_Source_MSStoreDefault_Name;
         case WellKnownSource::DesktopFrameworks:
             return s_Source_DesktopFrameworks_Name;
+        case WellKnownSource::WinGetFont:
+            return s_Source_WingetCommunityFont_Name;
         }
 
         return {};
@@ -233,6 +308,8 @@ namespace AppInstaller::Repository
             return s_Source_MSStoreDefault_Arg;
         case WellKnownSource::DesktopFrameworks:
             return s_Source_DesktopFrameworks_Arg;
+        case WellKnownSource::WinGetFont:
+            return s_Source_WingetCommunityFont_Arg;
         }
 
         return {};
@@ -248,6 +325,8 @@ namespace AppInstaller::Repository
             return s_Source_MSStoreDefault_Identifier;
         case WellKnownSource::DesktopFrameworks:
             return s_Source_DesktopFrameworks_Identifier;
+        case WellKnownSource::WinGetFont:
+            return s_Source_WingetCommunityFont_Identifier;
         }
 
         return {};
@@ -270,6 +349,11 @@ namespace AppInstaller::Repository
             return WellKnownSource::DesktopFrameworks;
         }
 
+        if (name == s_Source_WingetCommunityFont_Name && arg == s_Source_WingetCommunityFont_Arg && type == Rest::RestSourceFactory::Type())
+        {
+            return WellKnownSource::WinGetFont;
+        }
+
         return {};
     }
 
@@ -284,7 +368,7 @@ namespace AppInstaller::Repository
             details.Name = s_Source_WingetCommunityDefault_Name;
             details.Type = Microsoft::PreIndexedPackageSourceFactory::Type();
             details.Arg = s_Source_WingetCommunityDefault_Arg;
-            details.Data = s_Source_WingetCommunityDefault_Data;
+            details.Data = GetWingetCommunityDefaultData();
             details.Identifier = s_Source_WingetCommunityDefault_Identifier;
             details.TrustLevel = SourceTrustLevel::Trusted | SourceTrustLevel::StoreOrigin;
             return details;
@@ -300,20 +384,24 @@ namespace AppInstaller::Repository
             details.TrustLevel = SourceTrustLevel::Trusted;
             details.SupportInstalledSearchCorrelation = false;
 
-            if (!Settings::IsAdminSettingEnabled(Settings::AdminSetting::BypassCertificatePinningForMicrosoftStore))
+            if (!Settings::IsAdminSettingEnabled(Settings::BoolAdminSetting::BypassCertificatePinningForMicrosoftStore))
             {
                 using namespace AppInstaller::Certificates;
 
-                PinningChain chain;
-                auto chainElement = chain.Root();
-                chainElement->LoadCertificate(IDX_CERTIFICATE_STORE_ROOT_1).SetPinning(PinningVerificationType::PublicKey);
-                chainElement = chainElement.Next();
-                chainElement->LoadCertificate(IDX_CERTIFICATE_STORE_INTERMEDIATE_1).SetPinning(PinningVerificationType::Subject | PinningVerificationType::Issuer);
-                chainElement = chainElement.Next();
-                chainElement->LoadCertificate(IDX_CERTIFICATE_STORE_LEAF_1).SetPinning(PinningVerificationType::Subject | PinningVerificationType::Issuer);
+                // See https://aka.ms/AzureTLSCAs (internal) for the source of these CAs
+                PinningChain chain1;
+                chain1.PartialChain().Root()->
+                    LoadCertificate(IDX_CERTIFICATE_MS_TLS_ECC_ROOT_G2, CERTIFICATE_RESOURCE_TYPE).
+                    SetPinning(PinningVerificationType::PublicKey | PinningVerificationType::AnyIssuer | PinningVerificationType::RequireNonLeaf);
+
+                PinningChain chain2;
+                chain2.PartialChain().Root()->
+                    LoadCertificate(IDX_CERTIFICATE_MS_TLS_RSA_ROOT_G2, CERTIFICATE_RESOURCE_TYPE).
+                    SetPinning(PinningVerificationType::PublicKey | PinningVerificationType::AnyIssuer | PinningVerificationType::RequireNonLeaf);
 
                 details.CertificatePinningConfiguration = PinningConfiguration("Microsoft Store Source");
-                details.CertificatePinningConfiguration.AddChain(std::move(chain));
+                details.CertificatePinningConfiguration.AddChain(std::move(chain1));
+                details.CertificatePinningConfiguration.AddChain(std::move(chain2));
             }
 
             return details;
@@ -329,6 +417,19 @@ namespace AppInstaller::Repository
             details.Identifier = s_Source_DesktopFrameworks_Identifier;
             details.TrustLevel = SourceTrustLevel::Trusted | SourceTrustLevel::StoreOrigin;
             details.IsVisible = false;
+            return details;
+        }
+        case WellKnownSource::WinGetFont:
+        {
+            SourceDetailsInternal details;
+            details.Origin = SourceOrigin::Default;
+            details.Name = s_Source_WingetCommunityFont_Name;
+            details.Type = Microsoft::PreIndexedPackageSourceFactory::Type();
+            details.Arg = s_Source_WingetCommunityFont_Arg;
+            details.Data = s_Source_WingetCommunityFont_Data;
+            details.Identifier = s_Source_WingetCommunityFont_Identifier;
+            details.TrustLevel = SourceTrustLevel::Trusted | SourceTrustLevel::StoreOrigin;
+            details.Explicit = true;
             return details;
         }
         }
@@ -354,7 +455,7 @@ namespace AppInstaller::Repository
             }
             else
             {
-                AICLI_LOG(Repo, Info, << "GetCurrentSourceRefs: Source named '" << s.Name << "' from origin " << ToString(s.Origin) << " is hidden and is dropped.");
+                AICLI_LOG(Repo, Verbose, << "GetCurrentSourceRefs: Source named '" << s.Name << "' from origin " << ToString(s.Origin) << " is hidden and is dropped.");
             }
         }
 
@@ -369,6 +470,25 @@ namespace AppInstaller::Repository
                 return Utility::ICUCaseInsensitiveEquals(sd.Name, name) &&
                     (includeHidden || !ShouldBeHidden(sd));
             });
+    }
+
+    bool SourceList::TryFindSourceByOrigin(std::string_view name, SourceOrigin origin, SourceDetailsInternal& targetSourceOut, bool includeHidden)
+    {
+        auto defaultSources = GetSourcesByOrigin(origin);
+        auto iter = std::find_if(defaultSources.begin(), defaultSources.end(),
+            [name, includeHidden](const SourceDetailsInternal& sd)
+            {
+                return Utility::ICUCaseInsensitiveEquals(sd.Name, name) &&
+                    (includeHidden || !ShouldBeHidden(sd));
+            });
+
+        if (iter == defaultSources.end())
+        {
+            return false;
+        }
+
+        targetSourceOut = (*iter);
+        return true;
     }
 
     SourceDetailsInternal* SourceList::GetCurrentSource(std::string_view name)
@@ -453,6 +573,14 @@ namespace AppInstaller::Repository
                     return;
                 }
 
+                // If this is an override of a default source, turn this into a tombstone instead of removing it.
+                if (target->IsOverride)
+                {
+                    target->IsOverride = false;
+                    target->IsTombstone = true;
+                    break;
+                }
+
                 m_sourceList.erase(target);
             }
                 break;
@@ -476,6 +604,104 @@ namespace AppInstaller::Repository
         THROW_HR_IF_MSG(E_UNEXPECTED, !sourcesSet, "Too many attempts at SetSourcesByOrigin");
 
         SaveMetadataInternal(details, true);
+    }
+
+    void SourceList::EditSource(const SourceDetailsInternal& detailsRef)
+    {
+        // Copy the incoming details because we might destroy the referenced structure
+        // when reloading the source details from settings.
+        SourceDetailsInternal details = detailsRef;
+        bool sourcesSet = false;
+
+        for (size_t i = 0; !sourcesSet && i < 10; ++i)
+        {
+            switch (details.Origin)
+            {
+            case SourceOrigin::Default:
+            {
+                auto target = FindSource(details.Name, true);
+                if (target == m_sourceList.end())
+                {
+                    THROW_HR_MSG(E_UNEXPECTED, "Default source not in SourceList");
+                }
+
+                if (!target->IsTombstone)
+                {
+                    // Copy the original and then apply the override fields.
+                    SourceDetailsInternal override = *target;
+                    override.Origin = SourceOrigin::User;
+                    override.IsOverride = true;
+                    override.CopyOverrideFieldsFrom(details);
+                    m_sourceList.emplace_back(std::move(override));
+                }
+            }
+            break;
+            case SourceOrigin::User:
+            {
+                auto target = FindSource(details.Name);
+                if (target == m_sourceList.end())
+                {
+                    // Assumed that an update to the sources removed it first
+                    return;
+                }
+
+                // Editing a User Source is just replacing the fields that can be edited.
+                target->CopyOverrideFieldsFrom(details);
+            }
+            break;
+            case SourceOrigin::GroupPolicy:
+                // This should have already been blocked higher up.
+                AICLI_LOG(Repo, Error, << "Attempting to edit a Group Policy source: " << details.Name);
+                THROW_HR(E_UNEXPECTED);
+            default:
+                THROW_HR(E_UNEXPECTED);
+            }
+
+            sourcesSet = SetSourcesByOrigin(SourceOrigin::User, m_sourceList);
+
+            if (!sourcesSet)
+            {
+                OverwriteSourceList();
+                OverwriteMetadata();
+            }
+        }
+
+        THROW_HR_IF_MSG(E_UNEXPECTED, !sourcesSet, "Too many attempts at SetSourcesByOrigin");
+
+        SaveMetadataInternal(details, true);
+    }
+
+    void SourceList::ResetSource(const SourceDetailsInternal& detailsRef)
+    {
+        // Copy the incoming details because we might destroy the referenced structure
+        // when reloading the source details from settings.
+        SourceDetailsInternal details = detailsRef;
+        bool sourcesSet = false;
+
+        for (size_t i = 0; !sourcesSet && i < 10; ++i)
+        {
+            // Remove any user-level entry for this source (tombstone or override).
+            auto itr = FindSource(details.Name, true);
+            if (itr != m_sourceList.end() && itr->Origin == SourceOrigin::User)
+            {
+                m_sourceList.erase(itr);
+            }
+
+            sourcesSet = SetSourcesByOrigin(SourceOrigin::User, m_sourceList);
+
+            if (!sourcesSet)
+            {
+                OverwriteSourceList();
+                OverwriteMetadata();
+            }
+        }
+
+        THROW_HR_IF_MSG(E_UNEXPECTED, !sourcesSet, "Too many attempts at SetSourcesByOrigin");
+
+        // Reload to bring back the Default source (now that the user entry is removed).
+        OverwriteSourceList();
+
+        ResetMetadataInternal(details);
     }
 
     void SourceList::SaveMetadata(const SourceDetailsInternal& details)
@@ -552,6 +778,8 @@ namespace AppInstaller::Repository
                 }
             }
         }
+
+        std::stable_sort(m_sourceList.begin(), m_sourceList.end());
     }
 
     void SourceList::OverwriteMetadata()
@@ -590,6 +818,11 @@ namespace AppInstaller::Repository
                 result.emplace_back(GetWellKnownSourceDetailsInternal(WellKnownSource::WinGet));
             }
 
+            if (IsWellKnownSourceEnabled(WellKnownSource::WinGetFont))
+            {
+                result.emplace_back(GetWellKnownSourceDetailsInternal(WellKnownSource::WinGetFont));
+            }
+
             // Since the source is not visible outside, this is added just to have the source in the internal
             // list for tracking updates.  Thus there is no need to check a policy.
             result.emplace_back(GetWellKnownSourceDetailsInternal(WellKnownSource::DesktopFrameworks));
@@ -608,7 +841,17 @@ namespace AppInstaller::Repository
                     if (!TryReadScalar(name, settingValue, source, s_SourcesYaml_Source_Arg, details.Arg)) { return false; }
                     if (!TryReadScalar(name, settingValue, source, s_SourcesYaml_Source_Data, details.Data)) { return false; }
                     if (!TryReadScalar(name, settingValue, source, s_SourcesYaml_Source_IsTombstone, details.IsTombstone)) { return false; }
+                    TryReadScalar(name, settingValue, source, s_SourcesYaml_Source_Explicit, details.Explicit, false);
                     TryReadScalar(name, settingValue, source, s_SourcesYaml_Source_Identifier, details.Identifier, false);
+                    TryReadScalar(name, settingValue, source, s_SourcesYaml_Source_IsOverride, details.IsOverride, false);
+                    TryReadScalar(name, settingValue, source, s_SourcesYaml_Source_Priority, details.Priority, false);
+
+                    int64_t trustLevelValue;
+                    if (TryReadScalar(name, settingValue, source, s_SourcesYaml_Source_TrustLevel, trustLevelValue, false))
+                    {
+                        details.TrustLevel = static_cast<Repository::SourceTrustLevel>(trustLevelValue);
+                    }
+
                     return true;
                 });
 
@@ -621,6 +864,25 @@ namespace AppInstaller::Repository
                     continue;
                 }
 
+                // If this is an override source, we need to get the target of the override and apply the override data on top of it.
+                if (source.IsOverride)
+                {
+                    SourceDetailsInternal override;
+                    if (!TryFindSourceByOrigin(source.Name, SourceOrigin::Default, override))
+                    {
+                        // The default source may be disabled, in which case it may not be returned in the list of default sources.
+                        AICLI_LOG(Repo, Warning, << "User source " << source.Name << " is an override for a nonexistent Default Source.");
+                        continue;
+                    }
+
+                    override.CopyOverrideFieldsFrom(source);
+                    override.Origin = SourceOrigin::User;
+                    override.IsOverride = true;
+                    result.emplace_back(std::move(override));
+                    AICLI_LOG(Repo, Info, << "User source " << source.Name << " is overriding the Default source of the same name.");
+                    continue;
+                }
+
                 result.emplace_back(std::move(source));
             }
         }
@@ -630,10 +892,10 @@ namespace AppInstaller::Repository
             if (GroupPolicies().GetState(TogglePolicy::Policy::AdditionalSources) == PolicyState::Enabled)
             {
                 AICLI_LOG(Repo, Verbose, << "Additional sources GP is enabled...");
-                auto additionalSourcesOpt = GroupPolicies().GetValueRef<ValuePolicy::AdditionalSources>();
+                auto additionalSourcesOpt = GroupPolicies().GetValue<ValuePolicy::AdditionalSources>();
                 if (additionalSourcesOpt.has_value())
                 {
-                    const auto& additionalSources = additionalSourcesOpt->get();
+                    const auto& additionalSources = additionalSourcesOpt.value();
                     for (const auto& additionalSource : additionalSources)
                     {
                         AICLI_LOG(Repo, Verbose, << "... with configured source " << additionalSource.Name);
@@ -644,9 +906,21 @@ namespace AppInstaller::Repository
                         details.Data = additionalSource.Data;
                         details.Identifier = additionalSource.Identifier;
                         details.Origin = SourceOrigin::GroupPolicy;
+                        details.Explicit = additionalSource.Explicit;
+                        details.Priority = additionalSource.Priority.value_or(0);
 #ifndef AICLI_DISABLE_TEST_HOOKS
                         details.CertificatePinningConfiguration = additionalSource.PinningConfiguration;
 #endif
+                        try
+                        {
+                            details.TrustLevel = Repository::ConvertToSourceTrustLevelFlag(additionalSource.TrustLevel);
+                        }
+                        catch (...)
+                        {
+                            details.TrustLevel = Repository::SourceTrustLevel::None;
+                            AICLI_LOG(Repo, Verbose, << "Invalid source trust level from policy. Trust level set to None.");
+                        }
+
                         result.emplace_back(std::move(details));
                     }
                 }
@@ -694,9 +968,17 @@ namespace AppInstaller::Repository
                 details.Origin = SourceOrigin::Metadata;
                 std::string_view name = m_metadataStream.GetName();
                 if (!TryReadScalar(name, settingValue, source, s_MetadataYaml_Source_Name, details.Name)) { return false; }
+
                 int64_t lastUpdateInEpoch{};
                 if (!TryReadScalar(name, settingValue, source, s_MetadataYaml_Source_LastUpdate, lastUpdateInEpoch)) { return false; }
                 details.LastUpdateTime = Utility::ConvertUnixEpochToSystemClock(lastUpdateInEpoch);
+
+                int64_t doNotUpdateBeforeInEpoch{};
+                if (TryReadScalar(name, settingValue, source, s_MetadataYaml_Source_DoNotUpdateBefore, doNotUpdateBeforeInEpoch, false))
+                {
+                    details.DoNotUpdateBefore = Utility::ConvertUnixEpochToSystemClock(doNotUpdateBeforeInEpoch);
+                }
+
                 TryReadScalar(name, settingValue, source, s_MetadataYaml_Source_AcceptedAgreementsIdentifier, details.AcceptedAgreementsIdentifier, false);
                 TryReadScalar(name, settingValue, source, s_MetadataYaml_Source_AcceptedAgreementFields, details.AcceptedAgreementFields, false);
                 return true;
@@ -715,6 +997,7 @@ namespace AppInstaller::Repository
             out << YAML::BeginMap;
             out << YAML::Key << s_MetadataYaml_Source_Name << YAML::Value << details.Name;
             out << YAML::Key << s_MetadataYaml_Source_LastUpdate << YAML::Value << Utility::ConvertSystemClockToUnixEpoch(details.LastUpdateTime);
+            out << YAML::Key << s_MetadataYaml_Source_DoNotUpdateBefore << YAML::Value << Utility::ConvertSystemClockToUnixEpoch(details.DoNotUpdateBefore);
             out << YAML::Key << s_MetadataYaml_Source_AcceptedAgreementsIdentifier << YAML::Value << details.AcceptedAgreementsIdentifier;
             out << YAML::Key << s_MetadataYaml_Source_AcceptedAgreementFields << YAML::Value << details.AcceptedAgreementFields;
             out << YAML::EndMap;
@@ -760,6 +1043,27 @@ namespace AppInstaller::Repository
                     details.CopyMetadataFieldsTo(*target);
                 }
             }
+        }
+
+        THROW_HR_IF_MSG(E_UNEXPECTED, !metadataSet, "Too many attempts at SetMetadata");
+    }
+
+    void SourceList::ResetMetadataInternal(const SourceDetailsInternal& details)
+    {
+        bool metadataSet = false;
+
+        for (size_t i = 0; !metadataSet && i < 10; ++i)
+        {
+            // Load fresh metadata from storage so that other sources' metadata is preserved.
+            OverwriteMetadata();
+
+            auto target = FindSource(details.Name, true);
+            if (target != m_sourceList.end())
+            {
+                target->ResetMetadataFields();
+            }
+
+            metadataSet = SetMetadata(m_sourceList);
         }
 
         THROW_HR_IF_MSG(E_UNEXPECTED, !metadataSet, "Too many attempts at SetMetadata");

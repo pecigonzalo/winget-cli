@@ -11,6 +11,9 @@ namespace AppInstaller::CLI
         constexpr static std::string_view CommandName = "download"sv;
         COMDownloadCommand(std::string_view parent) : Command(CommandName, parent) {}
 
+        CLI::Resource::LocString ShortDescription() const override { return {}; }
+        CLI::Resource::LocString LongDescription() const override { return {}; }
+
     protected:
         void ExecuteInternal(Execution::Context& context) const override;
     };
@@ -21,6 +24,9 @@ namespace AppInstaller::CLI
         constexpr static std::string_view CommandName = "install"sv;
         COMInstallCommand(std::string_view parent) : Command(CommandName, parent) {}
 
+        CLI::Resource::LocString ShortDescription() const override { return {}; }
+        CLI::Resource::LocString LongDescription() const override { return {}; }
+
     protected:
         void ExecuteInternal(Execution::Context& context) const override;
     };
@@ -30,6 +36,22 @@ namespace AppInstaller::CLI
     {
         constexpr static std::string_view CommandName = "uninstall"sv;
         COMUninstallCommand(std::string_view parent) : Command(CommandName, parent) {}
+
+        CLI::Resource::LocString ShortDescription() const override { return {}; }
+        CLI::Resource::LocString LongDescription() const override { return {}; }
+
+    protected:
+        void ExecuteInternal(Execution::Context& context) const override;
+    };
+
+    // IMPORTANT: To use this command, the caller should have already retrieved the InstalledPackageVersion and added it to the Context Data
+    struct COMRepairCommand final : public Command
+    {
+        constexpr static std::string_view CommandName = "repair"sv;
+        COMRepairCommand(std::string_view parent) : Command(CommandName, parent) {}
+
+        CLI::Resource::LocString ShortDescription() const override { return {}; }
+        CLI::Resource::LocString LongDescription() const override { return {}; }
 
     protected:
         void ExecuteInternal(Execution::Context& context) const override;

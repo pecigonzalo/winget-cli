@@ -6,13 +6,10 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <None Include="$(MSBuildThisFileDirectory)StoreRoot1.cer">
+    <None Include="$(MSBuildThisFileDirectory)Microsoft_TLS_ECC_Root_G2.crt">
       <Filter>Certificates</Filter>
     </None>
-    <None Include="$(MSBuildThisFileDirectory)StoreIntermediate1.cer">
-      <Filter>Certificates</Filter>
-    </None>
-    <None Include="$(MSBuildThisFileDirectory)StoreLeaf1.cer">
+    <None Include="$(MSBuildThisFileDirectory)Microsoft_TLS_RSA_Root_G2.crt">
       <Filter>Certificates</Filter>
     </None>
   </ItemGroup>

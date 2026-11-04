@@ -4,8 +4,17 @@ Param(
   [String] $PackageIdentifier,
   [String] $SourceName,
   [String] $OutputPath,
-  [Switch] $UseDev
+  [Switch] $UseDev,
+  [Switch] $MetadataCollection,
+  [String] $System32Path,
+  [Int32] $GeoID = 0
 )
+
+if ($GeoID -ne 0)
+{
+  Write-Host "--> Setting GeoID to $GeoID"
+  Set-WinHomeLocation -GeoId $GeoID
+}
 
 function Get-ARPTable {
   $registry_paths = @('HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*','HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*', 'HKCU:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*')
@@ -60,7 +69,9 @@ if ($UseDev)
 }
 else
 {
-  Add-AppxPackage -Path $DesktopAppInstallerPath -DependencyPath $DesktopAppInstallerDependencyPath
+  Install-PackageProvider -Name NuGet -Force | Out-Null
+  Install-Module Microsoft.WinGet.Client -Force | Out-Null
+  Repair-WingetPackageManager -Latest
 }
 
 $originalARP = Get-ARPTable
@@ -73,15 +84,21 @@ Write-Host @"
 
 $installAndCorrelateOutPath = Join-Path $OutputPath "install_and_correlate.json"
 
-$installAndCorrelationExpression = Join-Path $desktopPath "InstallAndCheckCorrelation\InstallAndCheckCorrelation.exe"
-$installAndCorrelationExpression = -join($installAndCorrelationExpression, ' -id "', $PackageIdentifier, '" -src "', $SourceName, '" -out "', $installAndCorrelateOutPath, '"')
+$installAndCheckCorrelationExe = Join-Path $desktopPath "InstallAndCheckCorrelation\InstallAndCheckCorrelation.exe"
+$installAndCheckCorrelationArgs = @('-id', $PackageIdentifier, '-src', $SourceName, '-out', $installAndCorrelateOutPath)
 
 if ($UseDev)
 {
-  $installAndCorrelationExpression = -join($installAndCorrelationExpression, ' -dev')
+  $installAndCheckCorrelationArgs += '-dev'
 }
 
-Invoke-Expression $installAndCorrelationExpression
+if ($MetadataCollection)
+{
+  $wingetUtilPath = Join-Path $PSScriptRoot "WinGetUtil.dll"
+  $installAndCheckCorrelationArgs += ('-meta', $wingetUtilPath, '-sys32', $System32Path)
+}
+
+& $installAndCheckCorrelationExe $installAndCheckCorrelationArgs
 
 Write-Host @"
 

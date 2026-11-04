@@ -9,6 +9,7 @@
 #include <AppInstallerErrors.h>
 
 using namespace TestCommon;
+using namespace AppInstaller::Http;
 using namespace AppInstaller::Utility;
 using namespace AppInstaller::Manifest;
 using namespace AppInstaller::Repository;
@@ -36,7 +37,6 @@ namespace
     {
         utility::string_t GetSampleManifest_AllFields()
         {
-            utility::string_t id = L"Foo.Bar";
             return _XPLATSTR(
                 R"delimiter(
         {
@@ -190,7 +190,7 @@ namespace
         })delimiter");
         }
 
-        void VerifyLocalizations_AllFields(Manifest manifest)
+        void VerifyLocalizations_AllFields(const Manifest& manifest)
         {
             REQUIRE(manifest.DefaultLocalization.Locale == "en-US");
             REQUIRE(manifest.DefaultLocalization.Get<Localization::Publisher>() == "Foo");
@@ -245,7 +245,7 @@ namespace
             REQUIRE(frenchLocalization.Get<Localization::Agreements>().at(0).AgreementUrl == "https://AgreementUrl.net");
         }
 
-        void VerifyInstallers_AllFields(Manifest manifest)
+        void VerifyInstallers_AllFields(const Manifest& manifest)
         {
             REQUIRE(manifest.Installers.size() == 1);
 
@@ -311,7 +311,7 @@ TEST_CASE("Search_BadResponse_UnsupportedPackageMatchFields", "[RestSource][Inte
         })delimiter");
 
     HttpClientHelper helper{ GetTestRestRequestHandler(web::http::status_codes::OK, std::move(sample)) };
-    Interface v1_1{ TestRestUriString, GetTestSourceInformation(), {}, std::move(helper) };
+    Interface v1_1{ TestRestUriString, std::move(helper), GetTestSourceInformation(), {} };
     AppInstaller::Repository::SearchRequest request;
     PackageMatchFilter filter{ PackageMatchField::Name, MatchType::Exact, "Foo" };
     request.Filters.emplace_back(std::move(filter));
@@ -327,7 +327,7 @@ TEST_CASE("Search_BadResponse_RequiredPackageMatchFields", "[RestSource][Interfa
         })delimiter");
 
     HttpClientHelper helper{ GetTestRestRequestHandler(web::http::status_codes::OK, std::move(sample)) };
-    Interface v1_1{ TestRestUriString, GetTestSourceInformation(), {}, std::move(helper) };
+    Interface v1_1{ TestRestUriString, std::move(helper), GetTestSourceInformation(), {} };
     AppInstaller::Repository::SearchRequest request;
     PackageMatchFilter filter{ PackageMatchField::Name, MatchType::Exact, "Foo" };
     request.Filters.emplace_back(std::move(filter));
@@ -343,7 +343,7 @@ TEST_CASE("GetManifests_BadResponse_UnsupportedQueryParameters", "[RestSource][I
         })delimiter");
 
     HttpClientHelper helper{ GetTestRestRequestHandler(web::http::status_codes::OK, std::move(sample)) };
-    Interface v1_1{ TestRestUriString, GetTestSourceInformation(), {}, std::move(helper) };
+    Interface v1_1{ TestRestUriString, std::move(helper), GetTestSourceInformation(), {} };
     REQUIRE_THROWS_HR(v1_1.GetManifests("Foo"), APPINSTALLER_CLI_ERROR_UNSUPPORTED_SOURCE_REQUEST);
 }
 
@@ -356,7 +356,7 @@ TEST_CASE("GetManifests_BadResponse_RequiredQueryParameters", "[RestSource][Inte
         })delimiter");
 
     HttpClientHelper helper{ GetTestRestRequestHandler(web::http::status_codes::OK, std::move(sample)) };
-    Interface v1_1{ TestRestUriString, GetTestSourceInformation(), {}, std::move(helper) };
+    Interface v1_1{ TestRestUriString, std::move(helper), GetTestSourceInformation(), {} };
     REQUIRE_THROWS_HR(v1_1.GetManifests("Foo"), APPINSTALLER_CLI_ERROR_UNSUPPORTED_SOURCE_REQUEST);
 }
 
@@ -371,12 +371,12 @@ TEST_CASE("Search_BadRequest_UnsupportedPackageMatchFields", "[RestSource][Inter
               "Publisher": "git",
               "Versions": [
                 {   "PackageVersion": "1.0.0" },
-                {   "PackageVersion": "2.0.0"}]
+                {   "PackageVersion": "2.0.0" }]
             }]
         })delimiter");
 
     HttpClientHelper helper{ GetTestRestRequestHandler(web::http::status_codes::OK, std::move(sample)) };
-    Interface v1_1{ TestRestUriString, GetTestSourceInformation(), {}, std::move(helper) };
+    Interface v1_1{ TestRestUriString, std::move(helper), GetTestSourceInformation(), {} };
     AppInstaller::Repository::SearchRequest request;
     PackageMatchFilter filter{ PackageMatchField::Moniker, MatchType::Exact, "Foo" };
     request.Filters.emplace_back(std::move(filter));
@@ -394,17 +394,68 @@ TEST_CASE("Search_GoodRequest_OnlyMarketRequired", "[RestSource][Interface_1_1]"
               "Publisher": "git",
               "Versions": [
                 {   "PackageVersion": "1.0.0" },
-                {   "PackageVersion": "2.0.0"}]
+                {   "PackageVersion": "2.0.0" }]
             }]
         })delimiter");
 
-    HttpClientHelper helper{ GetTestRestRequestHandler(web::http::status_codes::OK, std::move(sample)) };
-    Interface v1_1{ TestRestUriString, GetTestSourceInformation(), {}, std::move(helper) };
+    web::json::value searchBody;
+    auto handler = std::make_shared<TestRestRequestHandler>(
+        [&](web::http::http_request httpRequest) -> pplx::task<web::http::http_response>
+        {
+            web::http::http_response response{ web::http::status_codes::BadRequest };
+            response.headers().set_content_type(web::http::details::mime_types::application_json);
+            response.headers().set_cache_control(L"no-store");
+            if (httpRequest.method() == web::http::methods::POST)
+            {
+                searchBody = httpRequest.extract_json().get();
+                response.set_status_code(web::http::status_codes::OK);
+                response.set_body(web::json::value::parse(sample));
+            }
+            return pplx::task_from_result(response);
+        });
+    HttpClientHelper helper{ handler };
+    Interface v1_1{ TestRestUriString, std::move(helper), GetTestSourceInformation(), {} };
     AppInstaller::Repository::SearchRequest request;
-    PackageMatchFilter filter{ PackageMatchField::Name, MatchType::Exact, "Foo" };
+    PackageMatchFilter filter{ PackageMatchField::Name, MatchType::Exact, "package" };
     request.Filters.emplace_back(std::move(filter));
+    size_t expectedCount = 1;
+
+    SECTION("Name filter") {}
+    SECTION("Matching ID filter")
+    {
+        request.Filters.emplace_back(PackageMatchField::Id, MatchType::CaseInsensitive, "GIT.PACKAGE");
+    }
+    SECTION("Mismatching ID filter")
+    {
+        request.Filters.emplace_back(PackageMatchField::Id, MatchType::CaseInsensitive, "Other.Package");
+        expectedCount = 0;
+    }
+    SECTION("Unsupported inclusion is removed")
+    {
+        request.Inclusions.emplace_back(PackageMatchField::Moniker, MatchType::CaseInsensitive, "git");
+        request.Inclusions.emplace_back(PackageMatchField::Id, MatchType::CaseInsensitive, "GIT.PACKAGE");
+    }
+
     Schema::IRestClient::SearchResult searchResponse = v1_1.Search(request);
-    REQUIRE(searchResponse.Matches.size() == 1);
+    const auto& filters = searchBody.at(L"Filters").as_array();
+    REQUIRE(filters.size() == request.Filters.size() + 1);
+    REQUIRE(filters.at(0).at(L"PackageMatchField").as_string() == L"PackageName");
+    REQUIRE(filters.at(0).at(L"RequestMatch").at(L"KeyWord").as_string() == L"package");
+    REQUIRE(filters.at(request.Filters.size()).at(L"PackageMatchField").as_string() == L"Market");
+    if (!request.Inclusions.empty())
+    {
+        REQUIRE(request.Inclusions.size() == 2);
+        const auto& inclusions = searchBody.at(L"Inclusions").as_array();
+        REQUIRE(inclusions.size() == 1);
+        REQUIRE(inclusions.at(0).at(L"PackageMatchField").as_string() == L"PackageIdentifier");
+        REQUIRE(inclusions.at(0).at(L"RequestMatch").at(L"KeyWord").as_string() == L"GIT.PACKAGE");
+    }
+    REQUIRE(searchResponse.Matches.size() == expectedCount);
+    if (!expectedCount)
+    {
+        return;
+    }
+
     Schema::IRestClient::Package package = searchResponse.Matches.at(0);
     REQUIRE(package.PackageInformation.PackageIdentifier.compare("git.package") == 0);
     REQUIRE(package.PackageInformation.Publisher.compare("git") == 0);
@@ -412,6 +463,85 @@ TEST_CASE("Search_GoodRequest_OnlyMarketRequired", "[RestSource][Interface_1_1]"
     REQUIRE(package.Versions.size() == 2);
     REQUIRE(package.Versions.at(0).VersionAndChannel.GetVersion().ToString().compare("1.0.0") == 0);
     REQUIRE(package.Versions.at(1).VersionAndChannel.GetVersion().ToString().compare("2.0.0") == 0);
+}
+
+TEST_CASE("Search_Inclusions_SourceCapabilities", "[RestSource][Interface_1_1]")
+{
+    utility::string_t sample = _XPLATSTR(
+        R"delimiter({
+            "Data": [{
+                "PackageIdentifier": "git.package",
+                "PackageName": "package",
+                "Publisher": "git",
+                "Versions": [{ "PackageVersion": "1.0.0" }]
+            }]
+        })delimiter");
+
+    size_t requestCount = 0;
+    auto handler = std::make_shared<TestRestRequestHandler>(
+        [&](web::http::http_request httpRequest) -> pplx::task<web::http::http_response>
+        {
+            ++requestCount;
+            web::http::http_response response{ web::http::status_codes::BadRequest };
+            response.headers().set_content_type(web::http::details::mime_types::application_json);
+            response.headers().set_cache_control(L"no-store");
+            if (httpRequest.method() == web::http::methods::POST)
+            {
+                response.set_status_code(web::http::status_codes::OK);
+                response.set_body(web::json::value::parse(sample));
+            }
+            return pplx::task_from_result(response);
+        });
+    HttpClientHelper helper{ handler };
+    Interface v1_1{ TestRestUriString, helper, GetTestSourceInformation(), {} };
+    SearchRequest request;
+    request.Inclusions.emplace_back(PackageMatchField::Moniker, MatchType::CaseInsensitive, "git");
+    size_t expectedCount = 1;
+    size_t expectedRequestCount = 1;
+
+    SECTION("Matching supported inclusion")
+    {
+        request.Inclusions.emplace_back(PackageMatchField::Id, MatchType::CaseInsensitive, "GIT.PACKAGE");
+    }
+    SECTION("Unsupported inclusion cannot admit an ID mismatch")
+    {
+        request.Inclusions.emplace_back(PackageMatchField::Id, MatchType::Exact, "Other.Package");
+        expectedCount = 0;
+    }
+    SECTION("Only unsupported inclusions must not become an unrestricted search")
+    {
+        expectedCount = 0;
+        expectedRequestCount = 0;
+    }
+    SECTION("Removed inclusions must not trigger ID fallback")
+    {
+        request.Filters.emplace_back(PackageMatchField::Id, MatchType::Substring, "git.package");
+        expectedCount = 0;
+        expectedRequestCount = 0;
+    }
+    SECTION("A query can still select when all inclusions are unsupported")
+    {
+        request.Query.emplace(MatchType::Substring, "git");
+    }
+    SECTION("No selectors were requested")
+    {
+        request.Inclusions.clear();
+    }
+    SECTION("Correlation retains unverified reference matches")
+    {
+        request.Inclusions.clear();
+        request.Purpose = SearchPurpose::CorrelationToAvailable;
+        request.Inclusions.emplace_back(PackageMatchField::ProductCode, MatchType::Exact, "Not in the response");
+    }
+
+    auto result = v1_1.Search(request);
+    REQUIRE(requestCount == expectedRequestCount);
+    REQUIRE(result.Matches.size() == expectedCount);
+    REQUIRE_FALSE(result.Truncated);
+    if (expectedCount)
+    {
+        REQUIRE(result.Matches[0].PackageInformation.PackageIdentifier == "git.package");
+    }
 }
 
 TEST_CASE("GetManifests_BadRequest_UnsupportedQueryParameters", "[RestSource][Interface_1_1]")
@@ -444,7 +574,7 @@ TEST_CASE("GetManifests_BadRequest_UnsupportedQueryParameters", "[RestSource][In
     })delimiter");
 
     HttpClientHelper helper{ GetTestRestRequestHandler(web::http::status_codes::OK, std::move(sample)) };
-    Interface v1_1{ TestRestUriString, GetTestSourceInformation(), {}, std::move(helper) };
+    Interface v1_1{ TestRestUriString, std::move(helper), GetTestSourceInformation(), {} };
     REQUIRE_THROWS_HR(v1_1.GetManifestByVersion("Foo", "1.0", "beta"), APPINSTALLER_CLI_ERROR_UNSUPPORTED_SOURCE_REQUEST);
 }
 
@@ -480,7 +610,7 @@ TEST_CASE("GetManifests_GoodRequest_OnlyMarketRequired", "[RestSource][Interface
     IRestClient::Information info = GetTestSourceInformation();
     info.UnsupportedQueryParameters.clear();
     HttpClientHelper helper{ GetTestRestRequestHandler(web::http::status_codes::OK, std::move(sample)) };
-    Interface v1_1{ TestRestUriString, info, {}, std::move(helper) };
+    Interface v1_1{ TestRestUriString, std::move(helper), info, {} };
     auto manifestResult = v1_1.GetManifestByVersion("Foo", "5.0.0", "");
     REQUIRE(manifestResult.has_value());
     const Manifest& manifest = manifestResult.value();
@@ -527,7 +657,7 @@ TEST_CASE("GetManifests_GoodResponse_MSStoreType", "[RestSource][Interface_1_1]"
     })delimiter");
 
     HttpClientHelper helper{ GetTestRestRequestHandler(web::http::status_codes::OK, std::move(msstoreInstallerResponse)) };
-    Interface v1_1{ TestRestUriString, GetTestSourceInformation(), {}, std::move(helper) };
+    Interface v1_1{ TestRestUriString, std::move(helper), GetTestSourceInformation(), {} };
     std::vector<Manifest> manifests = v1_1.GetManifests("Foo.Bar");
     REQUIRE(manifests.size() == 1);
 
@@ -538,21 +668,22 @@ TEST_CASE("GetManifests_GoodResponse_MSStoreType", "[RestSource][Interface_1_1]"
     REQUIRE(manifest.Installers.at(0).ProductId == "9nblggh4nns1");
 }
 
-TEST_CASE("GetManifests_GoodResponse_V1_1", "[RestSource][Interface_1_0]")
+TEST_CASE("GetManifests_GoodResponse_V1_1", "[RestSource][Interface_1_1]")
 {
     GoodManifest_AllFields sampleManifest;
     utility::string_t sample = sampleManifest.GetSampleManifest_AllFields();
     HttpClientHelper helper{ GetTestRestRequestHandler(web::http::status_codes::OK, std::move(sample)) };
-    Interface v1_1{ TestRestUriString, {}, {}, std::move(helper) };
+    Interface v1_1{ TestRestUriString, std::move(helper), {} };
     std::vector<Manifest> manifests = v1_1.GetManifests("Foo.Bar");
     REQUIRE(manifests.size() == 1);
 
     // Verify manifest is populated
-    Manifest manifest = manifests[0];
+    Manifest& manifest = manifests[0];
     REQUIRE(manifest.Id == "Foo.Bar");
     REQUIRE(manifest.Version == "3.0.0abc");
     REQUIRE(manifest.Moniker == "FooBarMoniker");
     REQUIRE(manifest.Channel == "");
+    REQUIRE(manifest.ManifestVersion == AppInstaller::Manifest::ManifestVer{ "1.1.0" });
     sampleManifest.VerifyLocalizations_AllFields(manifest);
     sampleManifest.VerifyInstallers_AllFields(manifest);
 }

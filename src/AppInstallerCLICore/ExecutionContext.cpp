@@ -1,9 +1,20 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 #include "pch.h"
-#include "ExecutionContext.h"
+#include "AppInstallerRuntime.h"
+#include "Argument.h"
 #include "COMContext.h"
-#include "winget/UserSettings.h"
+#include "Command.h"
+#include "ExecutionContext.h"
+#include "Public/ShutdownMonitoring.h"
+#include <winget/Checkpoint.h>
+#include <winget/Locale.h>
+#include <winget/Reboot.h>
+#include <winget/Resources.h>
+#include <winget/UserSettings.h>
+#include <winget/NetworkSettings.h>
+
+using namespace AppInstaller::Checkpoints;
 
 namespace AppInstaller::CLI::Execution
 {
@@ -11,135 +22,142 @@ namespace AppInstaller::CLI::Execution
 
     namespace
     {
-        // Type to contain the CTRL signal handler.
-        struct CtrlHandler
+        bool ShouldRemoveCheckpointDatabase(HRESULT hr)
         {
-            static CtrlHandler& Instance()
+            switch (hr)
             {
-                static CtrlHandler s_instance;
-                return s_instance;
-            }
-
-            void AddContext(Context* context)
-            {
-                std::lock_guard<std::mutex> lock{ m_contextsLock };
-
-                auto itr = std::find(m_contexts.begin(), m_contexts.end(), context);
-                THROW_HR_IF(E_NOT_VALID_STATE, itr != m_contexts.end());
-                m_contexts.push_back(context);
-            }
-
-            void RemoveContext(Context* context)
-            {
-                std::lock_guard<std::mutex> lock{ m_contextsLock };
-
-                auto itr = std::find(m_contexts.begin(), m_contexts.end(), context);
-                THROW_HR_IF(E_NOT_VALID_STATE, itr == m_contexts.end());
-                m_contexts.erase(itr);
-            }
-
-        private:
-            CtrlHandler()
-            {
-                LOG_IF_WIN32_BOOL_FALSE(SetConsoleCtrlHandler(StaticCtrlHandlerFunction, TRUE));
-            }
-
-            static BOOL WINAPI StaticCtrlHandlerFunction(DWORD ctrlType)
-            {
-                return Instance().CtrlHandlerFunction(ctrlType);
-            }
-
-            BOOL CtrlHandlerFunction(DWORD ctrlType)
-            {
-                switch (ctrlType)
-                {
-                case CTRL_C_EVENT:
-                case CTRL_BREAK_EVENT:
-                    return TerminateContexts(ctrlType, false);
-                    // According to MSDN, we should never receive these due to having gdi32/user32 loaded in our process.
-                    // But handle them as a force terminate anyway.
-                case CTRL_CLOSE_EVENT:
-                case CTRL_LOGOFF_EVENT:
-                case CTRL_SHUTDOWN_EVENT:
-                    return TerminateContexts(ctrlType, true);
-                default:
-                    return FALSE;
-                }
-            }
-
-            // Terminates the currently attached contexts.
-            // Returns FALSE if no contexts attached; TRUE otherwise.
-            BOOL TerminateContexts(DWORD ctrlType, bool force)
-            {
-                if (m_contexts.empty())
-                {
-                    return FALSE;
-                }
-
-                {
-                    std::lock_guard<std::mutex> lock{ m_contextsLock };
-
-                    // TODO: Move this to be logged per active context when we have thread static globals
-                    AICLI_LOG(CLI, Info, << "Got CTRL type: " << ctrlType);
-
-                    for (auto& context : m_contexts)
-                    {
-                        context->Cancel(true, force);
-                    }
-                }
-
-                return TRUE;
-            }
-
-            std::mutex m_contextsLock;
-            std::vector<Context*> m_contexts;
-        };
-
-        void SetCtrlHandlerContext(bool add, Context* context)
-        {
-            THROW_HR_IF(E_POINTER, context == nullptr);
-
-            if (add)
-            {
-                CtrlHandler::Instance().AddContext(context);
-            }
-            else
-            {
-                CtrlHandler::Instance().RemoveContext(context);
+            case APPINSTALLER_CLI_ERROR_INSTALL_REBOOT_REQUIRED_FOR_INSTALL:
+            case APPINSTALLER_CLI_ERROR_RESUME_LIMIT_EXCEEDED:
+            case APPINSTALLER_CLI_ERROR_CLIENT_VERSION_MISMATCH:
+                return false;
+            default:
+                return true;
             }
         }
     }
 
     Context::~Context()
     {
-        if (m_disableCtrlHandlerOnExit)
+        if (Settings::ExperimentalFeature::IsEnabled(ExperimentalFeature::Feature::Resume))
         {
-            EnableCtrlHandler(false);
+            if (m_checkpointManager && (!IsTerminated() || ShouldRemoveCheckpointDatabase(GetTerminationHR())))
+            {
+                m_checkpointManager->CleanUpDatabase();
+                AppInstaller::Reboot::UnregisterRestartForWER();
+            }
         }
+
+        if (m_disableSignalTerminationHandlerOnExit)
+        {
+            EnableSignalTerminationHandler(false);
+        }
+    }
+
+    Context Context::CreateEmptyContext()
+    {
+        AppInstaller::ThreadLocalStorage::WingetThreadGlobals threadGlobals;
+        return Context(Reporter, threadGlobals);
     }
 
     std::unique_ptr<Context> Context::CreateSubContext()
     {
-        auto clone = std::make_unique<Context>(Reporter, m_threadGlobals);
+        auto clone = std::make_unique<Context>(Reporter, *m_threadGlobals);
         clone->m_flags = m_flags;
         clone->m_executingCommand = m_executingCommand;
         // If the parent is hooked up to the CTRL signal, have the clone be as well
-        if (m_disableCtrlHandlerOnExit)
+        if (m_disableSignalTerminationHandlerOnExit)
         {
-            clone->EnableCtrlHandler();
+            clone->EnableSignalTerminationHandler();
         }
+        CopyArgsToSubContext(clone.get());
+        CopyDataToSubContext(clone.get());
         return clone;
     }
 
-    void Context::EnableCtrlHandler(bool enabled)
+    void Context::CopyArgsToSubContext(Context* subContext)
     {
-        SetCtrlHandlerContext(enabled, this);
-        m_disableCtrlHandlerOnExit = enabled;
+        auto argProperties = ArgumentCommon::GetFromExecArgs(Args);
+        for (const auto& arg : argProperties)
+        {
+            if (WI_IsFlagSet(arg.TypeCategory, ArgTypeCategory::CopyFlagToSubContext))
+            {
+                subContext->Args.AddArg(arg.Type);
+            }
+            else if (WI_IsFlagSet(arg.TypeCategory, ArgTypeCategory::CopyValueToSubContext))
+            {
+                subContext->Args.AddArg(arg.Type, Args.GetArg(arg.Type));
+            }
+        }
+    }
+
+    void Context::CopyDataToSubContext(Context* subContext)
+    {
+#define COPY_DATA_IF_EXISTS(dataType) \
+        if (this->Contains(dataType)) \
+        { \
+            subContext->Add<dataType>(this->Get<dataType>()); \
+        }
+
+        COPY_DATA_IF_EXISTS(Data::InstallerDownloadAuthenticators);
+    }
+
+    void Context::EnableSignalTerminationHandler(bool enabled)
+    {
+        ShutdownMonitoring::TerminationSignalHandler::EnableListener(enabled, this);
+        m_disableSignalTerminationHandlerOnExit = enabled;
     }
 
     void Context::UpdateForArgs()
     {
-        if (Args.Contains(Args::Type::NoVT))
+        // Override the language used for winget's own output.
+        // This takes precedence over the output locale user setting because it is applied later.
+        // Unsupported values are reported by Command::ValidateArguments.
+        if (Args.Contains(Args::Type::OutputLocale))
+        {
+            std::string_view requestedLocale = Args.GetArg(Args::Type::OutputLocale);
+            auto normalizedLocale = Locale::NormalizeOutputLocale(requestedLocale);
+
+            if (normalizedLocale)
+            {
+                if (AppInstaller::Resource::SetLanguageOverride(normalizedLocale.value()))
+                {
+                    AICLI_LOG(CLI, Info, << "Applied output locale override from argument: " << normalizedLocale.value());
+                }
+                else
+                {
+                    AICLI_LOG(CLI, Warning, << "Failed to apply output locale override from argument: " << normalizedLocale.value());
+                }
+            }
+        }
+
+        // Change logging level to Info if Verbose not requested
+        if (Args.Contains(Args::Type::VerboseLogs))
+        {
+            Logging::Log().SetLevel(Logging::Level::Verbose);
+        }
+
+        // Disable warnings if requested
+        if (Args.Contains(Args::Type::IgnoreWarnings))
+        {
+            Reporter.SetLevelMask(Reporter::Level::Warning, false);
+        }
+
+        // Set proxy
+        if (Args.Contains(Args::Type::Proxy))
+        {
+            Network().SetProxyUri(std::string{ Args.GetArg(Args::Type::Proxy) });
+        }
+        else if (Args.Contains(Args::Type::NoProxy))
+        {
+            Network().SetProxyUri(std::nullopt);
+        }
+
+        // Set visual style
+        if (Args.Contains(Args::Type::NoProgress))
+        {
+            Reporter.SetStyle(VisualStyle::Disabled);
+        }
+        else if (Args.Contains(Args::Type::NoVT))
         {
             Reporter.SetStyle(VisualStyle::NoVT);
         }
@@ -175,11 +193,18 @@ namespace AppInstaller::CLI::Execution
                 std::exit(hr);
             }
         }
+        else if (hr == APPINSTALLER_CLI_ERROR_APPTERMINATION_RECEIVED)
+        {
+            AICLI_LOG(CLI, Info, << "Got app termination signal");
+            hr = E_ABORT;
+        }
 
         Logging::Telemetry().LogCommandTermination(hr, file, line);
 
-        m_isTerminated = true;
-        m_terminationHR = hr;
+        if (!m_isTerminated)
+        {
+            SetTerminationHR(hr);
+        }
     }
 
     void Context::SetTerminationHR(HRESULT hr)
@@ -188,10 +213,12 @@ namespace AppInstaller::CLI::Execution
         m_isTerminated = true;
     }
 
-    void Context::Cancel(bool exitIfStuck, bool bypassUser)
+    void Context::Cancel(CancelReason reason, bool bypassUser)
     {
-        Terminate(exitIfStuck ? APPINSTALLER_CLI_ERROR_CTRL_SIGNAL_RECEIVED : E_ABORT);
-        Reporter.CancelInProgressTask(bypassUser);
+        HRESULT hr = ToHRESULT(reason);
+
+        Terminate(hr);
+        Reporter.CancelInProgressTask(bypassUser, reason);
     }
 
     void Context::SetExecutionStage(Workflow::ExecutionStage stage)
@@ -202,21 +229,26 @@ namespace AppInstaller::CLI::Execution
         }
         else if (m_executionStage > stage)
         {
-            THROW_HR_MSG(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), "Reporting ExecutionStage to an earlier Stage without allowBackward as true");
+            THROW_HR_MSG(HRESULT_FROM_WIN32(ERROR_INVALID_STATE), "Reporting ExecutionStage to an earlier Stage: current[%d], new[%d]", ToIntegral(m_executionStage), ToIntegral(stage));
         }
 
         m_executionStage = stage;
         GetThreadGlobals().GetTelemetryLogger().SetExecutionStage(static_cast<uint32_t>(m_executionStage));
     }
 
-    AppInstaller::ThreadLocalStorage::ThreadGlobals& Context::GetThreadGlobals()
+    AppInstaller::ThreadLocalStorage::WingetThreadGlobals& Context::GetThreadGlobals()
+    {
+        return *m_threadGlobals;
+    }
+
+    std::shared_ptr<ThreadLocalStorage::WingetThreadGlobals> Context::GetSharedThreadGlobals()
     {
         return m_threadGlobals;
     }
 
     std::unique_ptr<AppInstaller::ThreadLocalStorage::PreviousThreadGlobals> Context::SetForCurrentThread()
     {
-        return m_threadGlobals.SetForCurrentThread();
+        return m_threadGlobals->SetForCurrentThread();
     }
 
 #ifndef AICLI_DISABLE_TEST_HOOKS
@@ -225,4 +257,55 @@ namespace AppInstaller::CLI::Execution
         return (m_shouldExecuteWorkflowTask ? m_shouldExecuteWorkflowTask(task) : true);
     }
 #endif
+
+    void ContextEnumBasedVariantMapActionCallback(const void* map, Data data, EnumBasedVariantMapAction action)
+    {
+        switch (action)
+        {
+        case EnumBasedVariantMapAction::Add:
+            AICLI_LOG(Workflow, Verbose, << "Setting data item: " << data);
+            break;
+        case EnumBasedVariantMapAction::Contains:
+            AICLI_LOG(Workflow, Verbose, << "Checking data item: " << data);
+            break;
+        case EnumBasedVariantMapAction::Get:
+            AICLI_LOG(Workflow, Verbose, << "Getting data item: " << data);
+            break;
+        }
+
+        UNREFERENCED_PARAMETER(map);
+    }
+
+    std::string Context::GetResumeId()
+    {
+        return m_checkpointManager->GetResumeId();
+    }
+
+    std::optional<Checkpoint<AutomaticCheckpointData>> Context::LoadCheckpoint(const std::string& resumeId)
+    {
+        m_checkpointManager = std::make_unique<AppInstaller::Checkpoints::CheckpointManager>(resumeId);
+        return m_checkpointManager->GetAutomaticCheckpoint();
+    }
+
+    std::vector<AppInstaller::Checkpoints::Checkpoint<Execution::Data>> Context::GetCheckpoints()
+    {
+        return m_checkpointManager->GetCheckpoints();
+    }
+
+    void Context::Checkpoint(std::string_view checkpointName, std::vector<Execution::Data> contextData)
+    {
+        UNREFERENCED_PARAMETER(checkpointName);
+        UNREFERENCED_PARAMETER(contextData);
+
+        if (!m_checkpointManager)
+        {
+            m_checkpointManager = std::make_unique<AppInstaller::Checkpoints::CheckpointManager>();
+            m_checkpointManager->CreateAutomaticCheckpoint(*this);
+
+            // Register for restart only when we first call checkpoint to support restarting from an unexpected shutdown.
+            AppInstaller::Reboot::RegisterRestartForWER("resume -g " + GetResumeId());
+        }
+
+        // TODO: Capture context data for checkpoint.
+    }
 }

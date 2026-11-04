@@ -84,33 +84,67 @@ namespace AppInstaller::Repository
         case PackageVersionMetadata::Publisher: return "Publisher"sv;
         case PackageVersionMetadata::InstalledLocale: return "InstalledLocale"sv;
         case PackageVersionMetadata::TrackingWriteTime: return "TrackingWriteTime"sv;
+        case PackageVersionMetadata::InstalledArchitecture: return "InstalledArchitecture"sv;
+        case PackageVersionMetadata::PinnedState: return "PinnedState"sv;
+        case PackageVersionMetadata::UserIntentArchitecture: return "UserIntentArchitecture"sv;
+        case PackageVersionMetadata::UserIntentLocale: return "UserIntentLocale"sv;
+        case PackageVersionMetadata::InitialOverrideArguments: return "InitialOverrideArguments"sv;
+        case PackageVersionMetadata::InitialCustomSwitches: return "InitialCustomSwitches"sv;
         default: return "Unknown"sv;
         }
     }
 
-    std::string_view ToString(PackagePinnedState state)
+    bool PackageVersionKey::IsMatch(const PackageVersionKey& other) const
     {
-        switch (state)
+        return
+            ((other.SourceId.empty() || other.SourceId == SourceId) &&
+             (other.Version.empty() || Utility::Version{ other.Version } == Utility::Version{ Version }) &&
+             (other.Channel.empty() || Utility::ICUCaseInsensitiveEquals(other.Channel, Channel)));
+    }
+
+    bool PackageVersionKey::IsDefaultLatest() const
+    {
+        return Version.empty() && Channel.empty();
+    }
+
+    PackageVersionMultiProperty PackageMultiPropertyToPackageVersionMultiProperty(PackageMultiProperty property)
+    {
+        switch (property)
         {
-        case PackagePinnedState::PinnedByManifest: return "PinnedByManifest"sv;
-        case PackagePinnedState::NotPinned:
+        case PackageMultiProperty::PackageFamilyName: return PackageVersionMultiProperty::PackageFamilyName;
+        case PackageMultiProperty::ProductCode: return PackageVersionMultiProperty::ProductCode;
+        case PackageMultiProperty::UpgradeCode: return PackageVersionMultiProperty::UpgradeCode;
+        case PackageMultiProperty::NormalizedName: return PackageVersionMultiProperty::Name;
+        case PackageMultiProperty::NormalizedPublisher: return PackageVersionMultiProperty::Publisher;
+        case PackageMultiProperty::Tag: return PackageVersionMultiProperty::Tag;
+        case PackageMultiProperty::Command: return PackageVersionMultiProperty::Command;
         default:
-            return "Unknown";
+            THROW_HR_MSG(E_UNEXPECTED, "PackageMultiProperty must map to a PackageVersionMultiProperty");
         }
     }
 
-    PackagePinnedState ConvertToPackagePinnedStateEnum(std::string_view in)
+    std::vector<std::vector<std::string>> IPackage::GetMatrixProperty(PackageMatrixProperty property) const
     {
-        if (Utility::CaseInsensitiveEquals(in, "PinnedByManifest"sv))
+        switch (property)
         {
-            return PackagePinnedState::PinnedByManifest;
+        case PackageMatrixProperty::NormalizedNameAndPublisher:
+        {
+            auto names = GetMultiProperty(PackageMultiProperty::NormalizedName);
+            auto publishers = GetMultiProperty(PackageMultiProperty::NormalizedPublisher);
+            std::vector<std::vector<std::string>> result;
+            for (const auto& name : names)
+            {
+                for (const auto& publisher : publishers)
+                {
+                    result.push_back({ name.get(), publisher.get() });
+                }
+            }
+            return result;
         }
-        else
-        {
-            return PackagePinnedState::NotPinned;
+        default:
+            THROW_HR(E_UNEXPECTED);
         }
     }
-
 
     const char* UnsupportedRequestException::what() const noexcept
     {

@@ -1,0 +1,69 @@
+{
+  "AppxManifest": "%WINGET_SOURCE_ROOT%/src/AppInstallerCLIE2ETests/TestData/Package/AppxManifest.xml",
+  "WorkingDirectory": "%AGENT_TEMPDIRECTORY%/TestLocalIndex",
+  "LocalManifests": [
+    "%WINGET_SOURCE_ROOT%/src/AppInstallerCLIE2ETests/TestData/Manifests"
+  ],
+  "LocalInstallers": [
+    {
+      "Type": "exe",
+      "Name": "AppInstallerTestExeInstaller/AppInstallerTestExeInstaller.exe",
+      "Input": "%BUILDOUTDIR%/AppInstallerTestExeInstaller/AppInstallerTestExeInstaller.exe",
+      "HashToken": "<EXEHASH>"
+    },
+    {
+      "Type": "msi",
+      "Name": "AppInstallerTestMsiInstaller/AppInstallerTestMsiInstaller.msi",
+      "Input": "%WINGET_SOURCE_ROOT%/src/AppInstallerCLIE2ETests/TestData/AppInstallerTestMsiInstaller.msi",
+      "HashToken": "<MSIHASH>"
+    },
+    {
+      "Type": "msi",
+      "Name": "AppInstallerTestMsiInstaller/AppInstallerTestMsiInstallerV2.msi",
+      "Input": "%WINGET_SOURCE_ROOT%/src/AppInstallerCLIE2ETests/TestData/AppInstallerTestMsiInstallerV2.msi",
+      "HashToken": "<MSIHASHV2>"
+    },
+    {
+      "Type": "msix",
+      "Name": "AppInstallerTestMsixInstaller/AppInstallerTestMsixInstaller.msix",
+      "Input": "%BUILD_ARTIFACTSTAGINGDIRECTORY%/AppInstallerTestMsixInstaller.msix",
+      "HashToken": "<MSIXHASH>",
+      "SignatureToken": "<SIGNATUREHASH>"
+    },
+    {
+      "Type": "font",
+      "Name": "AppInstallerTestFont/AppInstallerTestFont.ttf",
+      "Input": "%WINGET_SOURCE_ROOT%/src/AppInstallerCLIE2ETests/TestData/AppInstallerTestFont.ttf",
+      "HashToken": "<FONTHASH>",
+      "SkipSignature": true
+    }
+  ],
+  "DynamicInstallers": [
+    {
+      "Type": "zip",
+      "Name": "AppInstallerTestZipInstaller/AppInstallerTestZipInstaller.zip",
+      "Input": [
+        "%AGENT_TEMPDIRECTORY%/TestLocalIndex/AppInstallerTestExeInstaller/AppInstallerTestExeInstaller.exe",
+        "%AGENT_TEMPDIRECTORY%/TestLocalIndex/AppInstallerTestMsiInstaller/AppInstallerTestMsiInstaller.msi",
+        "%AGENT_TEMPDIRECTORY%/TestLocalIndex/AppInstallerTestMsixInstaller/AppInstallerTestMsixInstaller.msix"
+      ],
+      "HashToken": "<ZIPHASH>"
+    }
+  ],
+  "Signature": {
+    "CertFile": "%TestSigningCert_PfxPath%",
+    "Password": "%TestSigningCert_Password%"
+  },
+  "Delta": {
+    "RelativeDirectory": "deltaSource",
+    "IdentityName": "WingetE2EDelta.Tests",
+    "DeltaIdentityName": "WingetE2EDelta.Tests.Delta",
+    "BaselineIdentityName": "WingetE2EDelta.Tests.Baseline",
+    "Version": "2020.805.713.335",
+    "BaselineVersion": "2020.805.713.334",
+    "BaselineRelativePath": "baseline/source2.msix",
+    "ManifestsNotInBaseline": [
+      "TestExampleInstaller.yaml"
+    ]
+  }
+}

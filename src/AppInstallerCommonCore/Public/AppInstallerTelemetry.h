@@ -4,6 +4,8 @@
 #include <AppInstallerLanguageUtilities.h>
 #include <wil/result_macros.h>
 
+#include <chrono>
+#include <optional>
 #include <string_view>
 #include <vector>
 #include <cguid.h>
@@ -15,6 +17,13 @@ namespace AppInstaller::Settings
 
 namespace AppInstaller::Logging
 {
+    enum class ExecutionLevel : UINT32
+    {
+        User = 0,
+        Admin = 1,
+        System = 2,
+    };
+
     enum class FailureTypeEnum : UINT32
     {
         None = 0x0,
@@ -59,6 +68,7 @@ namespace AppInstaller::Logging
 
         // LogStartup
         bool IsCOMCall = false;
+        ExecutionLevel ExecutionLevel = ExecutionLevel::User;
 
         // LogCommand
         std::string Command;
@@ -101,6 +111,8 @@ namespace AppInstaller::Logging
         std::vector<uint8_t> HashMismatchExpected;
         std::vector<uint8_t> HashMismatchActual;
         bool HashMismatchOverride = false;
+        uint64_t HashMismatchActualSize = 0;
+        std::string HashMismatchContentType;
 
         // LogInstallerFailure
         std::string InstallerExecutionType;
@@ -109,6 +121,10 @@ namespace AppInstaller::Logging
         // LogUninstallerFailure
         std::string UninstallerExecutionType;
         UINT32 UninstallerErrorCode = 0;
+
+        // LogRepairFailure
+        std::string RepairExecutionType;
+        UINT32 RepairErrorCode = 0;
 
         // LogSuccessfulInstallARPChange
         UINT64 ChangesToARP = 0;
@@ -130,7 +146,7 @@ namespace AppInstaller::Logging
     // this should not become a burden.
     struct TelemetryTraceLogger
     {
-        TelemetryTraceLogger();
+        TelemetryTraceLogger(bool useSummary = true);
 
         ~TelemetryTraceLogger();
 
@@ -154,6 +170,10 @@ namespace AppInstaller::Logging
         void Initialize();
 
         // Try to capture if UserSettings is enabled and set user profile path, returns whether the action is successfully completed.
+        // There is a possible circular dependency with the user settings. When initializing the telemetry, we need to read the settings
+        // to make sure it's not disabled, but a failure when reading the settings would trigger a telemetry event. We work around that
+        // by avoiding initialization (and thus disabling telemetry) until we have successfully read the settings. Subsequent calls to
+        // TryInitialize() would finish the initialization.
         bool TryInitialize();
 
         // Store the passed in name of the Caller for COM calls
@@ -224,13 +244,18 @@ namespace AppInstaller::Logging
             std::string_view channel,
             const std::vector<uint8_t>& expected,
             const std::vector<uint8_t>& actual,
-            bool overrideHashMismatch) const noexcept;
+            bool overrideHashMismatch,
+            uint64_t downloadSizeInBytes,
+            const std::optional<std::string>& contentType) const noexcept;
 
         // Logs a failed installation attempt.
         void LogInstallerFailure(std::string_view id, std::string_view version, std::string_view channel, std::string_view type, uint32_t errorCode) const noexcept;
 
         // Logs a failed uninstallation attempt.
         void LogUninstallerFailure(std::string_view id, std::string_view version, std::string_view type, uint32_t errorCode) const noexcept;
+
+        // Logs a failed repair attempt.
+        void LogRepairFailure(std::string_view id, std::string_view version, std::string_view type, uint32_t errorCode) const noexcept;
 
         // Logs data about the changes that ocurred in the ARP entries based on an install.
         // First 4 arguments are well known values for the package that we installed.
@@ -252,9 +277,26 @@ namespace AppInstaller::Logging
 
         void LogNonFatalDOError(std::string_view url, HRESULT hr) const noexcept;
 
+        // Logs details of a preindexed package source update (full or delta).
+        // Nullable datetime fields use a null optional; nullable float fields use -1.0.
+        void LogPreindexedPackageUpdate(
+            std::string_view sourceId,
+            std::optional<std::chrono::system_clock::time_point> previousIndexPublishedAt,
+            std::chrono::system_clock::time_point newIndexPublishedAt,
+            bool usedDeltaDownload,
+            std::optional<std::chrono::system_clock::time_point> previousBaselinePublishedAt,
+            std::optional<std::chrono::system_clock::time_point> newBaselinePublishedAt,
+            bool baselineUpdated,
+            uint64_t downloadedBytes,
+            bool isManualUpdate) const noexcept;
+
+        // Logs when an install succeeded from the msstore source.
+        void LogStoreInstall(std::string_view packageId) const noexcept;
+
     protected:
         bool IsTelemetryEnabled() const noexcept;
 
+        // Initializes flags that determine whether telemetry is enabled.
         void InitializeInternal(const AppInstaller::Settings::UserSettings& userSettings);
 
         // Used to anonymize a string to the best of our ability.
@@ -262,8 +304,16 @@ namespace AppInstaller::Logging
         std::wstring AnonymizeString(const wchar_t* input) const noexcept;
         std::wstring AnonymizeString(std::wstring_view input) const noexcept;
 
-        bool m_isSettingEnabled = true;
+        // Flags used to determine whether to send telemetry. All of them are set during initialization and
+        // are CopyConstructibleAtomic to minimize the impact of multiple simultaneous initialization attempts.
+        // m_isSettingEnabled starts as false so we can don't send telemetry until we have read the
+        // settings and confirmed that it is enabled.
+        CopyConstructibleAtomic<bool> m_isSettingEnabled{ false };
+
+        // We may decide to disable telemetry at runtime, for example, for command line completion.
         CopyConstructibleAtomic<bool> m_isRuntimeEnabled{ true };
+
+        // We wait for initialization of the other flags before sending any events.
         CopyConstructibleAtomic<bool> m_isInitialized{ false };
 
         CopyConstructibleAtomic<uint32_t> m_executionStage{ 0 };
@@ -273,9 +323,7 @@ namespace AppInstaller::Logging
         std::wstring m_telemetryCorrelationJsonW = L"{}";
         std::string m_caller;
 
-        // Data that is needed by AnonymizeString
-        std::wstring m_userProfile;
-
+        bool m_useSummary = true;
         mutable TelemetrySummary m_summary;
 
         // TODO: This and all related code could be removed after transition to summary event in back end.

@@ -7,9 +7,11 @@
 #include "ComContext.h"
 #include "ExecutionContext.h"
 #include "Workflows/WorkflowBase.h"
+#include <winget/Authentication.h>
 #include <winget/UserSettings.h>
 #include <winget/Manifest.h>
 #include "Commands/COMCommand.h"
+#include <AppInstallerArchitecture.h>
 #include <AppInstallerTelemetry.h>
 #include <AppInstallerErrors.h>
 #pragma warning( push )
@@ -21,16 +23,23 @@
 #pragma warning( pop )
 #include "PackageManager.g.cpp"
 #include "CatalogPackage.h"
+#include "DownloadResult.h"
 #include "InstallResult.h"
 #include "UninstallResult.h"
+#include "RepairResult.h"
 #include "PackageCatalogInfo.h"
 #include "PackageCatalogReference.h"
 #include "PackageVersionInfo.h"
 #include "PackageVersionId.h"
-#include "Workflows/WorkflowBase.h"
+#include "AddPackageCatalogResult.h"
+#include "RemovePackageCatalogResult.h"
+#include "EditPackageCatalogResult.h"
 #include "Converters.h"
 #include "Helpers.h"
 #include "ContextOrchestrator.h"
+#include "AppInstallerRuntime.h"
+#include <optional>
+#include <PackageCatalogProgress.h>
 
 using namespace std::literals::chrono_literals;
 using namespace ::AppInstaller::CLI;
@@ -40,18 +49,119 @@ namespace winrt::Microsoft::Management::Deployment::implementation
 {
     namespace
     {
-        static std::optional<std::string> s_callerName;
-        static wil::srwlock s_callerNameLock;
+        void LogStartupIfApplicable()
+        {
+            static std::once_flag logStartupOnceFlag;
+            std::call_once(logStartupOnceFlag,
+                [&]()
+                {
+                    ::AppInstaller::Logging::Telemetry().SetCaller(GetCallerName());
+                    ::AppInstaller::Logging::Telemetry().LogStartup(true);
+                });
+        }
+
+        winrt::Microsoft::Management::Deployment::AddPackageCatalogResult GetAddPackageCatalogResult(winrt::hresult terminationStatus)
+        {
+            winrt::Microsoft::Management::Deployment::AddPackageCatalogStatus status = GetPackageCatalogOperationStatus<AddPackageCatalogStatus>(terminationStatus);
+            auto addPackageCatalogResult = winrt::make_self<wil::details::module_count_wrapper<winrt::Microsoft::Management::Deployment::implementation::AddPackageCatalogResult>>();
+            addPackageCatalogResult->Initialize(status, terminationStatus);
+            return *addPackageCatalogResult;
+        }
+
+        void CheckForDuplicateSource(const std::string& name, const std::string& type, const std::string& sourceUri)
+        {
+            auto sourceList = ::AppInstaller::Repository::Source::GetCurrentSources();
+
+            std::string sourceType = type;
+
+            // [NOTE:] If the source type is not specified, the default source type will be used for validation.In cases where the source type is empty,
+            // it remains unassigned until the add operation, at which point it is assigned.Without this default assignment, an empty string could be
+            // compared to the default type, potentially allowing different source names with the same URI to be seen as unique.
+            // To avoid this, assign the default source type prior to comparison.
+            if (sourceType.empty())
+            {
+                // This method of obtaining the default source type is slightly expensive as it requires creating a SourceFactory object
+                // and fetching the type name.Nonetheless, it future-proofs the code against any changes in the SourceFactory's default type.
+                sourceType = ::AppInstaller::Repository::Source::GetDefaultSourceType();
+            }
+
+            for (const auto& source : sourceList)
+            {
+                THROW_HR_IF(APPINSTALLER_CLI_ERROR_SOURCE_NAME_ALREADY_EXISTS, ::AppInstaller::Utility::ICUCaseInsensitiveEquals(source.Name, name));
+
+                bool sourceUriAlreadyExists = !source.Arg.empty() && source.Arg == sourceUri && source.Type == sourceType;
+                THROW_HR_IF(APPINSTALLER_CLI_ERROR_SOURCE_ARG_ALREADY_EXISTS, sourceUriAlreadyExists);
+            }
+        }
+
+        ::AppInstaller::Repository::Source CreateSourceFromOptions(const winrt::Microsoft::Management::Deployment::AddPackageCatalogOptions& options)
+        {
+            std::string name = winrt::to_string(options.Name());
+            std::string type = winrt::to_string(options.Type());
+            std::string sourceUri = winrt::to_string(options.SourceUri());
+
+            AppInstaller::Repository::SourceTrustLevel trustLevel = AppInstaller::Repository::SourceTrustLevel::None;
+            if (options.TrustLevel() == winrt::Microsoft::Management::Deployment::PackageCatalogTrustLevel::Trusted)
+            {
+                trustLevel = AppInstaller::Repository::SourceTrustLevel::Trusted;
+            }
+
+            CheckForDuplicateSource(name, type, sourceUri);
+
+            ::AppInstaller::Repository::SourceEdit additionalProperties;
+            additionalProperties.Explicit = options.Explicit();
+            additionalProperties.Priority = options.Priority();
+
+            ::AppInstaller::Repository::Source source = ::AppInstaller::Repository::Source{ name, sourceUri, type, trustLevel, additionalProperties };
+
+            std::string customHeader = winrt::to_string(options.CustomHeader());
+            if (!customHeader.empty())
+            {
+                source.SetCustomHeader(customHeader);
+            }
+
+            auto sourceInfo = source.GetInformation();
+
+            if (sourceInfo.Authentication.Type == ::AppInstaller::Authentication::AuthenticationType::Unknown)
+            {
+                THROW_HR(APPINSTALLER_CLI_ERROR_AUTHENTICATION_TYPE_NOT_SUPPORTED);
+            }
+
+            return source;
+        }
+
+        winrt::Microsoft::Management::Deployment::RemovePackageCatalogResult GetRemovePackageCatalogResult(winrt::hresult terminationStatus)
+        {
+            winrt::Microsoft::Management::Deployment::RemovePackageCatalogStatus status = GetPackageCatalogOperationStatus<RemovePackageCatalogStatus>(terminationStatus);
+            auto removeResult = winrt::make_self<wil::details::module_count_wrapper<winrt::Microsoft::Management::Deployment::implementation::RemovePackageCatalogResult>>();
+            removeResult->Initialize(status, terminationStatus);
+            return *removeResult;
+        }
+
+        std::optional<::AppInstaller::Repository::SourceDetails> GetMatchingSource(const std::string& name)
+        {
+            auto sourceList = ::AppInstaller::Repository::Source::GetCurrentSources();
+
+            for (const auto& source : sourceList)
+            {
+                if (::AppInstaller::Utility::ICUCaseInsensitiveEquals(source.Name, name))
+                {
+                    return source; // Return the first matching source
+                }
+            }
+
+            return std::nullopt; // Return std::nullopt if no matching source is found
+        }
     }
 
-    void SetComCallerName(std::string name)
+    PackageManager::PackageManager()
     {
-        auto lock = s_callerNameLock.lock_exclusive();
-        s_callerName.emplace(std::move(name));
+        Execution::ContextOrchestrator::RegisterForShutdownSynchronization();
     }
 
     winrt::Windows::Foundation::Collections::IVectorView<winrt::Microsoft::Management::Deployment::PackageCatalogReference> PackageManager::GetPackageCatalogs()
     {
+        LogStartupIfApplicable();
         Windows::Foundation::Collections::IVector<Microsoft::Management::Deployment::PackageCatalogReference> catalogs{ winrt::single_threaded_vector<Microsoft::Management::Deployment::PackageCatalogReference>() };
         std::vector<::AppInstaller::Repository::SourceDetails> sources = ::AppInstaller::Repository::Source::GetCurrentSources();
         for (uint32_t i = 0; i < sources.size(); i++)
@@ -65,8 +175,10 @@ namespace winrt::Microsoft::Management::Deployment::implementation
         }
         return catalogs.GetView();
     }
+
     winrt::Microsoft::Management::Deployment::PackageCatalogReference PackageManager::GetPredefinedPackageCatalog(winrt::Microsoft::Management::Deployment::PredefinedPackageCatalog const& predefinedPackageCatalog)
     {
+        LogStartupIfApplicable();
         ::AppInstaller::Repository::Source source;
         switch (predefinedPackageCatalog)
         {
@@ -79,6 +191,9 @@ namespace winrt::Microsoft::Management::Deployment::implementation
         case winrt::Microsoft::Management::Deployment::PredefinedPackageCatalog::DesktopFrameworks:
             source = ::AppInstaller::Repository::Source{ ::AppInstaller::Repository::WellKnownSource::DesktopFrameworks };
             break;
+        case winrt::Microsoft::Management::Deployment::PredefinedPackageCatalog::OpenWindowsCatalogFont:
+            source = ::AppInstaller::Repository::Source{ ::AppInstaller::Repository::WellKnownSource::WinGetFont };
+            break;
         default:
             throw hresult_invalid_argument();
         }
@@ -88,8 +203,10 @@ namespace winrt::Microsoft::Management::Deployment::implementation
         packageCatalogRef->Initialize(*packageCatalogInfo, source);
         return *packageCatalogRef;
     }
+
     winrt::Microsoft::Management::Deployment::PackageCatalogReference PackageManager::GetLocalPackageCatalog(winrt::Microsoft::Management::Deployment::LocalPackageCatalog const& localPackageCatalog)
     {
+        LogStartupIfApplicable();
         ::AppInstaller::Repository::Source source;
         switch (localPackageCatalog)
         {
@@ -108,8 +225,10 @@ namespace winrt::Microsoft::Management::Deployment::implementation
         packageCatalogRef->Initialize(*packageCatalogInfo, source);
         return *packageCatalogRef;
     }
+
     winrt::Microsoft::Management::Deployment::PackageCatalogReference PackageManager::GetPackageCatalogByName(hstring const& catalogName)
     {
+        LogStartupIfApplicable();
         std::string name = winrt::to_string(catalogName);
         if (name.empty())
         {
@@ -131,6 +250,7 @@ namespace winrt::Microsoft::Management::Deployment::implementation
             return nullptr;
         }
     }
+
     void AddPackageManifestToContext(winrt::Microsoft::Management::Deployment::PackageVersionInfo packageVersionInfo, ::AppInstaller::CLI::Execution::Context* context)
     {
         winrt::Microsoft::Management::Deployment::implementation::PackageVersionInfo* packageVersionInfoImpl = get_self<winrt::Microsoft::Management::Deployment::implementation::PackageVersionInfo>(packageVersionInfo);
@@ -149,14 +269,17 @@ namespace winrt::Microsoft::Management::Deployment::implementation
         context->Add<::AppInstaller::CLI::Execution::Data::Manifest>(std::move(manifest));
         context->Add<::AppInstaller::CLI::Execution::Data::PackageVersion>(std::move(internalPackageVersion));
     }
+
     void AddInstalledVersionToContext(winrt::Microsoft::Management::Deployment::PackageVersionInfo installedVersionInfo, ::AppInstaller::CLI::Execution::Context* context)
     {
         winrt::Microsoft::Management::Deployment::implementation::PackageVersionInfo* installedVersionInfoImpl = get_self<winrt::Microsoft::Management::Deployment::implementation::PackageVersionInfo>(installedVersionInfo);
         std::shared_ptr<::AppInstaller::Repository::IPackageVersion> internalInstalledVersion = installedVersionInfoImpl->GetRepositoryPackageVersion();
         context->Add<AppInstaller::CLI::Execution::Data::InstalledPackageVersion>(internalInstalledVersion);
     }
+
     winrt::Microsoft::Management::Deployment::PackageCatalogReference PackageManager::CreateCompositePackageCatalog(winrt::Microsoft::Management::Deployment::CreateCompositePackageCatalogOptions const& options)
     {
+        LogStartupIfApplicable();
         if (!options)
         {
             // Can't make a composite source if the options aren't specified.
@@ -193,6 +316,22 @@ namespace winrt::Microsoft::Management::Deployment::implementation
         return *uninstallResult;
     }
 
+    winrt::Microsoft::Management::Deployment::DownloadResult GetDownloadResult(::Workflow::ExecutionStage executionStage, winrt::hresult terminationHR, winrt::hstring correlationData)
+    {
+        winrt::Microsoft::Management::Deployment::DownloadResultStatus downloadResultStatus = GetOperationResultStatus<DownloadResultStatus>(executionStage, terminationHR);
+        auto downloadResult = winrt::make_self<wil::details::module_count_wrapper<winrt::Microsoft::Management::Deployment::implementation::DownloadResult>>();
+        downloadResult->Initialize(downloadResultStatus, terminationHR, correlationData);
+        return *downloadResult;
+    }
+
+    winrt::Microsoft::Management::Deployment::RepairResult GetRepairResult(::Workflow::ExecutionStage executionStage, winrt::hresult terminationHR, uint32_t repairError, winrt::hstring correlationData, bool rebootRequired)
+    {
+        winrt::Microsoft::Management::Deployment::RepairResultStatus repairResultStatus = GetOperationResultStatus<RepairResultStatus>(executionStage, terminationHR);
+        auto repairResult = winrt::make_self<wil::details::module_count_wrapper<winrt::Microsoft::Management::Deployment::implementation::RepairResult>>();
+        repairResult->Initialize(repairResultStatus, terminationHR, repairError, correlationData, rebootRequired);
+        return *repairResult;
+    }
+
     template <typename TResult>
     TResult GetOperationResult(::Workflow::ExecutionStage executionStage, winrt::hresult terminationHR, uint32_t operationError, winrt::hstring correlationData, bool rebootRequired)
     {
@@ -204,9 +343,17 @@ namespace winrt::Microsoft::Management::Deployment::implementation
         {
             return GetUninstallResult(executionStage, terminationHR, operationError, correlationData, rebootRequired);
         }
+        else if constexpr (std::is_same_v<TResult, winrt::Microsoft::Management::Deployment::DownloadResult>)
+        {
+            return GetDownloadResult(executionStage, terminationHR, correlationData);
+        }
+        else if constexpr (std::is_same_v<TResult, winrt::Microsoft::Management::Deployment::RepairResult>)
+        {
+            return GetRepairResult(executionStage, terminationHR, operationError, correlationData, rebootRequired);
+        }
     }
 
-#define WINGET_GET_PROGRESS_STATE(_installState_, _uninstallState_) \
+#define WINGET_GET_PROGRESS_STATE(_installState_, _uninstallState_, _repairState_) \
     if constexpr (std::is_same_v<TState, winrt::Microsoft::Management::Deployment::PackageInstallProgressState>) \
     { \
         progressState = TState::_installState_; \
@@ -214,7 +361,11 @@ namespace winrt::Microsoft::Management::Deployment::implementation
     else if constexpr (std::is_same_v<TState, winrt::Microsoft::Management::Deployment::PackageUninstallProgressState>) \
     { \
         progressState = TState::_uninstallState_; \
-    }
+    } \
+    else if constexpr (std::is_same_v<TState, winrt::Microsoft::Management::Deployment::PackageRepairProgressState>) \
+    { \
+        progressState = TState::_repairState_; \
+    } \
 
     template <typename TProgress, typename TState>
     std::optional<TProgress> GetProgress(
@@ -238,9 +389,10 @@ namespace winrt::Microsoft::Management::Deployment::implementation
             // We already reported queued progress up front.
             break;
         case ::Workflow::ExecutionStage::Download:
-            if constexpr (std::is_same_v<TProgress, winrt::Microsoft::Management::Deployment::InstallProgress>)
+            if constexpr (std::is_same_v<TProgress, winrt::Microsoft::Management::Deployment::InstallProgress> ||
+                std::is_same_v<TProgress, winrt::Microsoft::Management::Deployment::PackageDownloadProgress>)
             {
-                progressState = PackageInstallProgressState::Downloading;
+                progressState = TState::Downloading;
                 if (reportType == ReportType::BeginProgress)
                 {
                     reportProgress = true;
@@ -261,7 +413,7 @@ namespace winrt::Microsoft::Management::Deployment::implementation
             // Wait until installer starts to report operation.
             break;
         case ::Workflow::ExecutionStage::Execution:
-            WINGET_GET_PROGRESS_STATE(Installing, Uninstalling);
+            WINGET_GET_PROGRESS_STATE(Installing, Uninstalling, Repairing);
             downloadProgress = 1;
             if (reportType == ReportType::ExecutionPhaseUpdate)
             {
@@ -289,7 +441,7 @@ namespace winrt::Microsoft::Management::Deployment::implementation
             {
                 // Send PostInstall progress when it switches to PostExecution phase.
                 reportProgress = true;
-                WINGET_GET_PROGRESS_STATE(PostInstall, PostUninstall);
+                WINGET_GET_PROGRESS_STATE(PostInstall, PostUninstall, PostRepair);
                 downloadProgress = 1;
                 operationProgress = 1;
             }
@@ -307,6 +459,16 @@ namespace winrt::Microsoft::Management::Deployment::implementation
                 TProgress progress{ progressState, operationProgress };
                 return progress;
             }
+            else if constexpr (std::is_same_v<TProgress, winrt::Microsoft::Management::Deployment::PackageDownloadProgress>)
+            {
+                TProgress progress{ progressState, downloadBytesDownloaded, downloadBytesRequired, downloadProgress };
+                return progress;
+            }
+            else if constexpr (std::is_same_v<TProgress, winrt::Microsoft::Management::Deployment::RepairProgress>)
+            {
+                TProgress progress{ progressState, operationProgress };
+                return progress;
+            }
         }
         else
         {
@@ -314,7 +476,8 @@ namespace winrt::Microsoft::Management::Deployment::implementation
         }
     }
 
-    Microsoft::Management::Deployment::PackageVersionInfo GetPackageVersionInfo(winrt::Microsoft::Management::Deployment::CatalogPackage package, winrt::Microsoft::Management::Deployment::InstallOptions options)
+    template <typename TOptions>
+    Microsoft::Management::Deployment::PackageVersionInfo GetPackageVersionInfo(winrt::Microsoft::Management::Deployment::CatalogPackage package, TOptions options)
     {
         Microsoft::Management::Deployment::PackageVersionInfo packageVersionInfo{ nullptr };
 
@@ -326,11 +489,23 @@ namespace winrt::Microsoft::Management::Deployment::implementation
         }
         else
         {
-            packageVersionInfo = package.DefaultInstallVersion();
+            if constexpr (std::is_same_v<TOptions, winrt::Microsoft::Management::Deployment::InstallOptions>)
+            {
+                packageVersionInfo = package.DefaultInstallVersion();
+            }
+            else if constexpr (std::is_same_v<TOptions, winrt::Microsoft::Management::Deployment::DownloadOptions>)
+            {
+                // For download, applicability check is not needed. Just use latest.
+                if (package.AvailableVersions().Size() > 0)
+                {
+                    packageVersionInfo = package.GetPackageVersionInfo(package.AvailableVersions().GetAt(0));
+                }
+            }
         }
         // If the specified version wasn't found then return a failure. This is unusual, since all packages that came from a non-local catalog have a default version,
         // and the versionId is strongly typed and comes from the CatalogPackage.GetAvailableVersions.
-        THROW_HR_IF(APPINSTALLER_CLI_ERROR_NO_MANIFEST_FOUND, !packageVersionInfo);
+        // If version is not specified, DefaultInstallVersion may be empty due to applicability check.
+        THROW_HR_IF(versionId ? APPINSTALLER_CLI_ERROR_NO_MANIFEST_FOUND : APPINSTALLER_CLI_ERROR_NO_APPLICABLE_INSTALLER, !packageVersionInfo);
         return packageVersionInfo;
     }
 
@@ -340,6 +515,8 @@ namespace winrt::Microsoft::Management::Deployment::implementation
     {
         if (options)
         {
+            THROW_HR_IF(APPINSTALLER_CLI_ERROR_INVALID_CL_ARGUMENTS, options.SkipDependencies() && options.InstallDependenciesOnly());
+
             if (!options.LogOutputPath().empty())
             {
                 context->Args.AddArg(Execution::Args::Type::Log, ::AppInstaller::Utility::ConvertToUTF8(options.LogOutputPath()));
@@ -348,6 +525,16 @@ namespace winrt::Microsoft::Management::Deployment::implementation
             if (options.AllowHashMismatch())
             {
                 context->Args.AddArg(Execution::Args::Type::HashOverride);
+            }
+
+            if (options.BypassIsStoreClientBlockedPolicyCheck())
+            {
+                context->SetFlags(Execution::ContextFlag::BypassIsStoreClientBlockedPolicyCheck);
+            }
+
+            if (options.Force())
+            {
+                context->Args.AddArg(Execution::Args::Type::Force);
             }
 
             // If the PackageInstallScope is anything other than ::Any then set it as a requirement.
@@ -367,6 +554,12 @@ namespace winrt::Microsoft::Management::Deployment::implementation
                 context->Args.AddArg(Execution::Args::Type::Silent);
             }
 
+            auto installerType = GetManifestInstallerType(options.InstallerType());
+            if (installerType != AppInstaller::Manifest::InstallerTypeEnum::Unknown)
+            {
+                context->Args.AddArg(Execution::Args::Type::InstallerType, AppInstaller::Manifest::InstallerTypeToString(installerType));
+            }
+
             if (!options.PreferredInstallLocation().empty())
             {
                 context->Args.AddArg(Execution::Args::Type::InstallLocation, ::AppInstaller::Utility::ConvertToUTF8(options.PreferredInstallLocation()));
@@ -375,6 +568,11 @@ namespace winrt::Microsoft::Management::Deployment::implementation
             if (!options.ReplacementInstallerArguments().empty())
             {
                 context->Args.AddArg(Execution::Args::Type::Override, ::AppInstaller::Utility::ConvertToUTF8(options.ReplacementInstallerArguments()));
+            }
+
+            if (!options.AdditionalInstallerArguments().empty())
+            {
+                context->Args.AddArg(Execution::Args::Type::CustomSwitches, ::AppInstaller::Utility::ConvertToUTF8(options.AdditionalInstallerArguments()));
             }
 
             if (options.AllowedArchitectures().Size() != 0)
@@ -392,6 +590,31 @@ namespace winrt::Microsoft::Management::Deployment::implementation
             }
 
             // Note: AdditionalPackageCatalogArguments is not needed during install since the manifest is already known so no additional calls to the source are needed. The property is deprecated.
+
+            if (options.AcceptPackageAgreements())
+            {
+                context->Args.AddArg(Execution::Args::Type::AcceptPackageAgreements);
+            }
+
+            if (options.SkipDependencies())
+            {
+                context->Args.AddArg(Execution::Args::Type::SkipDependencies);
+            }
+            if (options.InstallDependenciesOnly())
+            {
+                context->Args.AddArg(Execution::Args::Type::DependenciesOnly);
+            }
+
+            if (options.AuthenticationArguments())
+            {
+                context->Args.AddArg(Execution::Args::Type::AuthenticationMode, ::AppInstaller::Authentication::AuthenticationModeToString(GetAuthenticationMode(options.AuthenticationArguments().AuthenticationMode())));
+                context->Args.AddArg(Execution::Args::Type::AuthenticationAccount, ::AppInstaller::Utility::ConvertToUTF8(options.AuthenticationArguments().AuthenticationAccount()));
+            }
+        }
+        else
+        {
+            // Note: If no install options are specified, we assume the caller is accepting the package agreements by default.
+            context->Args.AddArg(Execution::Args::Type::AcceptPackageAgreements);
         }
     }
 
@@ -406,6 +629,10 @@ namespace winrt::Microsoft::Management::Deployment::implementation
                 context->Args.AddArg(Execution::Args::Type::Log, ::AppInstaller::Utility::ConvertToUTF8(options.LogOutputPath()));
                 context->Args.AddArg(Execution::Args::Type::VerboseLogs);
             }
+            if (options.Force())
+            {
+                context->Args.AddArg(Execution::Args::Type::Force);
+            }
 
             if (options.PackageUninstallMode() == PackageUninstallMode::Interactive)
             {
@@ -414,6 +641,140 @@ namespace winrt::Microsoft::Management::Deployment::implementation
             else if (options.PackageUninstallMode() == PackageUninstallMode::Silent)
             {
                 context->Args.AddArg(Execution::Args::Type::Silent);
+            }
+
+            auto uninstallScope = GetManifestUninstallScope(options.PackageUninstallScope());
+            if (uninstallScope != ::AppInstaller::Manifest::ScopeEnum::Unknown)
+            {
+                context->Args.AddArg(Execution::Args::Type::InstallScope, ScopeToString(uninstallScope));
+            }
+        }
+    }
+
+    void PopulateContextFromDownloadOptions(
+        ::AppInstaller::CLI::Execution::Context* context,
+        winrt::Microsoft::Management::Deployment::DownloadOptions options)
+    {
+        if (options)
+        {
+            if (!options.DownloadDirectory().empty())
+            {
+                context->Args.AddArg(Execution::Args::Type::DownloadDirectory, ::AppInstaller::Utility::ConvertToUTF8(options.DownloadDirectory()));
+            }
+            if (!options.Locale().empty())
+            {
+                context->Args.AddArg(Execution::Args::Type::Locale, ::AppInstaller::Utility::ConvertToUTF8(options.Locale()));
+            }
+            if (options.AllowHashMismatch())
+            {
+                context->Args.AddArg(Execution::Args::Type::HashOverride);
+            }
+            if (options.SkipDependencies())
+            {
+                context->Args.AddArg(Execution::Args::Type::SkipDependencies);
+            }
+            if (options.AcceptPackageAgreements())
+            {
+                context->Args.AddArg(Execution::Args::Type::AcceptPackageAgreements);
+            }
+            auto manifestScope = GetManifestScope(options.Scope());
+            if (manifestScope.first != ::AppInstaller::Manifest::ScopeEnum::Unknown)
+            {
+                context->Args.AddArg(Execution::Args::Type::InstallScope, ScopeToString(manifestScope.first));
+            }
+
+            auto architecture = options.Architecture();
+            if (architecture != Windows::System::ProcessorArchitecture::Unknown)
+            {
+                auto convertedArchitecture = GetUtilityArchitecture(architecture);
+                if (convertedArchitecture)
+                {
+                    context->Args.AddArg(Execution::Args::Type::InstallerArchitecture, ToString(convertedArchitecture.value()));
+                }
+            }
+
+            auto installerType = GetManifestInstallerType(options.InstallerType());
+            if (installerType != AppInstaller::Manifest::InstallerTypeEnum::Unknown)
+            {
+                context->Args.AddArg(Execution::Args::Type::InstallerType, AppInstaller::Manifest::InstallerTypeToString(installerType));
+            }
+
+            if (options.AuthenticationArguments())
+            {
+                context->Args.AddArg(Execution::Args::Type::AuthenticationMode, ::AppInstaller::Authentication::AuthenticationModeToString(GetAuthenticationMode(options.AuthenticationArguments().AuthenticationMode())));
+                context->Args.AddArg(Execution::Args::Type::AuthenticationAccount, ::AppInstaller::Utility::ConvertToUTF8(options.AuthenticationArguments().AuthenticationAccount()));
+            }
+
+            if (options.SkipMicrosoftStoreLicense())
+            {
+                context->Args.AddArg(Execution::Args::Type::SkipMicrosoftStorePackageLicense);
+            }
+
+            WindowsPlatform platform = options.Platform();
+            if (platform != WindowsPlatform::Unknown)
+            {
+                context->Args.AddArg(Execution::Args::Type::Platform, AppInstaller::Manifest::PlatformToString(GetPlatformEnum(platform)));
+            }
+
+            hstring targetOSVersion = options.TargetOSVersion();
+            if (!targetOSVersion.empty())
+            {
+                context->Args.AddArg(Execution::Args::Type::OSVersion, ::AppInstaller::Utility::ConvertToUTF8(targetOSVersion));
+            }
+        }
+    }
+
+    void PopulateContextFromRepairOptions(
+        ::AppInstaller::CLI::Execution::Context* context,
+        winrt::Microsoft::Management::Deployment::RepairOptions options)
+    {
+        if (options)
+        {
+            if (!options.LogOutputPath().empty())
+            {
+                context->Args.AddArg(Execution::Args::Type::Log, ::AppInstaller::Utility::ConvertToUTF8(options.LogOutputPath()));
+                context->Args.AddArg(Execution::Args::Type::VerboseLogs);
+            }
+
+            if (options.PackageRepairMode() == PackageRepairMode::Interactive)
+            {
+                context->Args.AddArg(Execution::Args::Type::Interactive);
+            }
+            else if (options.PackageRepairMode() == PackageRepairMode::Silent)
+            {
+                context->Args.AddArg(Execution::Args::Type::Silent);
+            }
+
+            if (options.AcceptPackageAgreements())
+            {
+                context->Args.AddArg(Execution::Args::Type::AcceptPackageAgreements);
+            }
+
+            if (options.AllowHashMismatch())
+            {
+                context->Args.AddArg(Execution::Args::Type::HashOverride);
+            }
+
+            if (options.BypassIsStoreClientBlockedPolicyCheck())
+            {
+                context->SetFlags(Execution::ContextFlag::BypassIsStoreClientBlockedPolicyCheck);
+            }
+
+            if (options.Force())
+            {
+                context->Args.AddArg(Execution::Args::Type::Force);
+            }
+
+            auto repairScope = GetManifestRepairScope(options.PackageRepairScope());
+            if (repairScope != ::AppInstaller::Manifest::ScopeEnum::Unknown)
+            {
+                context->Args.AddArg(Execution::Args::Type::InstallScope, ScopeToString(repairScope));
+            }
+
+            if (options.AuthenticationArguments())
+            {
+                context->Args.AddArg(Execution::Args::Type::AuthenticationMode, ::AppInstaller::Authentication::AuthenticationModeToString(GetAuthenticationMode(options.AuthenticationArguments().AuthenticationMode())));
+                context->Args.AddArg(Execution::Args::Type::AuthenticationAccount, ::AppInstaller::Utility::ConvertToUTF8(options.AuthenticationArguments().AuthenticationAccount()));
             }
         }
     }
@@ -425,12 +786,8 @@ namespace winrt::Microsoft::Management::Deployment::implementation
     {
         std::unique_ptr<COMContext> context = std::make_unique<COMContext>();
         hstring correlationData = (options) ? options.CorrelationData() : L"";
-        std::string callerName;
-        {
-            auto lock = s_callerNameLock.lock_shared();
-            callerName = s_callerName.has_value() ? s_callerName.value() : AppInstaller::Utility::ConvertToUTF8(callerProcessInfoString);
-        }
-        context->SetContextLoggers(correlationData, callerName);
+
+        context->SetContextLoggers(correlationData, GetComCallerName(AppInstaller::Utility::ConvertToUTF8(callerProcessInfoString)));
 
         // Convert the options to arguments for the installer.
         if constexpr (std::is_same_v<TOptions, winrt::Microsoft::Management::Deployment::InstallOptions>)
@@ -440,6 +797,14 @@ namespace winrt::Microsoft::Management::Deployment::implementation
         else if constexpr (std::is_same_v<TOptions, winrt::Microsoft::Management::Deployment::UninstallOptions>)
         {
             PopulateContextFromUninstallOptions(context.get(), options);
+        }
+        else if constexpr (std::is_same_v<TOptions, winrt::Microsoft::Management::Deployment::DownloadOptions>)
+        {
+            PopulateContextFromDownloadOptions(context.get(), options);
+        }
+        else if constexpr (std::is_same_v<TOptions, winrt::Microsoft::Management::Deployment::RepairOptions>)
+        {
+            PopulateContextFromRepairOptions(context.get(), options);
         }
 
         return context;
@@ -543,12 +908,45 @@ namespace winrt::Microsoft::Management::Deployment::implementation
     {
         // Add installed version
         AddInstalledVersionToContext(package.InstalledVersion(), comContext.get());
+
         // Add Package which is used by RecordUninstall later for removing from tracking catalog of correlated available sources as best effort
         winrt::Microsoft::Management::Deployment::implementation::CatalogPackage* catalogPackageImpl = get_self<winrt::Microsoft::Management::Deployment::implementation::CatalogPackage>(package);
-        std::shared_ptr<::AppInstaller::Repository::IPackage> internalPackage = catalogPackageImpl->GetRepositoryPackage();
+        std::shared_ptr<::AppInstaller::Repository::ICompositePackage> internalPackage = catalogPackageImpl->GetRepositoryPackage();
         comContext->Add<AppInstaller::CLI::Execution::Data::Package>(internalPackage);
 
         return Execution::OrchestratorQueueItemFactory::CreateItemForUninstall(std::wstring{ package.Id() }, std::wstring{ package.InstalledVersion().PackageCatalog().Info().Id() }, std::move(comContext));
+    }
+
+    std::unique_ptr<Execution::OrchestratorQueueItem> CreateQueueItemForDownload(
+        std::unique_ptr<::AppInstaller::CLI::Execution::COMContext> comContext,
+        winrt::Microsoft::Management::Deployment::CatalogPackage package,
+        winrt::Microsoft::Management::Deployment::DownloadOptions options)
+    {
+        // Add manifest and PackageVersion to context for download.
+        // If the version of the package is specified use that, otherwise use the default.
+        Microsoft::Management::Deployment::PackageVersionInfo packageVersionInfo = GetPackageVersionInfo(package, options);
+        AddPackageManifestToContext(packageVersionInfo, comContext.get());
+
+        comContext->SetFlags(AppInstaller::CLI::Execution::ContextFlag::InstallerDownloadOnly);
+
+        return Execution::OrchestratorQueueItemFactory::CreateItemForDownload(std::wstring{ package.Id() }, std::wstring{ packageVersionInfo.PackageCatalog().Info().Id() }, std::move(comContext));
+    }
+
+    std::unique_ptr<Execution::OrchestratorQueueItem> CreateQueueItemForRepair(
+        std::unique_ptr<::AppInstaller::CLI::Execution::COMContext> comContext,
+        winrt::Microsoft::Management::Deployment::CatalogPackage package)
+    {
+        // Add installed version
+        AddInstalledVersionToContext(package.InstalledVersion(), comContext.get());
+
+        // Add Package which is used to co-relate installed package with available package for repair
+        winrt::Microsoft::Management::Deployment::implementation::CatalogPackage* catalogPackageImpl = get_self<winrt::Microsoft::Management::Deployment::implementation::CatalogPackage>(package);
+        std::shared_ptr<::AppInstaller::Repository::ICompositePackage> internalPackage = catalogPackageImpl->GetRepositoryPackage();
+        comContext->Add<AppInstaller::CLI::Execution::Data::Package>(internalPackage);
+
+        comContext->SetFlags(AppInstaller::CLI::Execution::ContextFlag::InstallerExecutionUseRepair);
+
+        return Execution::OrchestratorQueueItemFactory::CreateItemForRepair(std::wstring{ package.Id() }, std::wstring{ package.InstalledVersion().PackageCatalog().Info().Id() }, std::move(comContext));
     }
 
     template <typename TResult, typename TProgress, typename TOptions, typename TProgressState>
@@ -587,6 +985,14 @@ namespace winrt::Microsoft::Management::Deployment::implementation
                 {
                     queueItem = CreateQueueItemForUninstall(std::move(comContext), package);
                 }
+                else if constexpr (std::is_same_v<TOptions, winrt::Microsoft::Management::Deployment::DownloadOptions>)
+                {
+                    queueItem = CreateQueueItemForDownload(std::move(comContext), package, options);
+                }
+                else if constexpr (std::is_same_v<TOptions, winrt::Microsoft::Management::Deployment::RepairOptions>)
+                {
+                    queueItem = CreateQueueItemForRepair(std::move(comContext), package);
+                }
 
                 Execution::ContextOrchestrator::Instance().EnqueueAndRunItem(queueItem);
 
@@ -597,7 +1003,17 @@ namespace winrt::Microsoft::Management::Deployment::implementation
                 }
                 else if constexpr (std::is_same_v<TProgress, winrt::Microsoft::Management::Deployment::PackageUninstallProgressState>)
                 {
-                    TProgress queuedProgress{ TProgressState::Queued, 0};
+                    TProgress queuedProgress{ TProgressState::Queued, 0 };
+                    report_progress(queuedProgress);
+                }
+                else if constexpr (std::is_same_v<TProgress, winrt::Microsoft::Management::Deployment::PackageDownloadProgressState>)
+                {
+                    TProgress queuedProgress{ TProgressState::Queued, 0 };
+                    report_progress(queuedProgress);
+                }
+                else if constexpr (std::is_same_v<TProgress, winrt::Microsoft::Management::Deployment::PackageRepairProgressState>)
+                {
+                    TProgress queuedProgress{ TProgressState::Queued, 0 };
                     report_progress(queuedProgress);
                 }
             }
@@ -856,6 +1272,226 @@ namespace winrt::Microsoft::Management::Deployment::implementation
 
         return GetPackageOperation<Deployment::UninstallResult, Deployment::UninstallProgress, Deployment::UninstallOptions, Deployment::PackageUninstallProgressState>(
             canCancelQueueItem, std::move(queueItem));
+    }
+
+#define WINGET_RETURN_DOWNLOAD_RESULT_HR_IF(hr, boolVal) { if(boolVal) { return GetEmptyAsynchronousResultForOperation<Deployment::DownloadResult, Deployment::PackageDownloadProgress>(hr, correlationData); }}
+#define WINGET_RETURN_DOWNLOAD_RESULT_HR_IF_FAILED(hr) { WINGET_RETURN_DOWNLOAD_RESULT_HR_IF(hr, FAILED(hr)) }
+
+    winrt::Windows::Foundation::IAsyncOperationWithProgress<winrt::Microsoft::Management::Deployment::DownloadResult, winrt::Microsoft::Management::Deployment::PackageDownloadProgress> PackageManager::DownloadPackageAsync(winrt::Microsoft::Management::Deployment::CatalogPackage package, winrt::Microsoft::Management::Deployment::DownloadOptions options)
+    {
+        hstring correlationData = (options) ? options.CorrelationData() : L"";
+
+        // options and catalog can both be null, package must be set.
+        WINGET_RETURN_DOWNLOAD_RESULT_HR_IF(APPINSTALLER_CLI_ERROR_INVALID_CL_ARGUMENTS, !package);
+
+        HRESULT hr = S_OK;
+        std::wstring callerProcessInfoString;
+        try
+        {
+            // Check for permissions and get caller info for telemetry.
+            // This must be done before any co_awaits since it requires info from the rpc caller thread.
+            auto [hrGetCallerId, callerProcessId] = GetCallerProcessId();
+            WINGET_RETURN_DOWNLOAD_RESULT_HR_IF_FAILED(hrGetCallerId);
+            WINGET_RETURN_DOWNLOAD_RESULT_HR_IF_FAILED(EnsureComCallerHasCapability(Capability::PackageQuery));
+            callerProcessInfoString = TryGetCallerProcessInfo(callerProcessId);
+        }
+        WINGET_CATCH_STORE(hr, APPINSTALLER_CLI_ERROR_COMMAND_FAILED);
+        WINGET_RETURN_DOWNLOAD_RESULT_HR_IF_FAILED(hr);
+
+        return GetPackageOperation<Deployment::DownloadResult, Deployment::PackageDownloadProgress, Deployment::DownloadOptions, Deployment::PackageDownloadProgressState>(
+            true /*canCancelQueueItem*/, nullptr /*queueItem*/, package, options, std::move(callerProcessInfoString));
+    }
+
+    winrt::Windows::Foundation::IAsyncOperationWithProgress<winrt::Microsoft::Management::Deployment::DownloadResult, winrt::Microsoft::Management::Deployment::PackageDownloadProgress> PackageManager::GetDownloadProgress(winrt::Microsoft::Management::Deployment::CatalogPackage package, winrt::Microsoft::Management::Deployment::PackageCatalogInfo catalogInfo)
+    {
+        hstring correlationData;
+        WINGET_RETURN_DOWNLOAD_RESULT_HR_IF(APPINSTALLER_CLI_ERROR_INVALID_CL_ARGUMENTS, !package);
+
+        HRESULT hr = S_OK;
+        std::shared_ptr<Execution::OrchestratorQueueItem> queueItem = nullptr;
+        try
+        {
+            WINGET_RETURN_DOWNLOAD_RESULT_HR_IF_FAILED(EnsureComCallerHasCapability(Capability::PackageQuery));
+
+            // Get the queueItem synchronously.
+            queueItem = GetExistingQueueItemForPackage(package, catalogInfo);
+            if (queueItem == nullptr ||
+                queueItem->GetPackageOperationType() != PackageOperationType::Download)
+            {
+                return nullptr;
+            }
+        }
+        WINGET_CATCH_STORE(hr, APPINSTALLER_CLI_ERROR_COMMAND_FAILED);
+        WINGET_RETURN_DOWNLOAD_RESULT_HR_IF_FAILED(hr);
+
+        return GetPackageOperation<Deployment::DownloadResult, Deployment::PackageDownloadProgress, Deployment::DownloadOptions, Deployment::PackageDownloadProgressState>(true, std::move(queueItem));
+    }
+
+#define WINGET_RETURN_REPAIR_RESULT_HR_IF(hr, boolVal) { if(boolVal) { return GetEmptyAsynchronousResultForOperation<Deployment::RepairResult, Deployment::RepairProgress>(hr, correlationData); }}
+#define WINGET_RETURN_REPAIR_RESULT_HR_IF_FAILED(hr) { WINGET_RETURN_REPAIR_RESULT_HR_IF(hr, FAILED(hr)) }
+
+    winrt::Windows::Foundation::IAsyncOperationWithProgress<winrt::Microsoft::Management::Deployment::RepairResult, winrt::Microsoft::Management::Deployment::RepairProgress> PackageManager::RepairPackageAsync(winrt::Microsoft::Management::Deployment::CatalogPackage package, winrt::Microsoft::Management::Deployment::RepairOptions options)
+    {
+        hstring correlationData = (options) ? options.CorrelationData() : L"";
+
+        // options and catalog can both be null, package must be set.
+        WINGET_RETURN_REPAIR_RESULT_HR_IF(APPINSTALLER_CLI_ERROR_INVALID_CL_ARGUMENTS, !package);
+        // the package should have an installed version to be repaired.
+        WINGET_RETURN_REPAIR_RESULT_HR_IF(APPINSTALLER_CLI_ERROR_INVALID_CL_ARGUMENTS, !package.InstalledVersion());
+
+        HRESULT hr = S_OK;
+        std::wstring callerProcessInfoString;
+        try
+        {
+            // Check for permissions and get caller info for telemetry.
+            // This must be done before any co_awaits since it requires info from the rpc caller thread.
+            auto [hrGetCallerId, callerProcessId] = GetCallerProcessId();
+            WINGET_RETURN_REPAIR_RESULT_HR_IF_FAILED(hrGetCallerId);
+            WINGET_RETURN_REPAIR_RESULT_HR_IF_FAILED(EnsureProcessHasCapability(Capability::PackageManagement, callerProcessId));
+            callerProcessInfoString = TryGetCallerProcessInfo(callerProcessId);
+        }
+        WINGET_CATCH_STORE(hr, APPINSTALLER_CLI_ERROR_COMMAND_FAILED);
+        WINGET_RETURN_REPAIR_RESULT_HR_IF_FAILED(hr);
+
+        return GetPackageOperation<Deployment::RepairResult, Deployment::RepairProgress, Deployment::RepairOptions, Deployment::PackageRepairProgressState>(
+            true /*canCancelQueueItem*/, nullptr /*queueItem*/, package, options, std::move(callerProcessInfoString));
+    }
+
+    winrt::Windows::Foundation::IAsyncOperationWithProgress<winrt::Microsoft::Management::Deployment::AddPackageCatalogResult, double> PackageManager::AddPackageCatalogAsync(winrt::Microsoft::Management::Deployment::AddPackageCatalogOptions options)
+    {
+        LogStartupIfApplicable();
+
+        // options must be set.
+        THROW_HR_IF_NULL(E_POINTER, options);
+        THROW_HR_IF(E_INVALIDARG, options.Name().empty());
+        THROW_HR_IF(E_INVALIDARG, options.SourceUri().empty());
+
+        HRESULT terminationHR = S_OK;
+        try {
+
+            // Check if running as admin/system.
+            // [NOTE:] For OutOfProc calls, the Windows Package Manager Service executes in the context initiated by the caller process,
+            // so the same admin/system validation check is applicable for both InProc and OutOfProc calls.
+            THROW_HR_IF(APPINSTALLER_CLI_ERROR_COMMAND_REQUIRES_ADMIN, !AppInstaller::Runtime::IsRunningAsAdminOrSystem());
+
+            ::AppInstaller::Repository::Source sourceToAdd = CreateSourceFromOptions(options);
+
+            auto strong_this = get_strong();
+            auto report_progress{ co_await winrt::get_progress_token() };
+            co_await winrt::resume_background();
+
+            std::string type = winrt::to_string(options.Type());
+            auto packageCatalogProgressSink = winrt::Microsoft::Management::Deployment::ProgressSinkFactory::CreatePackageCatalogProgressSink(type, report_progress );
+
+            packageCatalogProgressSink->BeginProgress();
+            ::AppInstaller::ProgressCallback progress(packageCatalogProgressSink.get());
+            sourceToAdd.Add(progress);
+            packageCatalogProgressSink->EndProgress(false);
+        }
+        catch (...)
+        {
+            terminationHR = AppInstaller::CLI::Workflow::HandleException(nullptr, std::current_exception());
+        }
+
+        co_return GetAddPackageCatalogResult(terminationHR);
+    }
+
+    winrt::Windows::Foundation::IAsyncOperationWithProgress<winrt::Microsoft::Management::Deployment::RemovePackageCatalogResult, double> PackageManager::RemovePackageCatalogAsync(winrt::Microsoft::Management::Deployment::RemovePackageCatalogOptions options)
+    {
+        LogStartupIfApplicable();
+
+        // options must be set.
+        THROW_HR_IF_NULL(E_POINTER, options);
+        THROW_HR_IF(E_INVALIDARG, options.Name().empty());
+
+        HRESULT terminationHR = S_OK;
+        try {
+
+            // Check if running as admin/system.
+            // [NOTE:] For OutOfProc calls, the Windows Package Manager Service executes in the context initiated by the caller process,
+            // so the same admin/system validation check is applicable for both InProc and OutOfProc calls.
+            THROW_HR_IF(APPINSTALLER_CLI_ERROR_COMMAND_REQUIRES_ADMIN, !AppInstaller::Runtime::IsRunningAsAdminOrSystem());
+
+            auto matchingSource = GetMatchingSource(winrt::to_string(options.Name()));
+            THROW_HR_IF(APPINSTALLER_CLI_ERROR_SOURCE_NAME_DOES_NOT_EXIST, !matchingSource.has_value());
+
+            auto strong_this = get_strong();
+            auto report_progress{ co_await winrt::get_progress_token() };
+            co_await winrt::resume_background();
+
+            auto packageCatalogProgressSink = winrt::Microsoft::Management::Deployment::ProgressSinkFactory::CreatePackageCatalogProgressSink(matchingSource.value().Type, report_progress, true);
+
+            packageCatalogProgressSink->BeginProgress();
+            ::AppInstaller::Repository::Source sourceToRemove = ::AppInstaller::Repository::Source{ matchingSource.value().Name };
+            ::AppInstaller::ProgressCallback progress(packageCatalogProgressSink.get());
+
+            // If the PreserveData option is set, this is equivalent to the WinGet CLI Reset command on a single source; otherwise, it removes the source.
+            if (options.PreserveData())
+            {
+                THROW_HR_IF(APPINSTALLER_CLI_ERROR_SOURCE_NAME_DOES_NOT_EXIST, !sourceToRemove.DropSource(matchingSource.value().Name));
+            }
+            else
+            {
+                sourceToRemove.Remove(progress);
+            }
+            packageCatalogProgressSink->EndProgress(false);
+        }
+        catch (...)
+        {
+            terminationHR = AppInstaller::CLI::Workflow::HandleException(nullptr, std::current_exception());
+        }
+
+        co_return GetRemovePackageCatalogResult(terminationHR);
+    }
+
+    winrt::hstring PackageManager::Version() const
+    {
+        return winrt::hstring{ AppInstaller::Utility::ConvertToUTF16(AppInstaller::Runtime::GetClientVersion()) };
+    }
+
+    winrt::Microsoft::Management::Deployment::EditPackageCatalogResult GetEditPackageCatalogResult(winrt::hresult terminationStatus)
+    {
+        winrt::Microsoft::Management::Deployment::EditPackageCatalogStatus status = GetPackageCatalogOperationStatus<EditPackageCatalogStatus>(terminationStatus);
+        auto editResult = winrt::make_self<wil::details::module_count_wrapper<winrt::Microsoft::Management::Deployment::implementation::EditPackageCatalogResult>>();
+        editResult->Initialize(status, terminationStatus);
+        return *editResult;
+    }
+
+    winrt::Microsoft::Management::Deployment::EditPackageCatalogResult PackageManager::EditPackageCatalog(winrt::Microsoft::Management::Deployment::EditPackageCatalogOptions options)
+    {
+        LogStartupIfApplicable();
+
+        // options must be set.
+        THROW_HR_IF_NULL(E_POINTER, options);
+        THROW_HR_IF(E_INVALIDARG, options.Name().empty());
+
+        HRESULT terminationHR = S_OK;
+        try {
+
+            // Check if running as admin/system.
+            // [NOTE:] For OutOfProc calls, the Windows Package Manager Service executes in the context initiated by the caller process,
+            // so the same admin/system validation check is applicable for both InProc and OutOfProc calls.
+            THROW_HR_IF(APPINSTALLER_CLI_ERROR_COMMAND_REQUIRES_ADMIN, !AppInstaller::Runtime::IsRunningAsAdminOrSystem());
+
+            auto matchingSource = GetMatchingSource(winrt::to_string(options.Name()));
+            THROW_HR_IF(APPINSTALLER_CLI_ERROR_SOURCE_NAME_DOES_NOT_EXIST, !matchingSource.has_value());
+            ::AppInstaller::Repository::Source sourceToEdit = ::AppInstaller::Repository::Source{ matchingSource.value().Name };
+
+            ::AppInstaller::Repository::SourceEdit edits;
+            edits.Explicit = options.Explicit();
+            edits.Priority = options.Priority();
+
+            if (sourceToEdit.RequiresChanges(edits))
+            {
+                sourceToEdit.Edit(edits);
+            }
+        }
+        catch (...)
+        {
+            terminationHR = AppInstaller::CLI::Workflow::HandleException(nullptr, std::current_exception());
+        }
+
+        return GetEditPackageCatalogResult(terminationHR);
     }
 
     CoCreatableMicrosoftManagementDeploymentClass(PackageManager);

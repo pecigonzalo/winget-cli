@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 #pragma once
+#include "TestCommon.h"
 #include <winget/Settings.h>
 #include <winget/UserSettings.h>
 #include <wil/resource.h>
@@ -14,10 +15,18 @@ namespace TestCommon
     const std::wstring ExperimentalFeaturesPolicyValueName = L"EnableExperimentalFeatures";
     const std::wstring LocalManifestsPolicyValueName = L"EnableLocalManifestFiles";
     const std::wstring EnableHashOverridePolicyValueName = L"EnableHashOverride";
+    const std::wstring EnableLocalArchiveMalwareScanOverridePolicyValueName = L"EnableLocalArchiveMalwareScanOverride";
     const std::wstring DefaultSourcePolicyValueName = L"EnableDefaultSource";
     const std::wstring MSStoreSourcePolicyValueName = L"EnableMicrosoftStoreSource";
+    const std::wstring FontSourcePolicyValueName = L"EnableFontSource";
     const std::wstring AdditionalSourcesPolicyValueName = L"EnableAdditionalSources";
     const std::wstring AllowedSourcesPolicyValueName = L"EnableAllowedSources";
+    const std::wstring BypassCertificatePinningForMicrosoftStoreValueName = L"EnableBypassCertificatePinningForMicrosoftStore";
+    const std::wstring EnableWindowsPackageManagerCommandLineInterfaces = L"EnableWindowsPackageManagerCommandLineInterfaces";
+    const std::wstring ConfigurationPolicyValueName = L"EnableWindowsPackageManagerConfiguration";
+    const std::wstring ProxyCommandLineOptionsPolicyValueName = L"EnableWindowsPackageManagerProxyCommandLineOptions";
+    const std::wstring McpServerValueName = L"EnableWindowsPackageManagerMcpServer";
+    const std::wstring ConfigurationProcessorPathValueName = L"EnableWindowsPackageManagerConfigurationProcessorPath";
 
     const std::wstring SourceUpdateIntervalPolicyValueName = L"SourceAutoUpdateInterval";
     const std::wstring SourceUpdateIntervalPolicyOldValueName = L"SourceAutoUpdateIntervalInMinutes";
@@ -29,7 +38,14 @@ namespace TestCommon
     void RemoveSetting(const AppInstaller::Settings::StreamDefinition& stream);
     std::filesystem::path GetPathTo(const AppInstaller::Settings::StreamDefinition& stream);
 
-    void DeleteUserSettingsFiles();
+    // This type removes the settings file on creation and destruction to ensure that a test that modifies them can do so cleanly.
+    struct UserSettingsFileGuard
+    {
+        UserSettingsFileGuard();
+        ~UserSettingsFileGuard();
+    };
+
+    [[nodiscard]] UserSettingsFileGuard DeleteUserSettingsFiles();
 
     struct UserSettingsTest : AppInstaller::Settings::UserSettings
     {
@@ -57,7 +73,7 @@ namespace TestCommon
     };
 
     // Matcher that lets us verify GroupPolicyExceptions.
-    struct GroupPolicyExceptionMatcher : public Catch::MatcherBase<AppInstaller::Settings::GroupPolicyException>
+    struct GroupPolicyExceptionMatcher : public Catch::Matchers::MatcherBase<AppInstaller::Settings::GroupPolicyException>
     {
         GroupPolicyExceptionMatcher(AppInstaller::Settings::TogglePolicy::Policy policy) : m_expectedPolicy(policy) {}
 

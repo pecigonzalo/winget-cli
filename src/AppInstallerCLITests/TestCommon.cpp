@@ -8,6 +8,8 @@
 #include <AppInstallerMsixInfo.h>
 #include <AppInstallerDownloader.h>
 
+using namespace AppInstaller;
+
 namespace TestCommon
 {
     namespace
@@ -48,25 +50,25 @@ namespace TestCommon
         }
     }
 
-    TempFile::TempFile(const std::string& baseName, const std::string& baseExt, bool deleteFileOnConstruction)
+    TempFile::TempFile(const std::string& baseName, const std::string& baseExt, std::optional<KeepTempFile> keepTempFile)
     {
         _filepath = GetTempFilePath(baseName, baseExt);
-        if (deleteFileOnConstruction)
+        if (!keepTempFile)
         {
             std::filesystem::remove(_filepath);
         }
     }
 
-    TempFile::TempFile(const std::filesystem::path& parent, const std::string& baseName, const std::string& baseExt, bool deleteFileOnConstruction)
+    TempFile::TempFile(const std::filesystem::path& parent, const std::string& baseName, const std::string& baseExt, std::optional<KeepTempFile> keepTempFile)
     {
         _filepath = GetFilePath(parent, baseName, baseExt);
-        if (deleteFileOnConstruction)
+        if (!keepTempFile)
         {
             std::filesystem::remove(_filepath);
         }
     }
 
-    TempFile::TempFile(const std::filesystem::path& filePath, bool deleteFileOnConstruction)
+    TempFile::TempFile(const std::filesystem::path& filePath, std::optional<KeepTempFile> keepTempFile)
     {
         if (filePath.is_relative())
         {
@@ -77,31 +79,40 @@ namespace TestCommon
         {
             _filepath = filePath;
         }
-        if (deleteFileOnConstruction)
+        if (!keepTempFile)
         {
             std::filesystem::remove(_filepath);
         }
     }
 
-    TempFile::~TempFile()
+    TempFile::~TempFile() try
     {
-        switch (s_TempFileDestructorBehavior)
+        if (m_destructionToken)
         {
-        case TempFileDestructionBehavior::Delete:
-            std::filesystem::remove_all(_filepath);
-            break;
-        case TempFileDestructionBehavior::Keep:
-            break;
-        case TempFileDestructionBehavior::ShellExecuteOnFailure:
-            s_TempFilesOnFile.emplace_back(std::move(_filepath));
-            break;
+            switch (s_TempFileDestructorBehavior)
+            {
+            case TempFileDestructionBehavior::Delete:
+                std::filesystem::remove_all(_filepath);
+                break;
+            case TempFileDestructionBehavior::Keep:
+                break;
+            case TempFileDestructionBehavior::ShellExecuteOnFailure:
+                s_TempFilesOnFile.emplace_back(std::move(_filepath));
+                break;
+            }
         }
     }
+    CATCH_LOG_RETURN()
 
     void TempFile::Rename(const std::filesystem::path& newFilePath)
     {
         std::filesystem::rename(GetPath(), newFilePath);
         _filepath = newFilePath;
+    }
+
+    void TempFile::Release()
+    {
+        m_destructionToken = false;
     }
 
     void TempFile::SetDestructorBehavior(TempFileDestructionBehavior behavior)
@@ -142,6 +153,16 @@ namespace TestCommon
         }
     }
 
+    TempFile TempDirectory::CreateTempFile(const std::string& baseName, const std::string& baseExt)
+    {
+        return { _filepath, baseName, baseExt };
+    }
+
+    TempFile TempDirectory::CreateTempFile(const std::string& name)
+    {
+        return { _filepath / name };
+    }
+
     std::filesystem::path TestDataFile::GetPath() const
     {
         std::filesystem::path result = s_TestDataFileBasePath;
@@ -162,6 +183,10 @@ namespace TestCommon
         }
     }
 
+    void TestProgress::SetProgressMessage(std::string_view)
+    {
+    }
+
     void TestProgress::BeginProgress()
     {
     }
@@ -170,7 +195,7 @@ namespace TestCommon
     {
     }
 
-    bool TestProgress::IsCancelled()
+    bool TestProgress::IsCancelledBy(AppInstaller::CancelReason)
     {
         return false;
     }
@@ -240,6 +265,22 @@ namespace TestCommon
     TestUserSettings::~TestUserSettings()
     {
         AppInstaller::Settings::SetUserSettingsOverride(nullptr);
+    }
+
+    std::unique_ptr<TestUserSettings> TestUserSettings::EnableExperimentalFeature(Settings::ExperimentalFeature::Feature feature, bool keepFileSettings)
+    {
+        std::unique_ptr<TestUserSettings> result = std::make_unique<TestUserSettings>(keepFileSettings);
+
+        // Due to the template usage, this needs to be updated for any features that want to use it.
+        // Currently no feature is used. Uncomment below when a feature needs to be used.
+        // switch (feature)
+        // {
+        // default:
+        //     THROW_HR(E_NOTIMPL);
+        // }
+        UNREFERENCED_PARAMETER(feature);
+
+        return result;
     }
 
     bool InstallCertFromSignedPackage(const std::filesystem::path& package)
@@ -325,5 +366,49 @@ namespace TestCommon
         Microsoft::WRL::ComPtr<IAppxPackageReader> packageReader;
         return  AppInstaller::Msix::GetPackageReader(stream.Get(), &packageReader)
             && SUCCEEDED(packageReader->GetManifest(manifestReader));
+    }
+
+    std::string RemoveConsoleFormat(const std::string& str)
+    {
+        // We are looking something that starts with "\x1b[0m"
+        if (!str.empty() && str[0] == '\x1b')
+        {
+            // Find first m
+            auto pos = str.find("m");
+            if (pos != std::string::npos)
+            {
+                return str.substr(pos + 1);
+            }
+        }
+
+        return str;
+    }
+
+    Json::Value ConvertToJson(const std::string& content)
+    {
+        auto contentClean = RemoveConsoleFormat(content);
+
+        Json::Value root;
+        Json::CharReaderBuilder builder;
+        const std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
+        std::string error;
+
+        if (!reader->parse(contentClean.c_str(), contentClean.c_str() + contentClean.size(), &root, &error))
+        {
+            throw error;
+        }
+
+        return root;
+    }
+
+    void SetTestPathOverrides()
+    {
+        // Force all tests to run against settings inside this container.
+        // This prevents test runs from trashing the users actual settings.
+        Runtime::TestHook_SetPathOverride(Runtime::PathName::LocalState, Runtime::GetPathTo(Runtime::PathName::LocalState) / "Tests");
+        Runtime::TestHook_SetPathOverride(Runtime::PathName::UserFileSettings, Runtime::GetPathTo(Runtime::PathName::UserFileSettings) / "Tests");
+        Runtime::TestHook_SetPathOverride(Runtime::PathName::StandardSettings, Runtime::GetPathTo(Runtime::PathName::StandardSettings) / "Tests");
+        Runtime::TestHook_SetPathOverride(Runtime::PathName::SecureSettingsForRead, Runtime::GetPathTo(Runtime::PathName::StandardSettings) / "WinGet_SecureSettings_Tests");
+        Runtime::TestHook_SetPathOverride(Runtime::PathName::SecureSettingsForWrite, Runtime::GetPathDetailsFor(Runtime::PathName::SecureSettingsForRead));
     }
 }

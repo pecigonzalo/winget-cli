@@ -9,7 +9,7 @@ ms.localizationpriority: medium
 # settings command (winget)
 
 The **settings** command of the [winget](index.md) tool allows you to customize your Windows Package Manager client experience.  You can change defaults and try out experimental features that are enabled in your client.
-The **settings** command will launch your default JSON editor. Windows by default will launch Notepad as an option. We recommend using a tool like [Visual Studio code](https://code.visualstudio.com/).  
+The **settings** command will launch your default JSON editor. Windows by default will launch Notepad as an option. We recommend using a tool like [Visual Studio code](https://code.visualstudio.com/).
 
 > You can easily install Visual Studio Code, by typing `winget install Microsoft.VisualStudioCode`
 
@@ -19,7 +19,7 @@ Launch your default JSON editing tool: `winget settings`
 
 ![Screenshot of the Windows Package Manager Settings.](images/settings.png)
 
-When you launch the settings for the first time, there will be no settings specified. At the top of the JSON we provide a [link](https://aka.ms/winget-settings) where you can discover the latest experimental features and settings.
+When you launch the settings for the first time, there will be no settings specified. At the top of the JSON we provide a link to [https://aka.ms/winget-settings](https://aka.ms/winget-settings) where you can discover the latest experimental features and settings.
 
 We have also defined a schema for the settings file.  This allows you to use TAB to discover settings and syntax if your JSON editor supports JSON schemas.
 
@@ -35,7 +35,7 @@ The `source` settings involve configuration to the WinGet source.
     "source": {
         "autoUpdateIntervalInMinutes": 3
     },
-``` 
+```
 
 #### autoUpdateIntervalInMinutes
 
@@ -58,7 +58,7 @@ The `visual` settings involve visual elements that are displayed by WinGet
 
 #### progressBar
 
-Color of the progress bar that WinGet displays when not specified by arguments. 
+Color of the progress bar that WinGet displays when not specified by arguments.
 
 - accent (default)
 - retro
@@ -88,7 +88,7 @@ The `scope` behavior affects the choice between installing a package for the cur
 
 #### Locale
 
-The `locale` behavior affects the choice of installer based on installer locale. The matching parameter is `--locale`, and uses bcp47 language tag.
+The `locale` behavior affects the choice of installer based on installer locale. The matching parameter is `--locale`, and uses a BCP 47 language tag. Both regional tags such as `en-US` and language-only tags such as `en` are supported. A language-only preference can match an available regional installer locale for the user's language.
 
 ```json
     "installBehavior": {
@@ -98,11 +98,33 @@ The `locale` behavior affects the choice of installer based on installer locale.
     },
 ```
 
+### Output
+
+The `output` settings affect winget interface output behavior.
+
+#### locale
+
+The `locale` setting selects winget interface language using a supported locale value. If not specified, winget uses the default Windows resource resolution behavior for the current process.
+
+Supported values: `en-US`, `de-DE`, `es-ES`, `fr-FR`, `it-IT`, `ja-JP`, `ko-KR`, `pt-BR`, `ru-RU`, `zh-CN`, `zh-TW`.
+
+> [!NOTE]
+> This setting only affects winget interface strings and does not affect package metadata localization, installer locale selection, or package-wide language settings.
+
+> [!NOTE]
+> The `--output-locale` argument overrides this setting for a single invocation and accepts the same supported values.
+
+```json
+    "output": {
+        "locale": "en-US"
+    },
+```
+
 ### Telemetry
 
 The `telemetry` settings control whether winget writes ETW events that may be sent to Microsoft on a default installation of Windows.
 
-See [details on telemetry](https://github.com/microsoft/winget-cli/blob/master/README.md#datatelemetry), and our [primary privacy statement](https://github.com/microsoft/winget-cli/blob/master/privacy.md).
+See [details on telemetry](https://github.com/microsoft/winget-cli/blob/master/README.md#datatelemetry), and our [primary privacy statement](https://github.com/microsoft/winget-cli/blob/master/PRIVACY.md).
 
 #### disable
 
@@ -133,4 +155,3 @@ The `downloader` setting controls which code is used when downloading packages. 
 ## Enabling Experimental features
 
 To discover which experimental features are available, go to [https://aka.ms/winget-settings](https://aka.ms/winget-settings) where you can see the experimental features available to you.
-

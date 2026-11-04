@@ -12,7 +12,7 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_4
     {
     }
 
-    Schema::Version Interface::GetVersion() const
+    SQLite::Version Interface::GetVersion() const
     {
         return { 1, 4 };
     }
@@ -134,6 +134,17 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_4
         return DependenciesTable::GetDependentsById(connection, packageId);
     }
 
+    void Interface::DropTables(SQLite::Connection& connection)
+    {
+        SQLite::Savepoint savepoint = SQLite::Savepoint::Create(connection, "drop_tables_v1_4");
+
+        V1_2::Interface::DropTables(connection);
+
+        DependenciesTable::Drop(connection);
+
+        savepoint.Commit();
+    }
+
     bool Interface::ValidateDependenciesWithMinVersions(const SQLite::Connection& connection, bool log) const
     {
         try
@@ -150,7 +161,7 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_4
                 {
                     auto versionKeys = GetVersionKeysById(connection, dependency.first);
                     THROW_HR_IF(E_UNEXPECTED, versionKeys.empty());
-                    checkedVersions.emplace(dependency.first, versionKeys[0].GetVersion());
+                    checkedVersions.emplace(dependency.first, versionKeys[0].VersionAndChannel.GetVersion());
                 }
 
                 // If the latest version is less than min version required, fail the validation.

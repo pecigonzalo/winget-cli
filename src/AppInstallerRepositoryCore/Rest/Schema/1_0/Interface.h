@@ -2,15 +2,14 @@
 // Licensed under the MIT License.
 #pragma once
 #include "Rest/Schema/IRestClient.h"
-#include "Rest/Schema/HttpClientHelper.h"
-#include <cpprest/json.h>
+#include <winget/HttpClientHelper.h>
 
 namespace AppInstaller::Repository::Rest::Schema::V1_0
 {
     // Interface to this schema version exposed through IRestClient.
     struct Interface : public IRestClient
     {
-        Interface(const std::string& restApi, const HttpClientHelper& httpClientHelper = {});
+        Interface(const std::string& restApi, const Http::HttpClientHelper& helper);
 
         Interface(const Interface&) = delete;
         Interface& operator=(const Interface&) = delete;
@@ -25,24 +24,31 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0
         std::vector<Manifest::Manifest> GetManifests(const std::string& packageId, const std::map<std::string_view, std::string>& params = {}) const override;
 
     protected:
-        bool MeetsOptimizedSearchCriteria(const SearchRequest& request) const;
+        bool MeetsOptimizedSearchCriteria(const SearchRequest& request, bool allowSubstringMatch = false) const;
         IRestClient::SearchResult OptimizedSearch(const SearchRequest& request) const;
         IRestClient::SearchResult SearchInternal(const SearchRequest& request) const;
 
         // Check query params against source information and update if necessary.
         virtual std::map<std::string_view, std::string> GetValidatedQueryParams(const std::map<std::string_view, std::string>& params) const;
 
-        // Check search request against source information and get json search body.
-        virtual web::json::value GetValidatedSearchBody(const SearchRequest& searchRequest) const;
+        // Check search request against source information and update if necessary.
+        virtual SearchRequest GetValidatedSearchRequest(const SearchRequest& searchRequest) const;
 
         virtual SearchResult GetSearchResult(const web::json::value& searchResponseObject) const;
         virtual std::vector<Manifest::Manifest> GetParsedManifests(const web::json::value& manifestsResponseObject) const;
 
-        std::unordered_map<utility::string_t, utility::string_t> m_requiredRestApiHeaders;
+        // Gets auth headers if source requires authentication for access.
+        virtual Http::HttpClientHelper::HttpRequestHeaders GetAuthHeaders() const;
+
+        Http::HttpClientHelper::HttpRequestHeaders m_requiredRestApiHeaders;
 
     private:
+        // Returns whether manifest retrieval was deferred for a supported criterion.
+        bool FilterSearchResult(const SearchRequest& request, SearchResult& result, bool allowManifestRetrieval) const;
+        std::vector<Manifest::Manifest> GetManifestsInternal(const std::string& packageId, const std::map<std::string_view, std::string>& validatedParams) const;
+
         std::string m_restApiUri;
         utility::string_t m_searchEndpoint;
-        HttpClientHelper m_httpClientHelper;
+        Http::HttpClientHelper m_httpClientHelper;
     };
 }

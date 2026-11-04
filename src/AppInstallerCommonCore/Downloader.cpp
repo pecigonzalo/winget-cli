@@ -1,30 +1,135 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
-
 #include "pch.h"
+#include "Public/winget/Hash.h"
+#include <wininet.h>
 #include "Public/AppInstallerErrors.h"
 #include "Public/AppInstallerRuntime.h"
 #include "Public/AppInstallerDownloader.h"
-#include "Public/AppInstallerSHA256.h"
 #include "Public/AppInstallerStrings.h"
 #include "Public/AppInstallerLogging.h"
 #include "Public/AppInstallerTelemetry.h"
 #include "Public/winget/UserSettings.h"
+#include "Public/winget/NetworkSettings.h"
 #include "Public/winget/Filesystem.h"
 #include "DODownloader.h"
 #include "HttpStream/HttpRandomAccessStream.h"
+#include "Public/winget/ThreadGlobals.h"
 
 using namespace AppInstaller::Runtime;
 using namespace AppInstaller::Settings;
 using namespace AppInstaller::Filesystem;
+using namespace AppInstaller::Utility::HttpStream;
+using namespace winrt::Windows::Web::Http;
+using namespace winrt::Windows::Web::Http::Headers;
+using namespace winrt::Windows::Web::Http::Filters;
 
 namespace AppInstaller::Utility
 {
-    std::optional<std::vector<BYTE>> WinINetDownloadToStream(
+    namespace
+    {
+        std::wstring GetHttpQueryString(const wil::unique_hinternet& urlFile, DWORD queryProperty)
+        {
+            std::wstring result = {};
+            DWORD length = 0;
+            if (!HttpQueryInfoW(urlFile.get(),
+                queryProperty,
+                &result[0],
+                &length,
+                nullptr))
+            {
+                auto lastError = GetLastError();
+                if (lastError == ERROR_INSUFFICIENT_BUFFER)
+                {
+                    // lpdwBufferLength contains the size, in bytes, of a buffer large enough to receive the requested information
+                    // without the nul char. not the exact buffer size.
+                    auto size = static_cast<size_t>(length) / sizeof(wchar_t);
+                    result.resize(size + 1);
+                    if (HttpQueryInfoW(urlFile.get(),
+                        queryProperty,
+                        &result[0],
+                        &length,
+                        nullptr))
+                    {
+                        // because the buffer can be bigger remove possible null chars
+                        result.erase(result.find(L'\0'));
+                    }
+                    else
+                    {
+                        AICLI_LOG(Core, Error, << "Error retrieving header value [" << queryProperty << "]: " << GetLastError());
+                        result.clear();
+                    }
+                }
+                else
+                {
+                    AICLI_LOG(Core, Error, << "Error retrieving header [" << queryProperty << "]: " << GetLastError());
+                }
+            }
+
+            return result;
+        }
+
+        // Gets the retry after value in terms of a delay in seconds
+        std::chrono::seconds GetRetryAfter(const HttpDateOrDeltaHeaderValue& retryAfter)
+        {
+            if (retryAfter)
+            {
+                auto delta = retryAfter.Delta();
+                if (delta)
+                {
+                    return  std::chrono::duration_cast<std::chrono::seconds>(delta.GetTimeSpan());
+                }
+
+                auto dateTimeRef = retryAfter.Date();
+                if (dateTimeRef)
+                {
+                    auto dateTime = dateTimeRef.GetDateTime();
+                    auto now = winrt::clock::now();
+
+                    if (dateTime > now)
+                    {
+                        return std::chrono::duration_cast<std::chrono::seconds>(dateTime - now);
+                    }
+                }
+            }
+
+            return 0s;
+        }
+
+        std::chrono::seconds GetRetryAfter(const wil::unique_hinternet& urlFile)
+        {
+            std::wstring retryAfter = GetHttpQueryString(urlFile, HTTP_QUERY_RETRY_AFTER);
+            return retryAfter.empty() ? 0s : AppInstaller::Utility::GetRetryAfter(retryAfter);
+        }
+    }
+
+#ifndef AICLI_DISABLE_TEST_HOOKS
+    namespace TestHooks
+    {
+        static std::function<DownloadResult(
+            const std::string& url,
+            const std::filesystem::path& dest,
+            DownloadType type,
+            IProgressCallback& progress,
+            std::optional<DownloadInfo> info)>* s_Download_Function_Override = nullptr;
+
+        void SetDownloadResult_Function_Override(std::function<DownloadResult(
+            const std::string& url,
+            const std::filesystem::path& dest,
+            DownloadType type,
+            IProgressCallback& progress,
+            std::optional<DownloadInfo> info)>* value)
+        {
+            s_Download_Function_Override = value;
+        }
+    }
+#endif
+
+    DownloadResult WinINetDownloadToStream(
         const std::string& url,
         std::ostream& dest,
         IProgressCallback& progress,
-        bool computeHash)
+        std::optional<DownloadInfo> info)
     {
         // For AICLI_LOG usages with string literals.
         #pragma warning(push)
@@ -32,19 +137,48 @@ namespace AppInstaller::Utility
 
         AICLI_LOG(Core, Info, << "WinINet downloading from url: " << url);
 
-        wil::unique_hinternet session(InternetOpenA(
-            Runtime::GetDefaultUserAgent().get().c_str(),
-            INTERNET_OPEN_TYPE_PRECONFIG,
-            NULL,
-            NULL,
-            0));
+        auto agentWide = Utility::ConvertToUTF16(Runtime::GetDefaultUserAgent().get());
+        wil::unique_hinternet session;
+
+        const auto& proxyUri = Network().GetProxyUri();
+        if (proxyUri)
+        {
+            AICLI_LOG(Core, Info, << "Using proxy " << proxyUri.value());
+            session.reset(InternetOpen(
+                agentWide.c_str(),
+                INTERNET_OPEN_TYPE_PROXY,
+                Utility::ConvertToUTF16(proxyUri.value()).c_str(),
+                NULL,
+                0));
+        }
+        else
+        {
+            session.reset(InternetOpen(
+                agentWide.c_str(),
+                INTERNET_OPEN_TYPE_PRECONFIG,
+                NULL,
+                NULL,
+                0));
+        }
+
         THROW_LAST_ERROR_IF_NULL_MSG(session, "InternetOpen() failed.");
 
-        wil::unique_hinternet urlFile(InternetOpenUrlA(
+        std::string customHeaders;
+        if (info && info->RequestHeaders.size() > 0)
+        {
+            for (const auto& header : info->RequestHeaders)
+            {
+                customHeaders += header.Name + ": " + header.Value + "\r\n";
+            }
+        }
+        std::wstring customHeadersWide = Utility::ConvertToUTF16(customHeaders);
+
+        auto urlWide = Utility::ConvertToUTF16(url);
+        wil::unique_hinternet urlFile(InternetOpenUrl(
             session.get(),
-            url.c_str(),
-            NULL,
-            0,
+            urlWide.c_str(),
+            customHeadersWide.empty() ? NULL : customHeadersWide.c_str(),
+            customHeadersWide.empty() ? 0 : (DWORD)(customHeadersWide.size()),
             INTERNET_FLAG_IGNORE_REDIRECT_TO_HTTPS, // This allows http->https redirection
             0));
         THROW_LAST_ERROR_IF_NULL_MSG(urlFile, "InternetOpenUrl() failed.");
@@ -53,14 +187,25 @@ namespace AppInstaller::Utility
         DWORD requestStatus = 0;
         DWORD cbRequestStatus = sizeof(requestStatus);
 
-        THROW_LAST_ERROR_IF_MSG(!HttpQueryInfoA(urlFile.get(),
+        THROW_LAST_ERROR_IF_MSG(!HttpQueryInfoW(urlFile.get(),
             HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER,
             &requestStatus,
             &cbRequestStatus,
             nullptr), "Query download request status failed.");
 
-        if (requestStatus != HTTP_STATUS_OK)
+        constexpr DWORD TooManyRequest = 429;
+
+        switch (requestStatus)
         {
+        case HTTP_STATUS_OK:
+            // All good
+            break;
+        case TooManyRequest:
+        case HTTP_STATUS_SERVICE_UNAVAIL:
+        {
+            THROW_EXCEPTION(ServiceUnavailableException(GetRetryAfter(urlFile)));
+        }
+        default:
             AICLI_LOG(Core, Error, << "Download request failed. Returned status: " << requestStatus);
             THROW_HR_MSG(MAKE_HRESULT(SEVERITY_ERROR, FACILITY_HTTP, requestStatus), "Download request status is not success.");
         }
@@ -71,13 +216,16 @@ namespace AppInstaller::Utility
         LONGLONG contentLength = 0;
         DWORD cbContentLength = sizeof(contentLength);
 
-        HttpQueryInfoA(
+        HttpQueryInfoW(
             urlFile.get(),
             HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER64,
             &contentLength,
             &cbContentLength,
             nullptr);
         AICLI_LOG(Core, Verbose, << "Download size: " << contentLength);
+
+        std::string contentType = Utility::ConvertToUTF8(GetHttpQueryString(urlFile, HTTP_QUERY_CONTENT_TYPE));
+        AICLI_LOG(Core, Verbose, << "Content Type: " << contentType);
 
         // Setup hash engine
         SHA256 hashEngine;
@@ -91,7 +239,7 @@ namespace AppInstaller::Utility
 
         do
         {
-            if (progress.IsCancelled())
+            if (progress.IsCancelledBy(CancelReason::Any))
             {
                 AICLI_LOG(Core, Info, << "Download cancelled.");
                 return {};
@@ -101,10 +249,7 @@ namespace AppInstaller::Utility
 
             THROW_LAST_ERROR_IF_MSG(!readSuccess, "InternetReadFile() failed.");
 
-            if (computeHash)
-            {
-                hashEngine.Add(buffer.get(), bytesRead);
-            }
+            hashEngine.Add(buffer.get(), bytesRead);
 
             dest.write((char*)buffer.get(), bytesRead);
 
@@ -125,12 +270,11 @@ namespace AppInstaller::Utility
             THROW_HR_IF(APPINSTALLER_CLI_ERROR_DOWNLOAD_SIZE_MISMATCH, bytesDownloaded != contentLength);
         }
 
-        std::vector<BYTE> result;
-        if (computeHash)
-        {
-            result = hashEngine.Get();
-            AICLI_LOG(Core, Info, << "Download hash: " << SHA256::ConvertToString(result));
-        }
+        DownloadResult result;
+        result.SizeInBytes = static_cast<uint64_t>(bytesDownloaded);
+        result.ContentType = std::move(contentType);
+        result.Sha256Hash = hashEngine.Get();
+        AICLI_LOG(Core, Info, << "Download hash: " << SHA256::ConvertToString(result.Sha256Hash));
 
         AICLI_LOG(Core, Info, << "Download completed.");
 
@@ -139,26 +283,73 @@ namespace AppInstaller::Utility
         return result;
     }
 
-    std::optional<std::vector<BYTE>> DownloadToStream(
+    std::map<std::string, std::string> GetHeaders(std::string_view url)
+    {
+        // TODO: Use proxy info. HttpClient does not support using a custom proxy, only using the system-wide one.
+        AICLI_LOG(Core, Verbose, << "Retrieving headers from url: " << url);
+
+        HttpBaseProtocolFilter filter;
+        filter.CacheControl().ReadBehavior(HttpCacheReadBehavior::MostRecent);
+
+        HttpClient client(filter);
+        client.DefaultRequestHeaders().Connection().Clear();
+        client.DefaultRequestHeaders().Append(L"Connection", L"close");
+        client.DefaultRequestHeaders().UserAgent().ParseAdd(Utility::ConvertToUTF16(Runtime::GetDefaultUserAgent().get()));
+
+        winrt::Windows::Foundation::Uri uri{ Utility::ConvertToUTF16(url) };
+        HttpRequestMessage request(HttpMethod::Head(), uri);
+
+        HttpResponseMessage response = client.SendRequestAsync(request, HttpCompletionOption::ResponseHeadersRead).get();
+
+        switch (response.StatusCode())
+        {
+        case HttpStatusCode::Ok:
+            // All good
+            break;
+        case HttpStatusCode::TooManyRequests:
+        case HttpStatusCode::ServiceUnavailable:
+        {
+            THROW_EXCEPTION(ServiceUnavailableException(GetRetryAfter(response.Headers().RetryAfter())));
+        }
+        default:
+            THROW_HR(MAKE_HRESULT(SEVERITY_ERROR, FACILITY_HTTP, response.StatusCode()));
+        }
+
+        std::map<std::string, std::string> result;
+
+        for (const auto& header : response.Headers())
+        {
+            result.emplace(Utility::FoldCase(static_cast<std::string_view>(Utility::ConvertToUTF8(header.Key()))), Utility::ConvertToUTF8(header.Value()));
+        }
+
+        return result;
+    }
+
+    DownloadResult DownloadToStream(
         const std::string& url,
         std::ostream& dest,
         DownloadType,
         IProgressCallback& progress,
-        bool computeHash,
-        std::optional<DownloadInfo>)
+        std::optional<DownloadInfo> info)
     {
         THROW_HR_IF(E_INVALIDARG, url.empty());
-        return WinINetDownloadToStream(url, dest, progress, computeHash);
+        return WinINetDownloadToStream(url, dest, progress, info);
     }
 
-    std::optional<std::vector<BYTE>> Download(
+    DownloadResult Download(
         const std::string& url,
         const std::filesystem::path& dest,
         DownloadType type,
         IProgressCallback& progress,
-        bool computeHash,
         std::optional<DownloadInfo> info)
     {
+#ifndef AICLI_DISABLE_TEST_HOOKS
+        if (TestHooks::s_Download_Function_Override)
+        {
+            return (*TestHooks::s_Download_Function_Override)(url, dest, type, progress, info);
+        }
+#endif
+
         THROW_HR_IF(E_INVALIDARG, url.empty());
         THROW_HR_IF(E_INVALIDARG, dest.empty());
 
@@ -172,15 +363,11 @@ namespace AppInstaller::Utility
         //  - WinGetUtil :: Intentionally not using DO at this time
         if (type == DownloadType::Installer)
         {
-            // Determine whether to try DO first or not, as this is the only choice currently supported.
-            InstallerDownloader setting = User().Get<Setting::NetworkDownloader>();
-
-            if (setting == InstallerDownloader::Default ||
-                setting == InstallerDownloader::DeliveryOptimization)
+            if (Network().GetInstallerDownloader() == InstallerDownloader::DeliveryOptimization)
             {
                 try
                 {
-                    auto result = DODownload(url, dest, progress, computeHash, info);
+                    auto result = DODownload(url, dest, progress, info);
                     // Since we cannot pre-apply to the file with DO, post-apply the MotW to the file.
                     // Only do so if the file exists, because cancellation will not throw here.
                     if (std::filesystem::exists(dest))
@@ -222,7 +409,7 @@ namespace AppInstaller::Utility
         // Use std::ofstream::app to append to previous empty file so that it will not
         // create a new file and clear motw.
         std::ofstream outfile(dest, std::ofstream::binary | std::ofstream::app);
-        return WinINetDownloadToStream(url, outfile, progress, computeHash);
+        return WinINetDownloadToStream(url, outfile, progress, info);
     }
 
     using namespace std::string_view_literals;
@@ -295,15 +482,19 @@ namespace AppInstaller::Utility
         THROW_IF_FAILED(zoneIdentifier.As(&persistFile));
 
         auto hr = persistFile->Load(filePath.c_str(), STGM_READ);
-        if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND))
+        if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) ||
+            hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND))
         {
-            // IPersistFile::Load returns same error for "file not found" and "motw not found".
+            // IPersistFile::Load can return ERROR_FILE_NOT_FOUND or ERROR_PATH_NOT_FOUND for
+            // both "file not found" and "motw not found" depending on the Windows build.
             // Check if the file exists to be sure we are on the "motw not found" case.
             THROW_HR_IF(HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND), !std::filesystem::exists(filePath));
 
             AICLI_LOG(Core, Info, << "File does not contain motw. Skipped removing motw");
             return;
         }
+
+        THROW_IF_FAILED(hr);
 
         THROW_IF_FAILED(zoneIdentifier->Remove());
         THROW_IF_FAILED(persistFile->Save(NULL, TRUE));
@@ -330,8 +521,17 @@ namespace AppInstaller::Utility
             RETURN_IF_FAILED(attachmentExecute->SetLocalPath(filePath.c_str()));
             RETURN_IF_FAILED(attachmentExecute->SetSource(Utility::ConvertToUTF16(source).c_str()));
 
-            // IAttachmentExecute::Save() expects the local file to be clean(i.e. it won't clear existing motw if it thinks the source url is trusted)
-            RemoveMotwIfApplicable(filePath);
+            // IAttachmentExecute::Save() expects the local file to be clean (i.e. it won't clear existing motw if it thinks the source url is trusted).
+            // If removal fails for any reason, log a warning and proceed — a removal failure should not abort the security check.
+            try
+            {
+                RemoveMotwIfApplicable(filePath);
+            }
+            catch (...)
+            {
+                HRESULT hrRemoveMotw = wil::ResultFromCaughtException();
+                AICLI_LOG(Core, Warning, << "RemoveMotwIfApplicable failed before IAttachmentExecute::Save(). Result: " << hrRemoveMotw << ". Proceeding with Save()");
+            }
 
             aesSaveResult = attachmentExecute->Save();
 
@@ -348,23 +548,35 @@ namespace AppInstaller::Utility
 
         HRESULT hr = S_OK;
 
-        std::thread aesThread([&]()
+        ThreadLocalStorage::ThreadGlobals* globals = ThreadLocalStorage::ThreadGlobals::GetForCurrentThread();
+        std::thread aesThread([&, globals]()
             {
-                hr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-                if (FAILED(hr))
+                auto globalsCleanup = globals ? globals->SetForCurrentThread() : nullptr;
+                try
                 {
-                    return;
-                }
+                    hr = LOG_IF_FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED));
+                    if (FAILED(hr))
+                    {
+                        return;
+                    }
 
-                hr = updateMotw();
-                CoUninitialize();
+                    hr = updateMotw();
+                    CoUninitialize();
+                }
+                catch (...)
+                {
+                    hr = wil::ResultFromCaughtException();
+                    AICLI_LOG(Core, Error, << "Exception in IAttachmentExecute thread. Result: " << hr);
+                }
             });
 
         aesThread.join();
 
         AICLI_LOG(Core, Info, << "Finished applying motw using IAttachmentExecute. Result: " << hr << " IAttachmentExecute::Save() result: " << aesSaveResult);
 
-        return aesSaveResult;
+        // Return the thread's hr when aesSaveResult was never updated (e.g. CoInitializeEx failure or exception
+        // before IAttachmentExecute::Save() was called), so the caller sees the real failure instead of S_OK.
+        return (FAILED(hr) && aesSaveResult == S_OK) ? hr : aesSaveResult;
     }
 
     Microsoft::WRL::ComPtr<IStream> GetReadOnlyStreamFromURI(std::string_view uriStr)
@@ -374,12 +586,27 @@ namespace AppInstaller::Utility
         {
             // Get an IStream from the input uri and try to create package or bundler reader.
             winrt::Windows::Foundation::Uri uri(Utility::ConvertToUTF16(uriStr));
-            auto randomAccessStream = HttpStream::HttpRandomAccessStream::CreateAsync(uri).get();
 
-            ::IUnknown* rasAsIUnknown = (::IUnknown*)winrt::get_abi(randomAccessStream);
-            THROW_IF_FAILED(CreateStreamOverRandomAccessStream(
-                rasAsIUnknown,
-                IID_PPV_ARGS(inputStream.ReleaseAndGetAddressOf())));
+            winrt::com_ptr<HttpRandomAccessStream> httpRandomAccessStream = winrt::make_self<HttpRandomAccessStream>();
+
+            try
+            {
+                auto randomAccessStream = httpRandomAccessStream->InitializeAsync(uri).get();
+
+                ::IUnknown* rasAsIUnknown = (::IUnknown*)winrt::get_abi(randomAccessStream);
+                THROW_IF_FAILED(CreateStreamOverRandomAccessStream(
+                    rasAsIUnknown,
+                    IID_PPV_ARGS(inputStream.ReleaseAndGetAddressOf())));
+            }
+            catch (const winrt::hresult_error& hre)
+            {
+                if (hre.code() == APPINSTALLER_CLI_ERROR_SERVICE_UNAVAILABLE)
+                {
+                    THROW_EXCEPTION(AppInstaller::Utility::ServiceUnavailableException(httpRandomAccessStream->RetryAfter()));
+                }
+
+                throw;
+            }
         }
         else
         {
@@ -389,5 +616,75 @@ namespace AppInstaller::Utility
         }
 
         return inputStream;
+    }
+
+    std::chrono::seconds GetRetryAfter(const std::wstring& retryAfter)
+    {
+        try
+        {
+            winrt::hstring hstringValue{ retryAfter };
+            HttpDateOrDeltaHeaderValue headerValue = nullptr;
+            HttpDateOrDeltaHeaderValue::TryParse(hstringValue, headerValue);
+            return GetRetryAfter(headerValue);
+        }
+        catch (...)
+        {
+            AICLI_LOG(Core, Error, << "Retry-After value not supported: " << Utility::ConvertToUTF8(retryAfter));
+        }
+
+        return 0s;
+    }
+
+    std::chrono::seconds GetRetryAfter(const HttpResponseMessage& response)
+    {
+        return GetRetryAfter(response.Headers().RetryAfter());
+    }
+
+    CacheControlPolicy::CacheControlPolicy(std::wstring_view header)
+    {
+        static constexpr std::wstring_view s_MaxAge = L"max-age"sv;
+
+        if (header.empty())
+        {
+            return;
+        }
+
+        std::vector<std::wstring_view> directives = Utility::Split(header, L',', true);
+
+        for (std::wstring_view directive : directives)
+        {
+            if (!directive.empty())
+            {
+                // Even if we don't understand the directive, the value was not empty
+                Present = true;
+            }
+
+            std::wstring lowerDirective = ToLower(directive);
+
+            if (lowerDirective == L"public"sv)
+            {
+                Public = true;
+            }
+            else if (lowerDirective == L"no-cache"sv)
+            {
+                NoCache = true;
+            }
+            else if (lowerDirective == L"no-store"sv)
+            {
+                NoStore = true;
+            }
+            else if (StartsWith(lowerDirective, s_MaxAge))
+            {
+                std::vector<std::wstring_view> parts = Utility::SplitView(lowerDirective, L'=', true);
+                if (parts.size() == 2)
+                {
+                    try
+                    {
+                        MaxAge = std::min(std::stoull(std::wstring{ parts[1] }), MaximumMaxAge);
+                    }
+                    CATCH_LOG();
+                }
+            }
+        }
     }
 }

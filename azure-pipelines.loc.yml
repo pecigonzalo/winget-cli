@@ -1,7 +1,7 @@
 #
 # Localization
 # This pipeline uploads English strings files to the localization service, downloads any translated
-# files which are available, and checks them in to git. This pipeline relies on Microsoft-internal
+# files which are available, and checks them into git. This pipeline relies on Microsoft-internal
 # resources to run.
 #
 
@@ -15,20 +15,20 @@ name: $(BuildDefinitionName)_$(date:yyMM).$(date:dd)$(rev:rrr)
 jobs:
 - job: Localize
   pool:
-    vmImage: windows-2019
+    vmImage: windows-latest
   variables:
     skipComponentGovernanceDetection: true
     tdbuildTeamId: 8343
-    tdbuildAuthId: 2796a411-f030-46c1-ae3e-ab56f60ea523
-    tdbuildAuthKey: $(LocServiceKey)
+    serviceTreeId: 4e6e6c45-6ddc-46ff-8661-909d2ef6171b
   steps:
     # Upload client resources
-  - task: MicrosoftTDBuild.tdbuild-task.tdbuild-task.TouchdownBuildTask@1
+  - task: MicrosoftTDBuild.tdbuild-task.tdbuild-task.TouchdownBuildTask@5
     displayName: Send resources to Touchdown Build
     inputs:
       teamId: $(tdbuildTeamId)
-      authId: $(tdbuildAuthId)
-      authKey: $(tdbuildAuthKey)
+      serviceTreeId: $(serviceTreeId)
+      authType: FederatedIdentity
+      FederatedIdentityServiceConnection: AppInstallerTDBuild
       isPreview: false
       relativePathRoot: src\AppInstallerCLIPackage\Shared\Strings\en-us
       resourceFilePath: '*.resw'
@@ -36,12 +36,13 @@ jobs:
 
     # Upload Group Policy ADML
     # Do it as a separate step as we need the result in a different location
-  - task: MicrosoftTDBuild.tdbuild-task.tdbuild-task.TouchdownBuildTask@1
+  - task: MicrosoftTDBuild.tdbuild-task.tdbuild-task.TouchdownBuildTask@5
     displayName: Send ADML to Touchdown Build
     inputs:
       teamId: $(tdbuildTeamId)
-      authId: $(tdbuildAuthId)
-      authKey: $(tdbuildAuthKey)
+      serviceTreeId: $(serviceTreeId)
+      authType: FederatedIdentity
+      FederatedIdentityServiceConnection: AppInstallerTDBuild
       isPreview: false
       relativePathRoot: doc\admx\en-US
       resourceFilePath: '*.adml'

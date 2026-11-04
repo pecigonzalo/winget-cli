@@ -30,6 +30,8 @@ const std::string s_PackagesJson_Packages = "Packages";
 const std::string s_PackagesJson_Package_PackageIdentifier = "PackageIdentifier";
 const std::string s_PackagesJson_Package_Version = "Version";
 const std::string s_PackagesJson_Package_Channel = "Channel";
+const std::string s_PackagesJson_Package_InitialOverrideArguments = "InitialOverrideArguments";
+const std::string s_PackagesJson_Package_InitialCustomSwitches = "InitialCustomSwitches";
 
 namespace
 {
@@ -50,20 +52,10 @@ namespace
 
         REQUIRE(node.isMember(propertyName));
         REQUIRE(node[propertyName].isString());
-        REQUIRE(node[propertyName].asString() == expectedValue);
-    }
-
-    void ValidateJsonStringPropertyRegex(const Json::Value& node, const std::string& propertyName, std::string_view regex, bool allowMissing = false)
-    {
-        if (allowMissing && !node.isMember(propertyName))
+        if (!expectedValue.empty())
         {
-            return;
+            REQUIRE(node[propertyName].asString() == expectedValue);
         }
-
-        REQUIRE(node.isMember(propertyName));
-        REQUIRE(node[propertyName].isString());
-        const auto& value = AppInstaller::Utility::ConvertToUTF16(node[propertyName].asString());
-        REQUIRE(AppInstaller::Regex::Expression(regex).IsMatch(value));
     }
 
     const Json::Value& GetAndValidateJsonProperty(const Json::Value& node, const std::string& propertyName, Json::ValueType valueType)
@@ -77,13 +69,8 @@ namespace
     {
         ValidateJsonStringProperty(root, s_PackagesJson_Schema, s_PackagesJson_SchemaUri_v2_0);
         ValidateJsonStringProperty(root, s_PackagesJson_WinGetVersion, collection.ClientVersion);
-
-        // valijson does not validate the date-time format, which should follow RFC3339 according to the JSON schema.
-        // Ensure we write something at least reasonable.
-        // The expected format is <Date>T<Time><TimeZone>
-        // with Date="YYYY-MM-DD"; Time="HH:mm:ss.xxx"; TimeZone="Z" or "+HH:mm" or "-HH:mm" (offset from UTC)
-        std::string_view dateTimeRegex = "[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}.[0-9]+(Z|[+-][0-9]{2}:[0-9]{2})"sv;
-        ValidateJsonStringPropertyRegex(root, s_PackagesJson_CreationDate, dateTimeRegex);
+        // valijson now validates the date-time format, just check the string property exists.
+        ValidateJsonStringProperty(root, s_PackagesJson_CreationDate, "");
 
         const auto& jsonSources = GetAndValidateJsonProperty(root, s_PackagesJson_Sources, Json::ValueType::arrayValue);
         REQUIRE(jsonSources.size() == collection.Sources.size());
@@ -111,6 +98,8 @@ namespace
                 ValidateJsonStringProperty(*jsonPackageItr, s_PackagesJson_Package_PackageIdentifier, packageItr->Id);
                 ValidateJsonStringProperty(*jsonPackageItr, s_PackagesJson_Package_Version, packageItr->VersionAndChannel.GetVersion().ToString(), true);
                 ValidateJsonStringProperty(*jsonPackageItr, s_PackagesJson_Package_Channel, packageItr->VersionAndChannel.GetChannel().ToString(), true);
+                ValidateJsonStringProperty(*jsonPackageItr, s_PackagesJson_Package_InitialOverrideArguments, packageItr->InitialOverrideArgs, true);
+                ValidateJsonStringProperty(*jsonPackageItr, s_PackagesJson_Package_InitialCustomSwitches, packageItr->InitialCustomSwitches, true);
             }
         }
     }
@@ -136,6 +125,8 @@ namespace
             {
                 REQUIRE(firstPackageItr->Id == secondPackageItr->Id);
                 REQUIRE(firstPackageItr->VersionAndChannel.ToString() == secondPackageItr->VersionAndChannel.ToString());
+                REQUIRE(firstPackageItr->InitialOverrideArgs == secondPackageItr->InitialOverrideArgs);
+                REQUIRE(firstPackageItr->InitialCustomSwitches == secondPackageItr->InitialCustomSwitches);
             }
         }
     }
@@ -186,12 +177,45 @@ TEST_CASE("PackageCollection_Write_MultipleSources", "[PackageCollection]")
     ValidateJsonWithCollection(PackagesJson::CreateJson(pc), pc);
 }
 
+TEST_CASE("PackageCollection_Write_OverrideAndCustomSwitches", "[PackageCollection]")
+{
+    PackageCollection::Source source;
+    source.Details.Name = "TestSource";
+    source.Details.Arg = "https://aka.ms/winget";
+    source.Details.Type = "Microsoft.PreIndexed.Package";
+    source.Details.Identifier = "TestSourceId";
+
+    PackageCollection::Package packageWithOverride{ LocIndString{ "test.withOverride"sv }, Version{ "1.0" }, Channel{ "" } };
+    packageWithOverride.InitialOverrideArgs = "/silent /norestart";
+    source.Packages.emplace_back(std::move(packageWithOverride));
+
+    PackageCollection::Package packageWithCustom{ LocIndString{ "test.withCustom"sv }, Version{ "2.0" }, Channel{ "" } };
+    packageWithCustom.InitialCustomSwitches = "--no-telemetry";
+    source.Packages.emplace_back(std::move(packageWithCustom));
+
+    PackageCollection::Package packageWithBoth{ LocIndString{ "test.withBoth"sv }, Version{ "3.0" }, Channel{ "" } };
+    packageWithBoth.InitialOverrideArgs = "/override";
+    packageWithBoth.InitialCustomSwitches = "--extra";
+    source.Packages.emplace_back(std::move(packageWithBoth));
+
+    PackageCollection::Package packageWithNeither{ LocIndString{ "test.withNeither"sv }, Version{ "4.0" }, Channel{ "" } };
+    source.Packages.emplace_back(std::move(packageWithNeither));
+
+    PackageCollection pc
+    {
+        "1.0.0",
+        std::vector<PackageCollection::Source>{ source }
+    };
+
+    ValidateJsonWithCollection(PackagesJson::CreateJson(pc), pc);
+}
+
 TEST_CASE("PackageCollection_Read_SingleSource_1_0", "[PackageCollection]")
 {
     auto json = ParseJsonString(R"(
     {
       "$schema": "https://aka.ms/winget-packages.schema.1.0.json",
-      "CreationDate": "2021-01-01T12:00:00.000",
+      "CreationDate": "2021-01-01T12:00:00.000-00:00",
       "Sources": [
         {
           "Packages": [
@@ -242,7 +266,7 @@ TEST_CASE("PackageCollection_Read_SingleSource_2_0", "[PackageCollection]")
     auto json = ParseJsonString(R"(
     {
       "$schema": "https://aka.ms/winget-packages.schema.2.0.json",
-      "CreationDate": "2021-01-01T12:00:00.000",
+      "CreationDate": "2021-01-01T12:00:00.000-00:00",
       "Sources": [
         {
           "Packages": [
@@ -287,12 +311,112 @@ TEST_CASE("PackageCollection_Read_SingleSource_2_0", "[PackageCollection]")
     ValidateEqualCollections(parseResult.Packages, expected);
 }
 
+TEST_CASE("PackageCollection_Read_OverrideAndCustomSwitches_2_0", "[PackageCollection]")
+{
+    auto json = ParseJsonString(R"(
+    {
+      "$schema": "https://aka.ms/winget-packages.schema.2.0.json",
+      "CreationDate": "2021-01-01T12:00:00.000-00:00",
+      "WinGetVersion": "1.0.0",
+      "Sources": [
+        {
+          "Packages": [
+            {
+              "PackageIdentifier": "test.withOverride",
+              "InitialOverrideArguments": "/silent /norestart"
+            },
+            {
+              "PackageIdentifier": "test.withCustom",
+              "InitialCustomSwitches": "--no-telemetry"
+            },
+            {
+              "PackageIdentifier": "test.withBoth",
+              "InitialOverrideArguments": "/override",
+              "InitialCustomSwitches": "--extra"
+            },
+            {
+              "PackageIdentifier": "test.withNeither"
+            }
+          ],
+          "SourceDetails": {
+            "Argument": "https://aka.ms/winget",
+            "Identifier": "TestSourceId",
+            "Name": "TestSource",
+            "Type": "Microsoft.PreIndexed.Package"
+          }
+        }
+      ]
+    })");
+
+    auto parseResult = PackagesJson::TryParseJson(json);
+    REQUIRE(parseResult.Result == PackagesJson::ParseResult::Type::Success);
+    REQUIRE(parseResult.Errors.empty());
+
+    REQUIRE(parseResult.Packages.Sources.size() == 1);
+    const auto& packages = parseResult.Packages.Sources[0].Packages;
+    REQUIRE(packages.size() == 4);
+
+    REQUIRE(packages[0].Id == "test.withOverride");
+    REQUIRE(packages[0].InitialOverrideArgs == "/silent /norestart");
+    REQUIRE(packages[0].InitialCustomSwitches.empty());
+
+    REQUIRE(packages[1].Id == "test.withCustom");
+    REQUIRE(packages[1].InitialOverrideArgs.empty());
+    REQUIRE(packages[1].InitialCustomSwitches == "--no-telemetry");
+
+    REQUIRE(packages[2].Id == "test.withBoth");
+    REQUIRE(packages[2].InitialOverrideArgs == "/override");
+    REQUIRE(packages[2].InitialCustomSwitches == "--extra");
+
+    REQUIRE(packages[3].Id == "test.withNeither");
+    REQUIRE(packages[3].InitialOverrideArgs.empty());
+    REQUIRE(packages[3].InitialCustomSwitches.empty());
+}
+
+TEST_CASE("PackageCollection_WriteRead_OverrideAndCustomSwitches", "[PackageCollection]")
+{
+    PackageCollection::Source source;
+    source.Details.Name = "TestSource";
+    source.Details.Arg = "https://aka.ms/winget";
+    source.Details.Type = "Microsoft.PreIndexed.Package";
+    source.Details.Identifier = "TestSourceId";
+
+    PackageCollection::Package packageWithOverride{ LocIndString{ "test.withOverride"sv }, Version{ "1.0" }, Channel{ "" } };
+    packageWithOverride.InitialOverrideArgs = "/silent /norestart";
+    source.Packages.emplace_back(std::move(packageWithOverride));
+
+    PackageCollection::Package packageWithCustom{ LocIndString{ "test.withCustom"sv }, Version{ "2.0" }, Channel{ "" } };
+    packageWithCustom.InitialCustomSwitches = "--no-telemetry";
+    source.Packages.emplace_back(std::move(packageWithCustom));
+
+    PackageCollection::Package packageWithBoth{ LocIndString{ "test.withBoth"sv }, Version{ "3.0" }, Channel{ "" } };
+    packageWithBoth.InitialOverrideArgs = "/override";
+    packageWithBoth.InitialCustomSwitches = "--extra";
+    source.Packages.emplace_back(std::move(packageWithBoth));
+
+    PackageCollection::Package packageWithNeither{ LocIndString{ "test.withNeither"sv }, Version{ "4.0" }, Channel{ "" } };
+    source.Packages.emplace_back(std::move(packageWithNeither));
+
+    PackageCollection original
+    {
+        "1.0.0",
+        std::vector<PackageCollection::Source>{ source }
+    };
+
+    auto json = PackagesJson::CreateJson(original);
+    ValidateJsonWithCollection(json, original);
+
+    auto parseResult = PackagesJson::TryParseJson(json);
+    REQUIRE(parseResult.Result == PackagesJson::ParseResult::Type::Success);
+    ValidateEqualCollections(parseResult.Packages, original);
+}
+
 TEST_CASE("PackageCollection_Read_MultipleSources_1_0", "[PackageCollection]")
 {
     auto json = ParseJsonString(R"(
     {
       "$schema": "https://aka.ms/winget-packages.schema.1.0.json",
-      "CreationDate": "2021-01-01T12:00:00.000",
+      "CreationDate": "2021-01-01T12:00:00.000-00:00",
       "WinGetVersion": "1.0.0",
       "Sources": [
         {
@@ -358,7 +482,7 @@ TEST_CASE("PackageCollection_Read_MultipleSources_2_0", "[PackageCollection]")
     auto json = ParseJsonString(R"(
     {
       "$schema": "https://aka.ms/winget-packages.schema.2.0.json",
-      "CreationDate": "2021-01-01T12:00:00.000",
+      "CreationDate": "2021-01-01T12:00:00.000-00:00",
       "WinGetVersion": "1.0.0",
       "Sources": [
         {
@@ -424,7 +548,7 @@ TEST_CASE("PackageCollection_Read_RepeatedSource", "[PackageCollection]")
     auto json = ParseJsonString(R"(
     {
       "$schema": "https://aka.ms/winget-packages.schema.1.0.json",
-      "CreationDate": "2021-01-01T12:00:00.000",
+      "CreationDate": "2021-01-01T12:00:00.000-00:00",
       "WinGetVersion": "1.0.0",
       "Sources": [
         {
@@ -504,7 +628,7 @@ TEST_CASE("PackageCollection_Read_MissingSchema", "[PackageCollection]")
 {
     auto json = ParseJsonString(R"(
     {
-      "CreationDate": "2021-01-01T12:00:00.000",
+      "CreationDate": "2021-01-01T12:00:00.000-00:00",
       "Sources": [
         {
           "Packages": [
@@ -537,7 +661,7 @@ TEST_CASE("PackageCollection_Read_WrongSchema", "[PackageCollection]")
     auto json = ParseJsonString(R"(
     {
       "$schema": "https://aka.ms/winget-settings.schema.json",
-      "CreationDate": "2021-01-01T12:00:00.000",
+      "CreationDate": "2021-01-01T12:00:00.000-00:00",
       "Sources": [
         {
           "Packages": [
@@ -565,7 +689,7 @@ TEST_CASE("PackageCollection_Read_SchemaValidationFail", "[PackageCollection]")
     auto json = ParseJsonString(R"(
     {
       "$schema": "https://aka.ms/winget-packages.schema.1.0.json",
-      "CreationDate": "2021-01-01T12:00:00.000",
+      "CreationDate": "2021-01-01T12:00:00.000-00:00",
       "NotSources": [
         {
           "Packages": [
@@ -596,7 +720,7 @@ TEST_CASE("PackageCollection_Read_SchemaValidationFail_Id", "[PackageCollection]
     auto json = ParseJsonString(R"(
     {
       "$schema": "https://aka.ms/winget-packages.schema.1.0.json",
-      "CreationDate": "2021-01-01T12:00:00.000",
+      "CreationDate": "2021-01-01T12:00:00.000-00:00",
       "Sources": [
         {
           "Packages": [
@@ -624,8 +748,6 @@ TEST_CASE("PackageCollection_Read_SchemaValidationFail_Id", "[PackageCollection]
 
 TEST_CASE("PackageCollection_Read_BadTimeStamp", "[PackageCollection]")
 {
-    // We used to export without padding the creation date with 0s nor adding time zone.
-    // Ensure we don't break with that format.
     auto json = ParseJsonString(R"(
     {
       "$schema": "https://aka.ms/winget-packages.schema.1.0.json",
@@ -651,6 +773,6 @@ TEST_CASE("PackageCollection_Read_BadTimeStamp", "[PackageCollection]")
     auto parseResult = PackagesJson::TryParseJson(json);
     INFO(parseResult.Errors);
 
-    REQUIRE(parseResult.Result == PackagesJson::ParseResult::Type::Success);
-    REQUIRE(parseResult.Errors.empty());
+    REQUIRE(parseResult.Result == PackagesJson::ParseResult::Type::SchemaValidationFailed);
+    REQUIRE_FALSE(parseResult.Errors.empty());
 }

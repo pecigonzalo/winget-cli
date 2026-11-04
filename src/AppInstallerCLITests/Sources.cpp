@@ -23,13 +23,15 @@ using namespace AppInstaller::Utility;
 using namespace std::string_literals;
 using namespace std::string_view_literals;
 
-constexpr size_t c_DefaultSourceCount = 2;
+constexpr size_t c_DefaultSourceCount = 3;
 
 constexpr std::string_view s_SourcesYaml_Sources = "Sources"sv;
 constexpr std::string_view s_SourcesYaml_Source_Name = "Name"sv;
 constexpr std::string_view s_SourcesYaml_Source_Type = "Type"sv;
 constexpr std::string_view s_SourcesYaml_Source_Arg = "Arg"sv;
 constexpr std::string_view s_SourcesYaml_Source_Data = "Data"sv;
+constexpr std::string_view s_SourcesYaml_Source_TrustLevel = "TrustLevel"sv;
+constexpr std::string_view s_SourcesYaml_Source_Explicit = "Explicit"sv;
 constexpr std::string_view s_SourcesYaml_Source_LastUpdate = "LastUpdate"sv;
 
 constexpr std::string_view s_EmptySources = R"(
@@ -48,6 +50,11 @@ Sources:
     Arg: ""
     Data: ""
     IsTombstone: true
+  - Name: winget-font
+    Type: ""
+    Arg: ""
+    Data: ""
+    IsTombstone: true
 )"sv;
 
 constexpr std::string_view s_SingleSource = R"(
@@ -57,6 +64,39 @@ Sources:
     Arg: testArg
     Data: testData
     IsTombstone: false
+)"sv;
+
+constexpr std::string_view s_SingleSourceOverride = R"(
+Sources:
+  - Name: winget-font
+    Type: ""
+    Arg: ""
+    Data: ""
+    IsTombstone: false
+    IsOverride: true
+    Explicit: false
+    Priority: 12
+)"sv;
+
+constexpr std::string_view s_WingetTombstoned = R"(
+Sources:
+  - Name: winget
+    Type: ""
+    Arg: ""
+    Data: ""
+    IsTombstone: true
+)"sv;
+
+constexpr std::string_view s_WingetDefaultMetadata = R"(
+Sources:
+  - Name: winget
+    LastUpdate: 100
+)"sv;
+
+constexpr std::string_view s_WingetFontOverrideMetadata = R"(
+Sources:
+  - Name: winget-font
+    LastUpdate: 100
 )"sv;
 
 constexpr std::string_view s_SingleSourceMetadata = R"(
@@ -100,22 +140,30 @@ Sources:
     Arg: testArg
     Data: testData
     IsTombstone: false
+    Priority: 1
   - Name: testName2
     Type: testType2
     Arg: testArg2
     Data: testData2
     IsTombstone: false
+    Priority: 5
   - Name: testName3
     Type: testType3
     Arg: testArg3
     Data: testData3
     IsTombstone: false
+    Priority: 3
   - Name: winget
     Type: ""
     Arg: ""
     Data: ""
     IsTombstone: true
   - Name: msstore
+    Type: ""
+    Arg: ""
+    Data: ""
+    IsTombstone: true
+  - Name: winget-font
     Type: ""
     Arg: ""
     Data: ""
@@ -172,6 +220,18 @@ Sources:
     IsTombstone: false
 )"sv;
 
+constexpr std::string_view s_SingleSource_AllProperties= R"(
+Sources:
+  - Name: testName
+    Type: testType
+    Arg: testArg
+    Data: testData
+    IsTombstone: false
+    TrustLevel: 3
+    Explicit: true
+    Priority: 1
+)"sv;
+
 namespace
 {
     // Helper to create a simple source.
@@ -195,9 +255,9 @@ namespace
             PackageMatchFilter testMatchFilter1{ PackageMatchField::Id, MatchType::Exact, "test" };
             PackageMatchFilter testMatchFilter2{ PackageMatchField::Name, MatchType::Exact, "test" };
             PackageMatchFilter testMatchFilter3{ PackageMatchField::Id, MatchType::CaseInsensitive, "test" };
-            result.Matches.emplace_back(std::shared_ptr<IPackage>(), testMatchFilter1);
-            result.Matches.emplace_back(std::shared_ptr<IPackage>(), testMatchFilter2);
-            result.Matches.emplace_back(std::shared_ptr<IPackage>(), testMatchFilter3);
+            result.Matches.emplace_back(nullptr, testMatchFilter1);
+            result.Matches.emplace_back(nullptr, testMatchFilter2);
+            result.Matches.emplace_back(nullptr, testMatchFilter3);
             return result;
         }
     };
@@ -268,6 +328,42 @@ TEST_CASE("RepoSources_DefaultSourcesTombstoned", "[sources]")
     REQUIRE(sources.empty());
 }
 
+
+TEST_CASE("RepoSources_DefaultSourceOverride", "[sources]")
+{
+    SetSetting(Stream::UserSources, s_EmptySources);
+
+    // Default font has explicit to true.
+    // Font is at index 2 as it is the third one added.
+    auto beforeOverride = GetSources();
+    REQUIRE(beforeOverride.size() == c_DefaultSourceCount);
+    REQUIRE(beforeOverride[2].Name == "winget-font");
+    REQUIRE(beforeOverride[2].Arg == "https://cdn.winget.microsoft.com/fonts");
+    REQUIRE(beforeOverride[2].Data == "Microsoft.Winget.Fonts.Source_8wekyb3d8bbwe");
+    REQUIRE(beforeOverride[2].Type == "Microsoft.PreIndexed.Package");
+    REQUIRE(beforeOverride[2].Origin == SourceOrigin::Default);
+    REQUIRE(beforeOverride[2].Explicit == true);
+    REQUIRE(beforeOverride[2].Priority == 0);
+
+    SetSetting(Stream::UserSources, s_SingleSourceOverride);
+    auto afterOverride = GetSources();
+
+    // The override will change the index value as the Default will be replaced by the override.
+    // User sources have higher priority so the override will be at index 0.
+    // We expect the same count, and the Name, Arg, Data, and Type properties to all be identical.
+    // Only the name is defined in the override setting so all others should be properly populated.
+    REQUIRE(afterOverride.size() == c_DefaultSourceCount);
+    REQUIRE(afterOverride[0].Name == beforeOverride[2].Name);
+    REQUIRE(afterOverride[0].Arg == beforeOverride[2].Arg);
+    REQUIRE(afterOverride[0].Data == beforeOverride[2].Data);
+    REQUIRE(afterOverride[0].Type == beforeOverride[2].Type);
+
+    // The only properties we expect to be different are the Origin, which is now User, and Explicit.
+    REQUIRE(afterOverride[0].Origin == SourceOrigin::User);
+    REQUIRE(afterOverride[0].Explicit == false);
+    REQUIRE(afterOverride[0].Priority == 12);
+}
+
 TEST_CASE("RepoSources_SingleSource", "[sources]")
 {
     SetSetting(Stream::UserSources, s_SingleSource);
@@ -286,25 +382,53 @@ TEST_CASE("RepoSources_SingleSource", "[sources]")
     RequireDefaultSourcesAt(sources, 1);
 }
 
+TEST_CASE("RepoSources_SingleSource_AllProperties", "[sources]")
+{
+    SetSetting(Stream::UserSources, s_SingleSource_AllProperties);
+    RemoveSetting(Stream::SourcesMetadata);
+
+    std::vector<SourceDetails> sources = GetSources();
+    REQUIRE(sources.size() == c_DefaultSourceCount + 1);
+
+    REQUIRE(sources[0].Name == "testName");
+    REQUIRE(sources[0].Type == "testType");
+    REQUIRE(sources[0].Arg == "testArg");
+    REQUIRE(sources[0].Data == "testData");
+    REQUIRE(sources[0].Origin == SourceOrigin::User);
+    REQUIRE(sources[0].Explicit == true);
+    REQUIRE(sources[0].Priority == 1);
+    REQUIRE(WI_IsFlagSet(sources[0].TrustLevel, SourceTrustLevel::Trusted));
+    REQUIRE(WI_IsFlagSet(sources[0].TrustLevel, SourceTrustLevel::StoreOrigin));
+    REQUIRE(sources[0].LastUpdateTime == ConvertUnixEpochToSystemClock(0));
+
+    RequireDefaultSourcesAt(sources, 1);
+}
+
 TEST_CASE("RepoSources_ThreeSources", "[sources]")
 {
+    GroupPolicyTestOverride policies;
+    policies.SetState(TogglePolicy::Policy::ExperimentalFeatures, GENERATE(PolicyState::NotConfigured, PolicyState::Disabled));
+
     SetSetting(Stream::UserSources, s_ThreeSources);
     SetSetting(Stream::SourcesMetadata, s_ThreeSourcesMetadata);
+
+    const char* suffixStrings[3] = { "", "2", "3" };
+    size_t suffix[3] = { 1, 2, 0 };
 
     std::vector<SourceDetails> sources = GetSources();
     REQUIRE(sources.size() == 3);
 
-    const char* suffix[3] = { "", "2", "3" };
-
-    for (size_t i = 0; i < 3; ++i)
+    for (size_t index = 0; index < 3; ++index)
     {
-        INFO("Source #" << i);
-        REQUIRE(sources[i].Name == "testName"s + suffix[i]);
-        REQUIRE(sources[i].Type == "testType"s + suffix[i]);
-        REQUIRE(sources[i].Arg == "testArg"s + suffix[i]);
-        REQUIRE(sources[i].Data == "testData"s + suffix[i]);
-        REQUIRE(sources[i].LastUpdateTime == ConvertUnixEpochToSystemClock(i));
-        REQUIRE(sources[i].Origin == SourceOrigin::User);
+        size_t i = suffix[index];
+
+        INFO("Source #" << index << " [" << i << "]");
+        REQUIRE(sources[index].Name == "testName"s + suffixStrings[i]);
+        REQUIRE(sources[index].Type == "testType"s + suffixStrings[i]);
+        REQUIRE(sources[index].Arg == "testArg"s + suffixStrings[i]);
+        REQUIRE(sources[index].Data == "testData"s + suffixStrings[i]);
+        REQUIRE(sources[index].LastUpdateTime == ConvertUnixEpochToSystemClock(i));
+        REQUIRE(sources[index].Origin == SourceOrigin::User);
     }
 }
 
@@ -312,14 +436,14 @@ TEST_CASE("RepoSources_InvalidYAML", "[sources]")
 {
     SetSetting(Stream::UserSources, "Name: Value : BAD");
 
-    REQUIRE_THROWS_HR(GetSources(), APPINSTALLER_CLI_ERROR_SOURCES_INVALID);
+    REQUIRE_NOTHROW(GetSources());
 }
 
 TEST_CASE("RepoSources_MissingField", "[sources]")
 {
     SetSetting(Stream::UserSources, s_SingleSource_MissingArg);
 
-    REQUIRE_THROWS_HR(GetSources(), APPINSTALLER_CLI_ERROR_SOURCES_INVALID);
+    REQUIRE_NOTHROW(GetSources());
 }
 
 TEST_CASE("RepoSources_AddSource", "[sources]")
@@ -332,6 +456,9 @@ TEST_CASE("RepoSources_AddSource", "[sources]")
     details.Type = "thisIsTheType";
     details.Arg = "thisIsTheArg";
     details.Data = "thisIsTheData";
+    details.TrustLevel = Repository::SourceTrustLevel::None;
+    details.Explicit = false;
+    details.Priority = 42;
 
     bool addCalledOnFactory = false;
     TestSourceFactory factory{ SourcesTestSource::Create };
@@ -352,6 +479,9 @@ TEST_CASE("RepoSources_AddSource", "[sources]")
     REQUIRE(sources[0].Data == details.Data);
     REQUIRE(sources[0].LastUpdateTime != ConvertUnixEpochToSystemClock(0));
     REQUIRE(sources[0].Origin == SourceOrigin::User);
+    REQUIRE(sources[0].TrustLevel == details.TrustLevel);
+    REQUIRE(sources[0].Explicit == details.Explicit);
+    REQUIRE(sources[0].Priority == details.Priority);
 
     RequireDefaultSourcesAt(sources, 1);
 }
@@ -575,6 +705,7 @@ TEST_CASE("RepoSources_UpdateOnOpen", "[sources]")
     bool updateCalledOnFactory = false;
     TestSourceFactory factory{ SourcesTestSource::Create };
     factory.OnUpdate = [&](const SourceDetails&) { updateCalledOnFactory = true; };
+    factory.ShouldUpdateBeforeOpenResult = true;
     TestHook_SetSourceFactoryOverride(type, factory);
 
     SetSetting(Stream::UserSources, s_SingleSource);
@@ -633,6 +764,81 @@ TEST_CASE("RepoSources_DropAllSources", "[sources]")
     sources = GetSources();
     REQUIRE(sources.size() == c_DefaultSourceCount);
     REQUIRE(sources[0].Origin == SourceOrigin::Default);
+}
+
+
+TEST_CASE("RepoSources_DropDefaultSourceByName", "[sources]")
+{
+    RemoveSetting(Stream::UserSources);
+    SetSetting(Stream::SourcesMetadata, s_WingetDefaultMetadata);
+
+    std::vector<SourceDetails> sources = GetSources();
+    REQUIRE(sources.size() == c_DefaultSourceCount);
+
+    // Verify the winget source has non-zero metadata before reset
+    auto wingetBefore = std::find_if(sources.begin(), sources.end(), [](const SourceDetails& sd) { return sd.Name == "winget"; });
+    REQUIRE(wingetBefore != sources.end());
+    REQUIRE(wingetBefore->LastUpdateTime == ConvertUnixEpochToSystemClock(100));
+
+    DropSource("winget");
+
+    // Source should still be present as a Default source
+    sources = GetSources();
+    REQUIRE(sources.size() == c_DefaultSourceCount);
+
+    auto wingetAfter = std::find_if(sources.begin(), sources.end(), [](const SourceDetails& sd) { return sd.Name == "winget"; });
+    REQUIRE(wingetAfter != sources.end());
+    REQUIRE(wingetAfter->Origin == SourceOrigin::Default);
+    // Metadata should be cleared
+    REQUIRE(wingetAfter->LastUpdateTime == ConvertUnixEpochToSystemClock(0));
+}
+
+TEST_CASE("RepoSources_ResetTombstonedDefaultSourceByName", "[sources]")
+{
+    SetSetting(Stream::UserSources, s_WingetTombstoned);
+    SetSetting(Stream::SourcesMetadata, s_WingetDefaultMetadata);
+
+    std::vector<SourceDetails> sources = GetSources();
+    REQUIRE(sources.size() == c_DefaultSourceCount - 1);
+
+    auto wingetBefore = std::find_if(sources.begin(), sources.end(), [](const SourceDetails& sd) { return sd.Name == "winget"; });
+    REQUIRE(wingetBefore == sources.end());
+
+    DropSource("winget");
+
+    sources = GetSources();
+    REQUIRE(sources.size() == c_DefaultSourceCount);
+
+    auto wingetAfter = std::find_if(sources.begin(), sources.end(), [](const SourceDetails& sd) { return sd.Name == "winget"; });
+    REQUIRE(wingetAfter != sources.end());
+    REQUIRE(wingetAfter->Origin == SourceOrigin::Default);
+    REQUIRE(wingetAfter->LastUpdateTime == ConvertUnixEpochToSystemClock(0));
+}
+
+TEST_CASE("RepoSources_DropDefaultSourceOverrideByName", "[sources]")
+{
+    SetSetting(Stream::UserSources, s_SingleSourceOverride);
+    SetSetting(Stream::SourcesMetadata, s_WingetFontOverrideMetadata);
+
+    std::vector<SourceDetails> sources = GetSources();
+    REQUIRE(sources.size() == c_DefaultSourceCount);
+
+    // winget-font should be present as a User (override) source with metadata
+    auto fontBefore = std::find_if(sources.begin(), sources.end(), [](const SourceDetails& sd) { return sd.Name == "winget-font"; });
+    REQUIRE(fontBefore != sources.end());
+    REQUIRE(fontBefore->Origin == SourceOrigin::User);
+    REQUIRE(fontBefore->LastUpdateTime == ConvertUnixEpochToSystemClock(100));
+
+    DropSource("winget-font");
+
+    // winget-font should be restored to Default with cleared metadata
+    sources = GetSources();
+    REQUIRE(sources.size() == c_DefaultSourceCount);
+
+    auto fontAfter = std::find_if(sources.begin(), sources.end(), [](const SourceDetails& sd) { return sd.Name == "winget-font"; });
+    REQUIRE(fontAfter != sources.end());
+    REQUIRE(fontAfter->Origin == SourceOrigin::Default);
+    REQUIRE(fontAfter->LastUpdateTime == ConvertUnixEpochToSystemClock(0));
 }
 
 TEST_CASE("RepoSources_SearchAcrossMultipleSources", "[sources]")
@@ -816,6 +1022,15 @@ TEST_CASE("RepoSources_GroupPolicy_AdditionalSources", "[sources][groupPolicy]")
                 source.Arg = "arg" + suffix[i];
                 source.Data = "data" + suffix[i];
                 source.Identifier = "id" + suffix[i];
+                source.TrustLevel = { "Trusted" };
+                source.Explicit = (i % 2 == 0);
+
+                // Leave the first source without a priority to verify the default value.
+                if (i != 0)
+                {
+                    source.Priority = static_cast<int32_t>(i);
+                }
+
                 policySources.emplace_back(std::move(source));
             }
 
@@ -824,18 +1039,68 @@ TEST_CASE("RepoSources_GroupPolicy_AdditionalSources", "[sources][groupPolicy]")
 
             auto sources = GetSources();
 
+            // Compare in descending priority order.
+            std::reverse(policySources.begin(), policySources.end());
+
             // The source list includes the default source
             REQUIRE(sources.size() == policySources.size() + c_DefaultSourceCount);
             REQUIRE(sources.back().Origin == SourceOrigin::Default);
 
             for (size_t i = 0; i < policySources.size(); ++i)
             {
+                INFO("Source #" << i);
                 REQUIRE(sources[i].Name == policySources[i].Name);
                 REQUIRE(sources[i].Type == policySources[i].Type);
                 REQUIRE(sources[i].Arg == policySources[i].Arg);
                 REQUIRE(sources[i].Data == policySources[i].Data);
                 REQUIRE(sources[i].Identifier == policySources[i].Identifier);
                 REQUIRE(sources[i].Origin == SourceOrigin::GroupPolicy);
+                REQUIRE(sources[i].Explicit == policySources[i].Explicit);
+                REQUIRE(WI_IsFlagSet(sources[i].TrustLevel, SourceTrustLevel::Trusted));
+                REQUIRE(sources[i].Priority == policySources[i].Priority.value_or(0));
+            }
+        }
+        SECTION("Priority sorts additional sources")
+        {
+            policies.SetState(TogglePolicy::Policy::ExperimentalFeatures, PolicyState::Disabled);
+
+            // The sources are given in increasing priority order; the result should be the reverse.
+            std::vector<SourceFromPolicy> policySources;
+            const std::string suffix[3] = { "", "2", "3" };
+            for (size_t i = 0; i < 3; ++i)
+            {
+                SourceFromPolicy source;
+                source.Name = "name" + suffix[i];
+                source.Type = "type" + suffix[i];
+                source.Arg = "arg" + suffix[i];
+                source.Data = "data" + suffix[i];
+                source.Identifier = "id" + suffix[i];
+                source.Priority = static_cast<int32_t>(i) + 1;
+                policySources.emplace_back(std::move(source));
+            }
+
+            policies.SetValue<ValuePolicy::AdditionalSources>(policySources);
+            SetSetting(Stream::UserSources, s_EmptySources);
+
+            auto sources = GetSources();
+
+            REQUIRE(sources.size() == policySources.size() + c_DefaultSourceCount);
+
+            for (size_t i = 0; i < policySources.size(); ++i)
+            {
+                size_t policyIndex = policySources.size() - 1 - i;
+                INFO("Source #" << i << " [" << policyIndex << "]");
+                REQUIRE(sources[i].Name == policySources[policyIndex].Name);
+                REQUIRE(sources[i].Origin == SourceOrigin::GroupPolicy);
+                REQUIRE(sources[i].Priority == policySources[policyIndex].Priority.value());
+            }
+
+            // The default sources have a priority of 0, so they come after all of the policy sources.
+            for (size_t i = policySources.size(); i < sources.size(); ++i)
+            {
+                INFO("Source #" << i);
+                REQUIRE(sources[i].Origin == SourceOrigin::Default);
+                REQUIRE(sources[i].Priority == 0);
             }
         }
         SECTION("Same-name user source is overridden")
@@ -1246,7 +1511,7 @@ TEST_CASE("RepoSources_RestoringWellKnownSource", "[sources]")
 
     SECTION("with well known name")
     {
-        Source addStoreBack{ details.Name, details.Arg, details.Type };
+        Source addStoreBack{ details.Name, details.Arg, details.Type, Repository::SourceTrustLevel::None, {} };
         REQUIRE(addStoreBack.Add(progress));
 
         Source storeAfterAdd{ details.Name };
@@ -1257,11 +1522,67 @@ TEST_CASE("RepoSources_RestoringWellKnownSource", "[sources]")
     SECTION("with different name")
     {
         std::string newName = details.Name + "_new";
-        Source addStoreBack{ newName, details.Arg, details.Type };
+        Source addStoreBack{ newName, details.Arg, details.Type, Repository::SourceTrustLevel::None, {} };
         REQUIRE(addStoreBack.Add(progress));
 
         Source storeAfterAdd{ newName };
         REQUIRE(storeAfterAdd);
         REQUIRE(storeAfterAdd.GetDetails().CertificatePinningConfiguration.IsEmpty());
     }
+}
+
+TEST_CASE("RepoSources_GroupPolicy_BypassCertificatePinningForMicrosoftStore", "[sources][groupPolicy]")
+{
+    TestHook_ClearSourceFactoryOverrides();
+
+    SECTION("Not configured")
+    {
+        GroupPolicyTestOverride policies;
+        policies.SetState(TogglePolicy::Policy::BypassCertificatePinningForMicrosoftStore, PolicyState::NotConfigured);
+        Source source(WellKnownSource::MicrosoftStore);
+        REQUIRE_FALSE(source.GetDetails().CertificatePinningConfiguration.IsEmpty());
+    }
+
+    SECTION("Enabled")
+    {
+        GroupPolicyTestOverride policies;
+        policies.SetState(TogglePolicy::Policy::BypassCertificatePinningForMicrosoftStore, PolicyState::Enabled);
+        Source source(WellKnownSource::MicrosoftStore);
+        REQUIRE(source.GetDetails().CertificatePinningConfiguration.IsEmpty());
+    }
+
+    SECTION("Disabled")
+    {
+        GroupPolicyTestOverride policies;
+        policies.SetState(TogglePolicy::Policy::BypassCertificatePinningForMicrosoftStore, PolicyState::Disabled);
+        Source source(WellKnownSource::MicrosoftStore);
+        REQUIRE_FALSE(source.GetDetails().CertificatePinningConfiguration.IsEmpty());
+    }
+}
+
+TEST_CASE("RepoSources_BuiltInDesktopFrameworkSourceAlwaysCreatable", "[sources]")
+{
+    Source source(WellKnownSource::DesktopFrameworks);
+    REQUIRE(source);
+}
+
+TEST_CASE("RepoSources_MicrosoftStore_CertificatePinningLifetimeCheck", "[sources]")
+{
+    TestHook_ClearSourceFactoryOverrides();
+
+    GroupPolicyTestOverride policies;
+    policies.SetState(TogglePolicy::Policy::BypassCertificatePinningForMicrosoftStore, PolicyState::Disabled);
+    Source source(WellKnownSource::MicrosoftStore);
+    REQUIRE_FALSE(source.GetDetails().CertificatePinningConfiguration.IsEmpty());
+
+    // The configuration's remaining lifetime is the *maximum* of the remaining lifetimes of the individual chains.
+    // A chain's remaining lifetime is the *minimum* of the remaining lifetimes of the individual certificates.
+    // A certificate's remaining lifetime is a value between 0.0 and 1.0 that is the ratio of remaining valid time to total valid time.
+
+    // The goal of this test is to warn when the pinning configuration may be in danger of expiration; either via certificate validity or
+    // more likely by renewals causing the pinning to reject the new, correct certificates. It operates in percentage lifetime to normalize
+    // the values across the chain.
+    INFO("If this test has failed, the pinning certificates may be nearing expiration and should be investigated.");
+    double lifetimePercentage = source.GetDetails().CertificatePinningConfiguration.GetRemainingLifetimePercentage();
+    REQUIRE(lifetimePercentage > 0.25);
 }

@@ -6,6 +6,9 @@
 #include "Public/AppInstallerRuntime.h"
 #include "Public/AppInstallerStrings.h"
 #include "Public/AppInstallerDateTime.h"
+#include "Public/winget/UserSettings.h"
+#include <winget/Filesystem.h>
+#include <corecrt_io.h>
 
 
 namespace AppInstaller::Logging
@@ -13,9 +16,26 @@ namespace AppInstaller::Logging
     using namespace std::string_view_literals;
     using namespace std::chrono_literals;
 
-    static constexpr std::string_view s_fileLoggerDefaultFilePrefix = "WinGet"sv;
-    static constexpr std::string_view s_fileLoggerDefaultFileExt = ".log"sv;
-    static constexpr std::ios_base::openmode s_fileLoggerDefaultOpenMode = std::ios_base::out | std::ios_base::app;
+    namespace
+    {
+        static constexpr std::string_view s_fileLoggerDefaultFilePrefix = "WinGet"sv;
+        static constexpr std::string_view s_fileLoggerDefaultFileExt = ".log"sv;
+
+        // Send to a string first to create a single block to write to a file.
+        std::string ToLogLine(Channel channel, Level level, std::string_view message)
+        {
+            std::stringstream strstr;
+            strstr << std::chrono::system_clock::now() << " <" << GetLevelChar(level) << "> [" << std::setw(GetMaxChannelNameLength()) << std::left << std::setfill(' ') << GetChannelName(channel) << "] " << message;
+            return std::move(strstr).str();
+        }
+
+        // Determines the difference between the given position and the maximum as an offset.
+        std::ofstream::off_type CalculateDiff(const std::ofstream::pos_type& position, std::ofstream::off_type maximum)
+        {
+            auto offsetPosition = static_cast<std::ofstream::off_type>(position);
+            return maximum > offsetPosition ? maximum - offsetPosition : 0;
+        }
+    }
 
     FileLogger::FileLogger() : FileLogger(s_fileLoggerDefaultFilePrefix) {}
 
@@ -23,8 +43,8 @@ namespace AppInstaller::Logging
     {
         m_name = GetNameForPath(filePath);
         m_filePath = filePath;
-
-        m_stream.open(m_filePath, s_fileLoggerDefaultOpenMode);
+        InitializeDefaultMaximumFileSize();
+        OpenFileLoggerStream();
     }
 
     FileLogger::FileLogger(const std::string_view fileNamePrefix)
@@ -32,13 +52,24 @@ namespace AppInstaller::Logging
         m_name = "file";
         m_filePath = Runtime::GetPathTo(Runtime::PathName::DefaultLogLocation);
         m_filePath /= fileNamePrefix.data() + ('-' + Utility::GetCurrentTimeForFilename() + s_fileLoggerDefaultFileExt.data());
-
-        m_stream.open(m_filePath, s_fileLoggerDefaultOpenMode);
+        InitializeDefaultMaximumFileSize();
+        OpenFileLoggerStream();
     }
 
     FileLogger::~FileLogger()
     {
         m_stream.flush();
+        // When std::ofstream is constructed from an existing File handle, it does not call fclose on destruction
+        // Only calling close() explicitly will close the file handle.
+        m_stream.close();
+    }
+
+    FileLogger& FileLogger::SetMaximumSize(std::ofstream::off_type maximumSize)
+    {
+        THROW_HR_IF(E_INVALIDARG, maximumSize < 0);
+        std::lock_guard<std::mutex> lock{ *m_streamLock };
+        m_maximumSize = maximumSize;
+        return *this;
     }
 
     std::string FileLogger::GetNameForPath(const std::filesystem::path& filePath)
@@ -62,25 +93,53 @@ namespace AppInstaller::Logging
         return m_name;
     }
 
-    void FileLogger::Write(Channel channel, Level, std::string_view message) noexcept try
+    void FileLogger::Write(Channel channel, Level level, std::string_view message) noexcept try
     {
-        // Send to a string first to create a single block to write to a file.
-        std::stringstream strstr;
-        strstr << std::chrono::system_clock::now() << " [" << std::setw(GetMaxChannelNameLength()) << std::left << std::setfill(' ') << GetChannelName(channel) << "] " << message;
-        m_stream << strstr.str() << std::endl;
+        std::string log = ToLogLine(channel, level, message);
+        WriteDirect(channel, level, log);
     }
-    catch (...)
-    {
-        // Just eat any exceptions here; better than losing logs
-    }
+    catch (...) {}
 
-    void FileLogger::WriteDirect(std::string_view message) noexcept try
+    void FileLogger::WriteDirect(Channel, Level, std::string_view message) noexcept try
     {
+        std::lock_guard<std::mutex> lock{ *m_streamLock };
+        HandleMaximumFileSize(message);
         m_stream << message << std::endl;
     }
-    catch (...)
+    catch (...) {}
+
+    void FileLogger::SetTag(Tag tag) noexcept try
     {
-        // Just eat any exceptions here; better than losing logs
+        if (tag == Tag::HeadersComplete)
+        {
+            std::lock_guard<std::mutex> lock{ *m_streamLock };
+            auto currentPosition = m_stream.tellp();
+            if (currentPosition != std::ofstream::pos_type{ -1 })
+            {
+                m_headersEnd = currentPosition;
+            }
+        }
+    }
+    catch (...) {}
+
+    void FileLogger::Add()
+    {
+        Log().AddLogger(std::make_unique<FileLogger>());
+    }
+
+    void FileLogger::Add(const std::filesystem::path& filePath)
+    {
+        Log().AddLogger(std::make_unique<FileLogger>(filePath));
+    }
+
+    void FileLogger::Add(std::string_view fileNamePrefix)
+    {
+        Log().AddLogger(std::make_unique<FileLogger>(fileNamePrefix));
+    }
+
+    void FileLogger::BeginCleanup()
+    {
+        BeginCleanup(Runtime::GetPathTo(Runtime::PathName::DefaultLogLocation));
     }
 
     void FileLogger::BeginCleanup(const std::filesystem::path& filePath)
@@ -89,20 +148,90 @@ namespace AppInstaller::Logging
             {
                 try
                 {
-                    auto now = std::filesystem::file_time_type::clock::now();
+                    const auto& settings = Settings::User();
 
-                    // Remove all files that are older than 7 days from the standard log location.
-                    for (auto& file : std::filesystem::directory_iterator{ filePath })
+                    Filesystem::FileLimits fileLimits;
+                    fileLimits.Age = settings.Get<Settings::Setting::LoggingFileAgeLimitInDays>();
+                    fileLimits.TotalSizeInMB = settings.Get<Settings::Setting::LoggingFileTotalSizeLimitInMB>();
+                    fileLimits.Count = settings.Get<Settings::Setting::LoggingFileCountLimit>();
+
+                    auto filesInPath = Filesystem::GetFileInfoFor(filePath);
+                    Filesystem::FilterToFilesExceedingLimits(filesInPath, fileLimits);
+
+                    for (const auto& file : filesInPath)
                     {
-                        if (file.is_regular_file() &&
-                            now - file.last_write_time() > (7 * 24h))
-                        {
-                            std::filesystem::remove(file.path());
-                        }
+                        std::filesystem::remove(file.Path);
                     }
                 }
                 // Just throw out everything
                 catch (...) {}
             }).detach();
+    }
+
+    void FileLogger::OpenFileLoggerStream() 
+    {
+        // Prevent other writers to our log file, but allow readers
+        FILE* filePtr = _wfsopen(m_filePath.wstring().c_str(), L"w", _SH_DENYWR);
+
+        if (filePtr)
+        {
+            auto closeFile = wil::scope_exit([&]() { fclose(filePtr); });
+
+            // Prevent inheritance to ensure log file handle is not opened by other processes
+            THROW_IF_WIN32_BOOL_FALSE(SetHandleInformation(reinterpret_cast<HANDLE>(_get_osfhandle(_fileno(filePtr))), HANDLE_FLAG_INHERIT, 0));
+
+            m_stream = std::ofstream{ filePtr };
+            closeFile.release();
+        }
+        else
+        {
+            AICLI_LOG(Core, Error, << "Failed to open log file " << m_filePath.u8string());
+            throw std::system_error(errno, std::generic_category());
+        }
+    }
+
+    void FileLogger::InitializeDefaultMaximumFileSize()
+    {
+        m_maximumSize = static_cast<std::ofstream::off_type>(Settings::User().Get<Settings::Setting::LoggingFileIndividualSizeLimitInMB>()) << 20;
+    }
+
+    void FileLogger::HandleMaximumFileSize(std::string_view& currentLog)
+    {
+        if (m_maximumSize == 0)
+        {
+            return;
+        }
+
+        auto maximumLogSize = static_cast<size_t>(CalculateDiff(m_headersEnd, m_maximumSize));
+
+        // In the event that a single log is larger than the maximum
+        if (currentLog.size() > maximumLogSize)
+        {
+            currentLog = currentLog.substr(0, maximumLogSize);
+            WrapLogFile();
+            return;
+        }
+
+        auto currentPosition = m_stream.tellp();
+        if (currentPosition == std::ofstream::pos_type{ -1 })
+        {
+            // The expectation is that if the stream is in an error state the write won't actually happen.
+            return;
+        }
+
+        auto availableSpace = static_cast<size_t>(CalculateDiff(currentPosition, m_maximumSize));
+
+        if (currentLog.size() > availableSpace)
+        {
+            WrapLogFile();
+            return;
+        }
+    }
+
+    void FileLogger::WrapLogFile()
+    {
+        m_stream.seekp(m_headersEnd);
+        // Yes, we may go over the size limit slightly due to this and the unaccounted for newlines
+        m_stream << ToLogLine(Channel::Core, Level::Info, "--- log file has wrapped ---") << std::endl;
     }
 }

@@ -111,6 +111,13 @@ TEST_CASE("NameNorm_Architecture", "[name_norm]")
     REQUIRE(normer.Normalize("Name x86", {}).Architecture() == Architecture::X86);
     REQUIRE(normer.Normalize("Name x86_64", {}).Architecture() == Architecture::X64);
     REQUIRE(normer.Normalize("Name (64 bit)", {}).Architecture() == Architecture::X64);
+    REQUIRE(normer.Normalize("Name arm32", {}).Architecture() == Architecture::Arm);
+    REQUIRE(normer.Normalize("Name arm64", {}).Architecture() == Architecture::Arm64);
+    REQUIRE(normer.Normalize("Name aarch64", {}).Architecture() == Architecture::Arm64);
+    REQUIRE(normer.Normalize("Name armadillo", {}).Architecture() == Architecture::Unknown);
+    REQUIRE(normer.Normalize("Name armadillo", {}).Name() == "Namearmadillo");
+    REQUIRE(normer.Normalize("ARM Compiler (x64)", {}).Architecture() == Architecture::X64);
+    REQUIRE(normer.Normalize("ARM Compiler (x64)", {}).Name() == "ARMCompiler");
     REQUIRE(normer.Normalize("Name 32/64 bit", {}).Architecture() == Architecture::Unknown);
     REQUIRE(normer.Normalize("Fox86", {}).Architecture() == Architecture::Unknown);
 }
@@ -138,4 +145,19 @@ TEST_CASE("NameNorm_Initial_PreserveWhitespace", "[name_norm]")
 
     REQUIRE(normer.NormalizeName("Some Name").Name() == "Some Name");
     REQUIRE(normer.NormalizePublisher("Some Publisher Corp") == "Some Publisher");
+}
+
+TEST_CASE("NameNorm_GetNormalizedName_GetNormalizedFields", "[name_norm]")
+{
+    NameNormalizer normer(NormalizationVersion::Initial);
+
+    auto normalizedName = normer.NormalizeName("Name(X64)");
+    REQUIRE(normalizedName.GetNormalizedName(NormalizationField::None) == "Name");
+    REQUIRE(normalizedName.GetNormalizedName(NormalizationField::Architecture) == "Name(X64)");
+    REQUIRE(normalizedName.GetNormalizedFields() == NormalizationField::Architecture);
+
+    auto normalizedName2 = normer.NormalizeName("Name");
+    REQUIRE(normalizedName2.GetNormalizedName(NormalizationField::None) == "Name");
+    REQUIRE(normalizedName2.GetNormalizedName(NormalizationField::Architecture) == "Name");
+    REQUIRE(normalizedName2.GetNormalizedFields() == NormalizationField::None);
 }

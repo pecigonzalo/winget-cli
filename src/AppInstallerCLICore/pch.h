@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 #pragma once
 
@@ -7,26 +7,33 @@
 #include <shellapi.h>
 #include <WinInet.h>
 #include <msi.h>
+#include <wincodec.h>
 
 #pragma warning( push )
-#pragma warning ( disable : 4458 4100 6031 4702 )
+#pragma warning ( disable : 4458 4100 6031 4702 26439 )
 #include <valijson/schema.hpp>
 #include <valijson/schema_parser.hpp>
 #include <valijson/validator.hpp>
 #include <valijson/adapters/jsoncpp_adapter.hpp>
 #pragma warning( pop )
 
+#include <algorithm>
 #include <array>
+#include <atomic>
+#include <csignal>
 #include <iostream>
 #include <fstream>
 #include <future>
 #include <functional>
 #include <iterator>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <optional>
+#include <queue>
 #include <set>
 #include <sstream>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -34,31 +41,32 @@
 #include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Management.Deployment.h>
 #include <winrt/Windows.UI.ViewManagement.h>
+#include <winrt/Windows.ApplicationModel.h>
 #include <winrt/Windows.ApplicationModel.Resources.h>
 #include <winrt/Windows.ApplicationModel.Resources.Core.h>
 #include <winrt/Windows.ApplicationModel.Store.Preview.InstallControl.h>
+#include <winrt/Windows.Storage.Streams.h>
+#include <winrt/Windows.Security.Cryptography.Certificates.h>
 
 #pragma warning( push )
-#pragma warning ( disable : 6001 6285 6340 6388 )
+#pragma warning ( disable : 6001 6285 6340 6388 26451 )
+#include <wil/resource.h>
 #include <wil/result.h>
 #include <wil/result_macros.h>
 #include <wil/safecast.h>
+#include <wil/com.h>
+#include <wil/registry_helpers.h>
 #pragma warning( pop )
 
-#include <wrl/client.h>
-#include <AppxPackaging.h>
+#ifndef WINGET_DISABLE_FOR_FUZZING
+#pragma warning( push )
+#pragma warning ( disable : 26495 26439 )
+#include <cpprest/http_client.h>
+#include <cpprest/json.h>
+#include <cpprest/uri_builder.h>
+#pragma warning( pop )
+#endif
 
-#include <AppInstallerArchitecture.h>
-#include <AppInstallerDateTime.h>
-#include <AppInstallerDownloader.h>
-#include <AppInstallerErrors.h>
-#include <AppInstallerLogging.h>
-#include <AppInstallerRuntime.h>
-#include <AppInstallerSHA256.h>
-#include <AppInstallerStrings.h>
-#include <AppInstallerTelemetry.h>
-#include <winget/ExperimentalFeature.h>
-#include <winget/Locale.h>
-#include <winget/LocIndependent.h>
-#include <winget/ManifestYamlParser.h>
-#include <winget/RepositorySource.h>
+#include <wrl/client.h>
+#include <wrl/implements.h>
+#include <AppxPackaging.h>

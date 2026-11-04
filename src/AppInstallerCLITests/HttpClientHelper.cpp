@@ -3,14 +3,15 @@
 #include "pch.h"
 #include "TestCommon.h"
 #include "TestRestRequestHandler.h"
+#include "TestCertificates.h"
 #include <AppInstallerErrors.h>
-#include <Rest/Schema/HttpClientHelper.h>
 #include <AppInstallerRuntime.h>
 #include <AppInstallerStrings.h>
 #include <winget/Certificates.h>
-#include <CertificateResources.h>
+#include <winget/HttpClientHelper.h>
+#include <winget/JsonUtil.h>
 
-using namespace AppInstaller::Repository::Rest::Schema;
+using namespace AppInstaller::Http;
 using namespace AppInstaller::Runtime;
 using namespace AppInstaller::Utility;
 using namespace AppInstaller::Certificates;
@@ -18,19 +19,19 @@ using namespace AppInstaller::Certificates;
 TEST_CASE("ExtractJsonResponse_UnsupportedMimeType", "[RestSource][RestSearch]")
 {
     HttpClientHelper helper{ GetTestRestRequestHandler(web::http::status_codes::OK, L"", web::http::details::mime_types::text_plain) };
-    REQUIRE_THROWS_HR(helper.HandleGet(L"https://testUri"), APPINSTALLER_CLI_ERROR_RESTSOURCE_UNSUPPORTED_MIME_TYPE);
+    REQUIRE_THROWS_HR(helper.HandleGet(L"https://testUri"), APPINSTALLER_CLI_ERROR_RESTAPI_UNSUPPORTED_MIME_TYPE);
 }
 
 TEST_CASE("ValidateAndExtractResponse_ServiceUnavailable", "[RestSource]")
 {
     HttpClientHelper helper{ GetTestRestRequestHandler(web::http::status_codes::ServiceUnavailable) };
-    REQUIRE_THROWS_HR(helper.HandleGet(L"https://testUri"), MAKE_HRESULT(SEVERITY_ERROR, FACILITY_HTTP, web::http::status_codes::ServiceUnavailable));
+    REQUIRE_THROWS_HR(helper.HandleGet(L"https://testUri"), APPINSTALLER_CLI_ERROR_SERVICE_UNAVAILABLE);
 }
 
 TEST_CASE("ValidateAndExtractResponse_NotFound", "[RestSource]")
 {
     HttpClientHelper helper{ GetTestRestRequestHandler(web::http::status_codes::NotFound) };
-    REQUIRE_THROWS_HR(helper.HandleGet(L"https://testUri"), APPINSTALLER_CLI_ERROR_RESTSOURCE_ENDPOINT_NOT_FOUND);
+    REQUIRE_THROWS_HR(helper.HandleGet(L"https://testUri"), APPINSTALLER_CLI_ERROR_RESTAPI_ENDPOINT_NOT_FOUND);
 }
 
 TEST_CASE("EnsureDefaultUserAgent", "[RestSource]")
@@ -60,16 +61,17 @@ TEST_CASE("EnsureDefaultUserAgent", "[RestSource]")
     }
 }
 
-TEST_CASE("HttpClientHelper_PinningConfiguration", "[RestSource]")
+TEST_CASE("HttpClientHelper_PinningConfiguration", "[RestSource][uses-test-certificates]")
 {
-    // Create the Store chain config
+    // Create a pinning chain with test certs that won't match any real server
+    TestCommon::TestCertificateChain testChain;
     PinningChain chain;
     auto chainElement = chain.Root();
-    chainElement->LoadCertificate(IDX_CERTIFICATE_STORE_ROOT_1).SetPinning(PinningVerificationType::PublicKey);
+    chainElement->LoadCertificate(testChain.Root().View()).SetPinning(PinningVerificationType::PublicKey);
     chainElement = chainElement.Next();
-    chainElement->LoadCertificate(IDX_CERTIFICATE_STORE_INTERMEDIATE_1).SetPinning(PinningVerificationType::Subject | PinningVerificationType::Issuer);
+    chainElement->LoadCertificate(testChain.Intermediate2().View()).SetPinning(PinningVerificationType::Subject | PinningVerificationType::Issuer);
     chainElement = chainElement.Next();
-    chainElement->LoadCertificate(IDX_CERTIFICATE_STORE_LEAF_1).SetPinning(PinningVerificationType::Subject | PinningVerificationType::Issuer);
+    chainElement->LoadCertificate(testChain.Leaf2().View()).SetPinning(PinningVerificationType::Subject | PinningVerificationType::Issuer);
 
     PinningConfiguration config;
     config.AddChain(chain);
@@ -77,5 +79,14 @@ TEST_CASE("HttpClientHelper_PinningConfiguration", "[RestSource]")
     HttpClientHelper helper;
     helper.SetPinningConfiguration(config);
 
-    REQUIRE_THROWS_HR(helper.HandleGet(L"https://microsoft.com"), APPINSTALLER_CLI_ERROR_PINNED_CERTIFICATE_MISMATCH);
+    REQUIRE_THROWS_HR(helper.HandleGet(L"https://github.com"), APPINSTALLER_CLI_ERROR_PINNED_CERTIFICATE_MISMATCH);
+}
+
+TEST_CASE("HttpClientHelper_CallerCharacters", "[RestSource]")
+{
+    HttpClientHelper::HttpRequestHeaders headers;
+    headers.emplace(web::http::header_names::user_agent, AppInstaller::JSON::GetUtilityString(AppInstaller::Runtime::GetUserAgent("\xe6\xb5\x8b\xe8\xaf\x95")));
+
+    HttpClientHelper helper;
+    REQUIRE_THROWS_HR(helper.HandleGet(L"https://github.com", headers), APPINSTALLER_CLI_ERROR_RESTAPI_UNSUPPORTED_MIME_TYPE);
 }

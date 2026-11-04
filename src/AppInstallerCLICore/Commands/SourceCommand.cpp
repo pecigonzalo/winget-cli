@@ -12,7 +12,23 @@ namespace AppInstaller::CLI
     using namespace AppInstaller::CLI::Execution;
     using namespace std::string_view_literals;
 
-    static constexpr std::string_view s_SourceCommand_HelpLink = "https://aka.ms/winget-command-source"sv;
+    namespace
+    {
+        void ValidateSourcePriorityArgument(const Args& execArgs)
+        {
+            if (execArgs.Contains(Execution::Args::Type::SourcePriority))
+            {
+                std::string_view priorityArg = execArgs.GetArg(Execution::Args::Type::SourcePriority);
+                auto convertedArg = Utility::TryConvertStringToInt32(priorityArg);
+                if (!convertedArg.has_value())
+                {
+                    throw CommandException(Resource::String::InvalidArgumentValueErrorWithoutValidValues(Argument::ForType(Execution::Args::Type::SourcePriority).Name()));
+                }
+            }
+        }
+    }
+
+    Utility::LocIndView s_SourceCommand_HelpLink = "https://aka.ms/winget-command-source"_liv;
 
     std::vector<std::unique_ptr<Command>> SourceCommand::GetCommands() const
     {
@@ -21,6 +37,7 @@ namespace AppInstaller::CLI
             std::make_unique<SourceListCommand>(FullName()),
             std::make_unique<SourceUpdateCommand>(FullName()),
             std::make_unique<SourceRemoveCommand>(FullName()),
+            std::make_unique<SourceEditCommand>(FullName()),
             std::make_unique<SourceResetCommand>(FullName()),
             std::make_unique<SourceExportCommand>(FullName()),
             });
@@ -36,9 +53,9 @@ namespace AppInstaller::CLI
         return { Resource::String::SourceCommandLongDescription };
     }
 
-    std::string SourceCommand::HelpLink() const
+    Utility::LocIndView SourceCommand::HelpLink() const
     {
-        return std::string{ s_SourceCommand_HelpLink };
+        return s_SourceCommand_HelpLink;
     }
 
     void SourceCommand::ExecuteInternal(Context& context) const
@@ -52,8 +69,11 @@ namespace AppInstaller::CLI
             Argument::ForType(Args::Type::SourceName).SetRequired(true),
             Argument::ForType(Args::Type::SourceArg),
             Argument::ForType(Args::Type::SourceType),
+            Argument::ForType(Args::Type::SourceTrustLevel),
             Argument::ForType(Args::Type::CustomHeader),
             Argument::ForType(Args::Type::AcceptSourceAgreements),
+            Argument::ForType(Args::Type::SourceExplicit),
+            Argument::ForType(Args::Type::SourcePriority),
         };
     }
 
@@ -67,9 +87,34 @@ namespace AppInstaller::CLI
         return { Resource::String::SourceAddCommandLongDescription };
     }
 
-    std::string SourceAddCommand::HelpLink() const
+    Utility::LocIndView SourceAddCommand::HelpLink() const
     {
-        return std::string{ s_SourceCommand_HelpLink };
+        return s_SourceCommand_HelpLink;
+    }
+
+    void SourceAddCommand::ValidateArgumentsInternal(Args& execArgs) const
+    {
+        if (execArgs.Contains(Execution::Args::Type::SourceTrustLevel))
+        {
+            try
+            {
+                std::string trustLevelArg = std::string{ execArgs.GetArg(Execution::Args::Type::SourceTrustLevel) };
+
+                for (auto trustLevel : Utility::Split(trustLevelArg, '|', true))
+                {
+                    Repository::ConvertToSourceTrustLevelEnum(trustLevel);
+                }
+            }
+            catch (...)
+            {
+                auto validOptions = std::vector<Utility::LocIndString>{
+                    Utility::LocIndString{ Repository::SourceTrustLevelEnumToString(Repository::SourceTrustLevel::None) },
+                    Utility::LocIndString{ Repository::SourceTrustLevelEnumToString(Repository::SourceTrustLevel::Trusted) } };
+                throw CommandException(Resource::String::InvalidArgumentValueError(ArgumentCommon::ForType(Execution::Args::Type::SourceTrustLevel).Name, Utility::Join(","_liv, validOptions)));
+            }
+        }
+
+        ValidateSourcePriorityArgument(execArgs);
     }
 
     void SourceAddCommand::ExecuteInternal(Context& context) const
@@ -110,9 +155,9 @@ namespace AppInstaller::CLI
         }
     }
 
-    std::string SourceListCommand::HelpLink() const
+    Utility::LocIndView SourceListCommand::HelpLink() const
     {
-        return std::string{ s_SourceCommand_HelpLink };
+        return s_SourceCommand_HelpLink;
     }
 
     void SourceListCommand::ExecuteInternal(Context& context) const
@@ -148,9 +193,9 @@ namespace AppInstaller::CLI
         }
     }
 
-    std::string SourceUpdateCommand::HelpLink() const
+    Utility::LocIndView SourceUpdateCommand::HelpLink() const
     {
-        return std::string{ s_SourceCommand_HelpLink };
+        return s_SourceCommand_HelpLink;
     }
 
     void SourceUpdateCommand::ExecuteInternal(Context& context) const
@@ -186,9 +231,9 @@ namespace AppInstaller::CLI
         }
     }
 
-    std::string SourceRemoveCommand::HelpLink() const
+    Utility::LocIndView SourceRemoveCommand::HelpLink() const
     {
-        return std::string{ s_SourceCommand_HelpLink };
+        return s_SourceCommand_HelpLink;
     }
 
     void SourceRemoveCommand::ExecuteInternal(Context& context) const
@@ -204,7 +249,7 @@ namespace AppInstaller::CLI
     {
         return {
             Argument::ForType(Args::Type::SourceName),
-            Argument{ "force", Argument::NoAlias, Args::Type::ForceSourceReset, Resource::String::SourceResetForceArgumentDescription, ArgumentType::Flag },
+            Argument{ Args::Type::ForceSourceReset, Resource::String::SourceResetForceArgumentDescription, ArgumentType::Flag },
         };
     }
 
@@ -227,9 +272,9 @@ namespace AppInstaller::CLI
         }
     }
 
-    std::string SourceResetCommand::HelpLink() const
+    Utility::LocIndView SourceResetCommand::HelpLink() const
     {
-        return std::string{ s_SourceCommand_HelpLink };
+        return s_SourceCommand_HelpLink;
     }
 
     void SourceResetCommand::ExecuteInternal(Context& context) const
@@ -238,8 +283,7 @@ namespace AppInstaller::CLI
         {
             context <<
                 Workflow::EnsureRunningAsAdmin <<
-                Workflow::GetSourceListWithFilter <<
-                Workflow::ResetSourceList;
+                Workflow::ResetNamedSource;
         }
         else
         {
@@ -276,9 +320,9 @@ namespace AppInstaller::CLI
         }
     }
 
-    std::string SourceExportCommand::HelpLink() const
+    Utility::LocIndView SourceExportCommand::HelpLink() const
     {
-        return std::string{ s_SourceCommand_HelpLink };
+        return s_SourceCommand_HelpLink;
     }
 
     void SourceExportCommand::ExecuteInternal(Context& context) const
@@ -286,5 +330,58 @@ namespace AppInstaller::CLI
         context <<
             Workflow::GetSourceListWithFilter <<
             Workflow::ExportSourceList;
+    }
+
+    // Source Edit Command
+
+    std::vector<Argument> SourceEditCommand::GetArguments() const
+    {
+        return {
+            Argument::ForType(Args::Type::SourceName).SetRequired(true),
+            Argument::ForType(Args::Type::SourceEditExplicit),
+            Argument::ForType(Args::Type::SourcePriority),
+        };
+    }
+
+    Resource::LocString SourceEditCommand::ShortDescription() const
+    {
+        return { Resource::String::SourceEditCommandShortDescription };
+    }
+
+    Resource::LocString SourceEditCommand::LongDescription() const
+    {
+        return { Resource::String::SourceEditCommandLongDescription };
+    }
+
+    Utility::LocIndView SourceEditCommand::HelpLink() const
+    {
+        return s_SourceCommand_HelpLink;
+    }
+
+    void SourceEditCommand::ValidateArgumentsInternal(Execution::Args& execArgs) const
+    {
+        if (execArgs.Contains(Execution::Args::Type::SourceEditExplicit))
+        {
+            std::string_view explicitArg = execArgs.GetArg(Execution::Args::Type::SourceEditExplicit);
+            auto convertedArg = Utility::TryConvertStringToBool(explicitArg);
+            if (!convertedArg.has_value())
+            {
+                auto validOptions = Utility::Join(", "_liv, std::vector<Utility::LocIndString>{
+                    "true"_lis,
+                    "false"_lis,
+                });
+                throw CommandException(Resource::String::InvalidArgumentValueError(Argument::ForType(Execution::Args::Type::SourceEditExplicit).Name(), validOptions));
+            }
+        }
+
+        ValidateSourcePriorityArgument(execArgs);
+    }
+
+    void SourceEditCommand::ExecuteInternal(Context& context) const
+    {
+        context <<
+            Workflow::EnsureRunningAsAdmin <<
+            Workflow::GetSourceListWithFilter <<
+            Workflow::EditSources;
     }
 }

@@ -5,9 +5,9 @@
 #include "Public/AppInstallerLogging.h"
 #include "Public/AppInstallerRuntime.h"
 #include "Public/AppInstallerStrings.h"
-#include "Public/winget/Filesystem.h"
 #include "Public/winget/UserSettings.h"
 #include "Public/winget/Registry.h"
+#include <winget/Filesystem.h>
 
 
 #define WINGET_DEFAULT_LOG_DIRECTORY "DiagOutputDir"
@@ -16,37 +16,77 @@ namespace AppInstaller::Runtime
 {
     using namespace Utility;
     using namespace Settings;
+    using namespace Filesystem;
 
     namespace
     {
         using namespace std::string_view_literals;
         constexpr std::string_view s_DefaultTempDirectory = "WinGet"sv;
-        constexpr std::string_view s_AppDataDir_Settings = "Settings"sv;
-        constexpr std::string_view s_AppDataDir_State = "State"sv;
-        constexpr std::string_view s_SecureSettings_Base = "Microsoft/WinGet"sv;
+        constexpr std::string_view s_SettingsFile_Relative = "Settings"sv;
+        constexpr std::string_view s_SecureSettings_Base = "Microsoft\\WinGet"sv;
         constexpr std::string_view s_SecureSettings_UserRelative = "settings"sv;
         constexpr std::string_view s_SecureSettings_Relative_Unpackaged = "win"sv;
         constexpr std::string_view s_PortablePackageUserRoot_Base = "Microsoft"sv;
         constexpr std::string_view s_PortablePackageRoot = "WinGet"sv;
         constexpr std::string_view s_PortablePackagesDirectory = "Packages"sv;
         constexpr std::string_view s_LinksDirectory = "Links"sv;
+        constexpr std::string_view s_FontsInstallDirectory = "Microsoft\\Windows\\Fonts"sv;
+        constexpr std::string_view s_ConfigurationModulesDirectory = "Configuration\\Modules"sv;
+// Use production CLSIDs as a surrogate for repository location.
+#if USE_PROD_CLSIDS
+        constexpr std::string_view s_ImageAssetsDirectoryRelative = "Assets\\WinGet"sv;
+#else
+        constexpr std::string_view s_ImageAssetsDirectoryRelative = "Images"sv;
+#endif
+        constexpr std::string_view s_CheckpointsDirectory = "Checkpoints"sv;
         constexpr std::string_view s_DevModeSubkey = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock"sv;
         constexpr std::string_view s_AllowDevelopmentWithoutDevLicense = "AllowDevelopmentWithoutDevLicense"sv;
 #ifndef WINGET_DISABLE_FOR_FUZZING
         constexpr std::string_view s_SecureSettings_Relative_Packaged = "pkg"sv;
 #endif
-        constexpr std::string_view s_PreviewBuildSuffix = "-preview"sv;
         constexpr std::string_view s_RuntimePath_Unpackaged_DefaultState = "defaultState"sv;
+
+        constexpr std::string_view s_UserProfileEnvironmentVariable = "%USERPROFILE%";
+        constexpr std::string_view s_LocalAppDataEnvironmentVariable = "%LOCALAPPDATA%";
+        constexpr std::string_view s_WindowsApps_Base = "Microsoft\\WindowsApps"sv;
+        constexpr std::string_view s_WinGetDev_Exe = "wingetdev.exe";
+        constexpr std::string_view s_WinGet_Exe = "winget.exe";
+        constexpr std::string_view s_WinGetMCPDev_Exe = "WindowsPackageManagerMCPServerDev.exe";
+        constexpr std::string_view s_WinGetMCP_Exe = "WindowsPackageManagerMCPServer.exe";
 
         static std::optional<std::string> s_runtimePathStateName;
         static wil::srwlock s_runtimePathStateNameLock;
 
-        // Gets a boolean indicating whether the current process has identity.
-        bool DoesCurrentProcessHaveIdentity()
+        // Gets the path to the root of the package containing the current process.
+        std::filesystem::path GetPackagePath()
         {
-            UINT32 length = 0;
-            LONG result = GetPackageFamilyName(GetCurrentProcess(), &length, nullptr);
-            return (result != APPMODEL_ERROR_NO_PACKAGE);
+            wchar_t packageFullName[PACKAGE_FULL_NAME_MAX_LENGTH + 1];
+            UINT32 nameLength = ARRAYSIZE(packageFullName);
+            THROW_IF_WIN32_ERROR(GetPackageFullName(GetCurrentProcess(), &nameLength, packageFullName));
+
+            UINT32 pathLength = 0;
+            LONG result = GetPackagePathByFullName(packageFullName, &pathLength, nullptr);
+            THROW_HR_IF(HRESULT_FROM_WIN32(result), result != ERROR_INSUFFICIENT_BUFFER);
+
+            std::unique_ptr<wchar_t[]> buffer = std::make_unique<wchar_t[]>(pathLength);
+            THROW_IF_WIN32_ERROR(GetPackagePathByFullName(packageFullName, &pathLength, buffer.get()));
+
+            return { buffer.get() };
+        }
+
+        // Gets the path to the directory containing the currently executing binary file.
+        std::filesystem::path GetBinaryDirectoryPath()
+        {
+            HMODULE moduleHandle = NULL;
+            THROW_IF_WIN32_BOOL_FALSE(GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                (LPCWSTR)&GetBinaryDirectoryPath, &moduleHandle));
+
+            // Get the path for this module.
+            wil::unique_process_heap_string binaryPath;
+            THROW_IF_FAILED(wil::GetModuleFileNameW(moduleHandle, binaryPath));
+
+            std::filesystem::path resultFilePath{ binaryPath.get() };
+            return resultFilePath.parent_path();
         }
 
         std::unique_ptr<byte[]> GetPACKAGE_ID()
@@ -79,63 +119,25 @@ namespace AppInstaller::Runtime
             return Utility::ConvertToUTF8(packageId->name);
         }
 
-        // Gets the package version; only succeeds if running in a packaged context.
-        std::optional<PACKAGE_VERSION> GetPACKAGE_VERSION()
-        {
-            std::unique_ptr<byte[]> buffer = GetPACKAGE_ID();
-            if (!buffer)
-            {
-                return {};
-            }
-
-            PACKAGE_ID* packageId = reinterpret_cast<PACKAGE_ID*>(buffer.get());
-            return packageId->version;
-        }
-
 #ifndef AICLI_DISABLE_TEST_HOOKS
         static std::map<PathName, PathDetails> s_Path_TestHook_Overrides;
 #endif
 
-        std::filesystem::path GetKnownFolderPath(const KNOWNFOLDERID& id)
-        {
-            wil::unique_cotaskmem_string knownFolder = nullptr;
-            THROW_IF_FAILED(SHGetKnownFolderPath(id, KF_FLAG_NO_ALIAS | KF_FLAG_DONT_VERIFY | KF_FLAG_NO_PACKAGE_REDIRECTION, NULL, &knownFolder));
-            return knownFolder.get();
-        }
-
         // Gets the user's temp path
-        std::filesystem::path GetPathToUserTemp()
+        std::filesystem::path GetPathToUserTemp(bool forDisplay)
         {
-            wchar_t tempPath[MAX_PATH + 1];
-            DWORD tempChars = GetTempPathW(ARRAYSIZE(tempPath), tempPath);
-            THROW_LAST_ERROR_IF(!tempChars);
-            THROW_HR_IF(E_UNEXPECTED, tempChars > ARRAYSIZE(tempPath));
-            return { std::wstring_view{ tempPath, static_cast<size_t>(tempChars) } };
-        }
-
-        // Gets the path to the appdata root.
-        // *Only used by non packaged version!*
-        std::filesystem::path GetPathToAppDataRoot()
-        {
-            THROW_HR_IF(E_NOT_VALID_STATE, IsRunningInPackagedContext());
-
-            std::filesystem::path result = GetKnownFolderPath(FOLDERID_LocalAppData);
-            result /= "Microsoft/WinGet";
-
-            return result;
-        }
-
-        // Gets the path to the app data relative directory.
-        std::filesystem::path GetPathToAppDataDir(const std::filesystem::path& relative)
-        {
-            THROW_HR_IF(E_INVALIDARG, !relative.has_relative_path());
-            THROW_HR_IF(E_INVALIDARG, relative.has_root_path());
-            THROW_HR_IF(E_INVALIDARG, !relative.has_filename());
-
-            std::filesystem::path result = GetPathToAppDataRoot();
-            result /= relative;
-
-            return result;
+            if (forDisplay && Settings::User().Get<Setting::AnonymizePathForDisplay>())
+            {
+                return "%TEMP%";
+            }
+            else
+            {
+                wchar_t tempPath[MAX_PATH + 1];
+                DWORD tempChars = GetTempPathW(ARRAYSIZE(tempPath), tempPath);
+                THROW_LAST_ERROR_IF(!tempChars);
+                THROW_HR_IF(E_UNEXPECTED, tempChars > ARRAYSIZE(tempPath));
+                return { std::wstring_view{ tempPath, static_cast<size_t>(tempChars) } };
+            }
         }
 
         // Gets the current user's SID for use in paths.
@@ -165,173 +167,7 @@ namespace AppInstaller::Runtime
 
             return result;
         }
-
-        // If `source` begins with all of `prefix`, replace that with `replacement`.
-        void ReplaceCommonPathPrefix(std::filesystem::path& source, const std::filesystem::path& prefix, std::string_view replacement)
-        {
-            auto prefixItr = prefix.begin();
-            auto sourceItr = source.begin();
-
-            while (prefixItr != prefix.end() && sourceItr != source.end())
-            {
-                if (*prefixItr != *sourceItr)
-                {
-                    break;
-                }
-
-                ++prefixItr;
-                ++sourceItr;
-            }
-
-            // Only replace source if we found all of prefix
-            if (prefixItr == prefix.end())
-            {
-                std::filesystem::path temp{ replacement };
-
-                for (; sourceItr != source.end(); ++sourceItr)
-                {
-                    temp /= *sourceItr;
-                }
-
-                source = std::move(temp);
-            }
-        }
-
-        DWORD AccessPermissionsFrom(ACEPermissions permissions)
-        {
-            DWORD result = 0;
-
-            if (permissions == ACEPermissions::All)
-            {
-                result |= GENERIC_ALL;
-            }
-            else
-            {
-                if (WI_IsFlagSet(permissions, ACEPermissions::Read))
-                {
-                    result |= GENERIC_READ;
-                }
-
-                if (WI_IsFlagSet(permissions, ACEPermissions::Write))
-                {
-                    result |= GENERIC_WRITE | FILE_DELETE_CHILD;
-                }
-
-                if (WI_IsFlagSet(permissions, ACEPermissions::Execute))
-                {
-                    result |= GENERIC_EXECUTE;
-                }
-            }
-
-            return result;
-        }
-
-        // Contains the information about an ACE entry for a given principal.
-        struct ACEDetails
-        {
-            ACEPrincipal Principal;
-            PSID SID;
-            TRUSTEE_TYPE TrusteeType;
-        };
     }
-
-    bool IsRunningInPackagedContext()
-    {
-        static bool result = DoesCurrentProcessHaveIdentity();
-        return result;
-    }
-
-    LocIndString GetClientVersion()
-    {
-        using namespace std::string_literals;
-
-        // Major and minor come directly from version.h
-        std::ostringstream strstr;
-        strstr << VERSION_MAJOR << '.' << VERSION_MINOR << '.';
-
-        // Build comes from the package for now, if packaged.
-        if (IsRunningInPackagedContext())
-        {
-            auto version = GetPACKAGE_VERSION();
-
-            if (!version)
-            {
-                // In the extremely unlikely event of a failure, this is merely a sentinel value
-                // to indicated such.  The only other option is to completely prevent execution,
-                // which seems unnecessary.
-                return LocIndString{ "error"sv };
-            }
-
-            strstr << version->Build;
-        }
-        else
-        {
-            strstr << VERSION_BUILD;
-        }
-
-        if (!IsReleaseBuild())
-        {
-            strstr << s_PreviewBuildSuffix;
-        }
-
-        return LocIndString{ strstr.str() };
-    }
-
-    LocIndString GetPackageVersion()
-    {
-        using namespace std::string_literals;
-
-        if (IsRunningInPackagedContext())
-        {
-            auto version = GetPACKAGE_VERSION();
-
-            if (!version)
-            {
-                // In the extremely unlikely event of a failure, this is merely a sentinel value
-                // to indicated such.  The only other option is to completely prevent execution,
-                // which seems unnecessary.
-                return LocIndString{ "error"sv };
-            }
-
-            std::ostringstream strstr;
-            strstr << GetPackageName() << " v" << version->Major << '.' << version->Minor << '.' << version->Build << '.' << version->Revision;
-
-            return LocIndString{ strstr.str() };
-        }
-        else
-        {
-            // Calling code should avoid calling in when this is the case.
-            return LocIndString{ "none"sv };
-        }
-    }
-
-#ifndef WINGET_DISABLE_FOR_FUZZING
-    LocIndString GetOSVersion()
-    {
-        winrt::Windows::System::Profile::AnalyticsInfo analyticsInfo{};
-        auto versionInfo = analyticsInfo.VersionInfo();
-
-        uint64_t version = std::stoull(Utility::ConvertToUTF8(versionInfo.DeviceFamilyVersion()));
-        uint16_t parts[4];
-
-        for (size_t i = 0; i < ARRAYSIZE(parts); ++i)
-        {
-            parts[i] = version & 0xFFFF;
-            version = version >> 16;
-        }
-
-        std::ostringstream strstr;
-        strstr << Utility::ConvertToUTF8(versionInfo.DeviceFamily()) << " v" << parts[3] << '.' << parts[2] << '.' << parts[1] << '.' << parts[0];
-
-        return LocIndString{ strstr.str() };
-    }
-
-    std::string GetOSRegion()
-    {
-        winrt::Windows::Globalization::GeographicRegion region;
-        return Utility::ConvertToUTF8(region.CodeTwoLetter());
-    }
-#endif
 
     void SetRuntimePathStateName(std::string name)
     {
@@ -340,107 +176,19 @@ namespace AppInstaller::Runtime
         s_runtimePathStateName.emplace(std::move(suitablePathPart));
     }
 
-    void PathDetails::SetOwner(ACEPrincipal owner)
-    {
-        Owner = owner;
-        ACL[owner] = ACEPermissions::All;
-    }
-
-    bool PathDetails::ShouldApplyACL() const
-    {
-        // Could be expanded to actually check the current owner/ACL on the path, but isn't worth it currently
-        return !ACL.empty();
-    }
-
-    void PathDetails::ApplyACL() const
-    {
-        bool hasCurrentUser = ACL.count(ACEPrincipal::CurrentUser) != 0;
-        bool hasSystem = ACL.count(ACEPrincipal::System) != 0;
-
-        // Configuring permissions for both CurrentUser and SYSTEM while not having owner set as one of them is not valid because
-        // below we use only the owner permissions in the case of running as SYSTEM.
-        if ((hasCurrentUser && hasSystem) &&
-            (!Owner || (Owner.value() != ACEPrincipal::CurrentUser && Owner.value() != ACEPrincipal::System)))
-        {
-            THROW_HR(HRESULT_FROM_WIN32(ERROR_INVALID_STATE));
-        }
-
-        auto userToken = wil::get_token_information<TOKEN_USER>();
-        auto adminSID = wil::make_static_sid(SECURITY_NT_AUTHORITY, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS);
-        auto systemSID = wil::make_static_sid(SECURITY_NT_AUTHORITY, SECURITY_LOCAL_SYSTEM_RID);
-        PSID ownerSID = nullptr;
-
-        ACEDetails aceDetails[] =
-        {
-            { ACEPrincipal::CurrentUser, userToken->User.Sid, TRUSTEE_IS_USER },
-            { ACEPrincipal::Admins, adminSID.get(), TRUSTEE_IS_WELL_KNOWN_GROUP},
-            { ACEPrincipal::System, systemSID.get(), TRUSTEE_IS_USER},
-        };
-
-        ULONG entriesCount = 0;
-        std::array<EXPLICIT_ACCESS_W, ARRAYSIZE(aceDetails)> explicitAccess;
-
-        // If the current user is SYSTEM, we want to take either the owner or the only configured set of permissions.
-        // The check above should prevent us from getting into situations outside of the ones below.
-        std::optional<ACEPrincipal> principalToIgnore;
-        if (hasCurrentUser && hasSystem && EqualSid(userToken->User.Sid, systemSID.get()))
-        {
-            principalToIgnore = (Owner.value() == ACEPrincipal::CurrentUser ? ACEPrincipal::System : ACEPrincipal::CurrentUser);
-        }
-
-        for (const auto& ace : aceDetails)
-        {
-            if (principalToIgnore && principalToIgnore.value() == ace.Principal)
-            {
-                continue;
-            }
-
-            if (Owner && Owner.value() == ace.Principal)
-            {
-                ownerSID = ace.SID;
-            }
-
-            auto itr = ACL.find(ace.Principal);
-            if (itr != ACL.end())
-            {
-                EXPLICIT_ACCESS_W& entry = explicitAccess[entriesCount++];
-                entry = {};
-
-                entry.grfAccessPermissions = AccessPermissionsFrom(itr->second);
-                entry.grfAccessMode = SET_ACCESS;
-                entry.grfInheritance = CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE;
-
-                entry.Trustee.pMultipleTrustee = nullptr;
-                entry.Trustee.MultipleTrusteeOperation = NO_MULTIPLE_TRUSTEE;
-                entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
-                entry.Trustee.TrusteeType = ace.TrusteeType;
-                entry.Trustee.ptstrName = reinterpret_cast<LPWCH>(ace.SID);
-            }
-        }
-
-        wil::unique_any<PACL, decltype(&::LocalFree), ::LocalFree> acl;
-        THROW_IF_WIN32_ERROR(SetEntriesInAclW(entriesCount, explicitAccess.data(), nullptr, &acl));
-
-        std::wstring path = Path.wstring();
-        SECURITY_INFORMATION securityInformation = DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION;
-
-        if (ownerSID)
-        {
-            securityInformation |= OWNER_SECURITY_INFORMATION;
-        }
-
-        THROW_IF_WIN32_ERROR(SetNamedSecurityInfoW(&path[0], SE_FILE_OBJECT, securityInformation, ownerSID, nullptr, acl.get(), nullptr));
-    }
-
     // Contains all of the paths that are common between the runtime contexts.
-    PathDetails GetPathDetailsCommon(PathName path)
+    PathDetails GetPathDetailsCommon(PathName path, bool forDisplay)
     {
         PathDetails result;
+        // We should not create directories by default when they are retrieved for display purposes.
+        result.Create = !forDisplay;
+
+        bool mayBeInProfilePath = false;
 
         switch (path)
         {
         case PathName::UserProfile:
-            result.Path = GetKnownFolderPath(FOLDERID_Profile);
+            result.Path = (forDisplay && Settings::User().Get<Setting::AnonymizePathForDisplay>()) ? s_UserProfileEnvironmentVariable : GetKnownFolderPath(FOLDERID_Profile);
             result.Create = false;
             break;
         case PathName::PortablePackageUserRoot:
@@ -452,12 +200,13 @@ namespace AppInstaller::Runtime
                 result.Path /= s_PortablePackageRoot;
                 result.Path /= s_PortablePackagesDirectory;
             }
+            mayBeInProfilePath = true;
             break;
-        case PathName::PortablePackageMachineRootX64:
+        case PathName::PortablePackageMachineRoot:
             result.Path = Settings::User().Get<Setting::PortablePackageMachineRoot>();
             if (result.Path.empty())
             {
-                result.Path = GetKnownFolderPath(FOLDERID_ProgramFilesX64);
+                result.Path = GetKnownFolderPath(FOLDERID_ProgramFiles);
                 result.Path /= s_PortablePackageRoot;
                 result.Path /= s_PortablePackagesDirectory;
             }
@@ -476,47 +225,80 @@ namespace AppInstaller::Runtime
             result.Path /= s_PortablePackageUserRoot_Base;
             result.Path /= s_PortablePackageRoot;
             result.Path /= s_LinksDirectory;
+            mayBeInProfilePath = true;
             break;
         case PathName::PortableLinksMachineLocation:
             result.Path = GetKnownFolderPath(FOLDERID_ProgramFiles);
             result.Path /= s_PortablePackageRoot;
             result.Path /= s_LinksDirectory;
             break;
+        case PathName::UserProfileDownloads:
+            result.Path = GetKnownFolderPath(FOLDERID_Downloads);
+            mayBeInProfilePath = true;
+            break;
+        case PathName::FontsUserInstallLocation:
+            result.Path = GetKnownFolderPath(FOLDERID_LocalAppData);
+            result.Path /= s_FontsInstallDirectory;
+            mayBeInProfilePath = true;
+            break;
+        case PathName::FontsMachineInstallLocation:
+            result.Path = GetKnownFolderPath(FOLDERID_Fonts);
+            break;
+        case PathName::ConfigurationModules:
+            result.Path = Settings::User().Get<Setting::ConfigureDefaultModuleRoot>();
+            if (result.Path.empty())
+            {
+                result.Path = GetKnownFolderPath(FOLDERID_LocalAppData);
+                result.Path /= s_SecureSettings_Base;
+                result.Path /= s_ConfigurationModulesDirectory;
+            }
+            mayBeInProfilePath = true;
+            break;
         default:
             THROW_HR(E_UNEXPECTED);
+        }
+
+        if (mayBeInProfilePath && forDisplay && Settings::User().Get<Setting::AnonymizePathForDisplay>())
+        {
+            ReplaceProfilePathsWithEnvironmentVariable(result.Path);
         }
 
         return result;
     }
 
 #ifndef WINGET_DISABLE_FOR_FUZZING
-    PathDetails GetPathDetailsForPackagedContext(PathName path)
+    PathDetails GetPathDetailsForPackagedContext(PathName path, bool forDisplay)
     {
         PathDetails result;
+        // We should not create directories by default when they are retrieved for display purposes.
+        result.Create = !forDisplay;
 
         auto appStorage = winrt::Windows::Storage::ApplicationData::Current();
+        bool mayBeInProfilePath = false;
 
         switch (path)
         {
         case PathName::Temp:
-            result.Path = GetPathToUserTemp() / s_DefaultTempDirectory;
+            result.Path = GetPathToUserTemp(forDisplay) / s_DefaultTempDirectory;
             result.SetOwner(ACEPrincipal::CurrentUser);
             result.ACL[ACEPrincipal::System] = ACEPermissions::All;
+            result.ACL[ACEPrincipal::Admins] = ACEPermissions::All;
             break;
         case PathName::LocalState:
         case PathName::UserFileSettings:
             result.Path.assign(appStorage.LocalFolder().Path().c_str());
+            mayBeInProfilePath = true;
+            break;
+        case PathName::StandardFileSettings:
+            result.Path.assign(appStorage.LocalFolder().Path().c_str());
+            result.Path /= s_SettingsFile_Relative;
+            mayBeInProfilePath = true;
             break;
         case PathName::DefaultLogLocation:
-        case PathName::DefaultLogLocationForDisplay:
             // To enable UIF collection through Feedback hub, we must put our logs here.
             result.Path.assign(appStorage.LocalFolder().Path().c_str());
             result.Path /= WINGET_DEFAULT_LOG_DIRECTORY;
-
-            if (path == PathName::DefaultLogLocationForDisplay)
-            {
-                ReplaceCommonPathPrefix(result.Path, GetKnownFolderPath(FOLDERID_LocalAppData), "%LOCALAPPDATA%");
-            }
+            mayBeInProfilePath = true;
             break;
         case PathName::StandardSettings:
             result.Create = false;
@@ -532,7 +314,12 @@ namespace AppInstaller::Runtime
             if (path == PathName::SecureSettingsForWrite)
             {
                 result.SetOwner(ACEPrincipal::Admins);
-                result.ACL[ACEPrincipal::CurrentUser] = ACEPermissions::ReadExecute;
+                // When running as system, we do not set current user permissions to avoid permission conflicts.
+                if (!IsRunningAsSystem())
+                {
+                    result.ACL[ACEPrincipal::CurrentUser] = ACEPermissions::ReadExecute;
+                }
+                result.ACL[ACEPrincipal::System] = ACEPermissions::All;
             }
             else
             {
@@ -540,56 +327,103 @@ namespace AppInstaller::Runtime
             }
             break;
         case PathName::UserProfile:
-        case PathName::PortablePackageUserRoot:
-        case PathName::PortablePackageMachineRootX64:
+        case PathName::PortablePackageMachineRoot:
         case PathName::PortablePackageMachineRootX86:
-        case PathName::PortableLinksUserLocation:
         case PathName::PortableLinksMachineLocation:
-            result = GetPathDetailsCommon(path);
+        case PathName::PortableLinksUserLocation:
+        case PathName::PortablePackageUserRoot:
+        case PathName::UserProfileDownloads:
+        case PathName::FontsUserInstallLocation:
+        case PathName::FontsMachineInstallLocation:
+        case PathName::ConfigurationModules:
+            result = GetPathDetailsCommon(path, forDisplay);
+            break;
+        case PathName::SelfPackageRoot:
+        case PathName::ImageAssets:
+            result.Path = GetPackagePath();
+            result.Create = false;
+            if (path == PathName::ImageAssets)
+            {
+                result.Path /= s_ImageAssetsDirectoryRelative;
+            }
+            break;
+        case PathName::CheckpointsLocation:
+            result = GetPathDetailsForPackagedContext(PathName::LocalState, forDisplay);
+            result.Path /= s_CheckpointsDirectory;
+            break;
+        case PathName::CLIExecutable:
+        case PathName::MCPExecutable:
+            result.Path = GetKnownFolderPath(FOLDERID_LocalAppData);
+            result.Path /= s_WindowsApps_Base;
+            result.Path /= GetPackageFamilyName();
+
+            if (path == PathName::CLIExecutable)
+            {
+#if USE_PROD_CLSIDS
+                result.Path /= s_WinGet_Exe;
+#else
+                result.Path /= s_WinGetDev_Exe;
+#endif
+            }
+            else if (path == PathName::MCPExecutable)
+            {
+#if USE_PROD_CLSIDS
+                result.Path /= s_WinGetMCP_Exe;
+#else
+                result.Path /= s_WinGetMCPDev_Exe;
+#endif
+            }
+
+            result.Create = false;
+            mayBeInProfilePath = true;
             break;
         default:
             THROW_HR(E_UNEXPECTED);
+        }
+
+        if (mayBeInProfilePath && forDisplay && Settings::User().Get<Setting::AnonymizePathForDisplay>())
+        {
+            ReplaceProfilePathsWithEnvironmentVariable(result.Path);
         }
 
         return result;
     }
 #endif
 
-    PathDetails GetPathDetailsForUnpackagedContext(PathName path)
+    PathDetails GetPathDetailsForUnpackagedContext(PathName path, bool forDisplay)
     {
         PathDetails result;
+        // We should not create directories by default when they are retrieved for display purposes.
+        result.Create = !forDisplay;
+        bool anonymize = forDisplay && Settings::User().Get<Setting::AnonymizePathForDisplay>();
 
         switch (path)
         {
         case PathName::Temp:
         case PathName::DefaultLogLocation:
         {
-            result.Path = GetPathToUserTemp();
+            result.Path = GetPathToUserTemp(forDisplay);
             result.Path /= s_DefaultTempDirectory;
             result.Path /= GetRuntimePathStateName();
             if (path == PathName::Temp)
             {
                 result.SetOwner(ACEPrincipal::CurrentUser);
                 result.ACL[ACEPrincipal::System] = ACEPermissions::All;
+                result.ACL[ACEPrincipal::Admins] = ACEPermissions::All;
             }
         }
         break;
-        case PathName::DefaultLogLocationForDisplay:
-            result.Path.assign("%TEMP%");
-            result.Path /= s_DefaultTempDirectory;
-            result.Path /= GetRuntimePathStateName();
-            result.Create = false;
-            break;
         case PathName::LocalState:
-            result.Path = GetPathToAppDataDir(s_AppDataDir_State);
+            result = Filesystem::GetPathDetailsFor(Filesystem::PathName::UnpackagedLocalStateRoot, anonymize);
+            result.Create = !forDisplay;
             result.Path /= GetRuntimePathStateName();
-            result.SetOwner(ACEPrincipal::CurrentUser);
             break;
         case PathName::StandardSettings:
+        case PathName::StandardFileSettings:
         case PathName::UserFileSettings:
-            result.Path = GetPathToAppDataDir(s_AppDataDir_Settings);
+            result = Filesystem::GetPathDetailsFor(Filesystem::PathName::UnpackagedSettingsRoot, anonymize);
+            result.Create = !forDisplay;
             result.Path /= GetRuntimePathStateName();
-            result.SetOwner(ACEPrincipal::CurrentUser);
             break;
         case PathName::SecureSettingsForRead:
         case PathName::SecureSettingsForWrite:
@@ -602,7 +436,12 @@ namespace AppInstaller::Runtime
             if (path == PathName::SecureSettingsForWrite)
             {
                 result.SetOwner(ACEPrincipal::Admins);
-                result.ACL[ACEPrincipal::CurrentUser] = ACEPermissions::ReadExecute;
+                // When running as system, we do not set current user permissions to avoid permission conflicts.
+                if (!IsRunningAsSystem())
+                {
+                    result.ACL[ACEPrincipal::CurrentUser] = ACEPermissions::ReadExecute;
+                }
+                result.ACL[ACEPrincipal::System] = ACEPermissions::All;
             }
             else
             {
@@ -610,12 +449,43 @@ namespace AppInstaller::Runtime
             }
             break;
         case PathName::UserProfile:
-        case PathName::PortablePackageUserRoot:
-        case PathName::PortablePackageMachineRootX64:
+        case PathName::PortablePackageMachineRoot:
         case PathName::PortablePackageMachineRootX86:
-        case PathName::PortableLinksUserLocation:
         case PathName::PortableLinksMachineLocation:
-            result = GetPathDetailsCommon(path);
+        case PathName::PortableLinksUserLocation:
+        case PathName::PortablePackageUserRoot:
+        case PathName::UserProfileDownloads:
+        case PathName::FontsUserInstallLocation:
+        case PathName::FontsMachineInstallLocation:
+        case PathName::ConfigurationModules:
+            result = GetPathDetailsCommon(path, forDisplay);
+            break;
+        case PathName::SelfPackageRoot:
+        case PathName::CLIExecutable:
+        case PathName::MCPExecutable:
+        case PathName::ImageAssets:
+            result.Path = GetBinaryDirectoryPath();
+            result.Create = false;
+            if (path == PathName::CLIExecutable)
+            {
+                result.Path /= s_WinGet_Exe;
+            }
+            else if (path == PathName::MCPExecutable)
+            {
+                result.Path /= s_WinGetMCP_Exe;
+            }
+            else if (path == PathName::ImageAssets)
+            {
+                result.Path /= s_ImageAssetsDirectoryRelative;
+                if (!std::filesystem::is_directory(result.Path))
+                {
+                    result.Path.clear();
+                }
+            }
+            break;
+        case PathName::CheckpointsLocation:
+            result = GetPathDetailsForUnpackagedContext(PathName::LocalState, forDisplay);
+            result.Path /= s_CheckpointsDirectory;
             break;
         default:
             THROW_HR(E_UNEXPECTED);
@@ -624,19 +494,19 @@ namespace AppInstaller::Runtime
         return result;
     }
 
-    PathDetails GetPathDetailsFor(PathName path)
+    PathDetails GetPathDetailsFor(PathName path, bool forDisplay)
     {
         PathDetails result;
 
 #ifndef WINGET_DISABLE_FOR_FUZZING
         if (IsRunningInPackagedContext())
         {
-            result = GetPathDetailsForPackagedContext(path);
+            result = GetPathDetailsForPackagedContext(path, forDisplay);
         }
         else
 #endif
         {
-            result = GetPathDetailsForUnpackagedContext(path);
+            result = GetPathDetailsForUnpackagedContext(path, forDisplay);
         }
 
 #ifndef AICLI_DISABLE_TEST_HOOKS
@@ -651,36 +521,13 @@ namespace AppInstaller::Runtime
         return result;
     }
 
-    std::filesystem::path GetPathTo(PathName path)
+    // Try to replace LOCALAPPDATA first as it is the likely location, fall back to trying USERPROFILE.
+    void ReplaceProfilePathsWithEnvironmentVariable(std::filesystem::path& path)
     {
-        PathDetails details = GetPathDetailsFor(path);
-
-        if (details.Create)
+        if (!ReplaceCommonPathPrefix(path, GetKnownFolderPath(FOLDERID_LocalAppData), s_LocalAppDataEnvironmentVariable))
         {
-            if (details.Path.is_absolute())
-            {
-                if (std::filesystem::exists(details.Path) && !std::filesystem::is_directory(details.Path))
-                {
-                    std::filesystem::remove(details.Path);
-                }
-
-                std::filesystem::create_directories(details.Path);
-
-                // Set the ACLs on the directory if needed. We do this after creating the directory because an attacker could
-                // have created the directory beforehand so we must be able to place the correct ACL on any directory or fail
-                // to operate.
-                if (details.ShouldApplyACL())
-                {
-                    details.ApplyACL();
-                }
-            }
-            else
-            {
-                AICLI_LOG(Core, Warning, << "GetPathTo directory creation requested for [" << path << "], but path was not absolute: " << details.Path);
-            }
+            ReplaceCommonPathPrefix(path, GetKnownFolderPath(FOLDERID_Profile), s_UserProfileEnvironmentVariable);
         }
-
-        return std::move(details.Path);
     }
 
     std::filesystem::path GetNewTempFilePath()
@@ -693,45 +540,6 @@ namespace AppInstaller::Runtime
         tempFilePath /= tempFileName;
 
         return tempFilePath;
-    }
-
-    bool IsCurrentOSVersionGreaterThanOrEqual(const Utility::Version& version)
-    {
-        DWORD versionParts[3] = {};
-
-        for (size_t i = 0; i < ARRAYSIZE(versionParts) && i < version.GetParts().size(); ++i)
-        {
-            versionParts[i] = static_cast<DWORD>(std::min(static_cast<decltype(version.GetParts()[i].Integer)>(std::numeric_limits<DWORD>::max()), version.GetParts()[i].Integer));
-        }
-
-        OSVERSIONINFOEXW osVersionInfo{};
-        osVersionInfo.dwOSVersionInfoSize = sizeof(osVersionInfo);
-        osVersionInfo.dwMajorVersion = versionParts[0];
-        osVersionInfo.dwMinorVersion = versionParts[1];
-        osVersionInfo.dwBuildNumber = versionParts[2];
-        osVersionInfo.wServicePackMajor = 0;
-        osVersionInfo.wServicePackMinor = 0;
-
-        DWORD mask = VER_MAJORVERSION | VER_MINORVERSION | VER_BUILDNUMBER | VER_SERVICEPACKMAJOR | VER_SERVICEPACKMINOR;
-
-        DWORDLONG conditions = 0;
-        VER_SET_CONDITION(conditions, VER_MAJORVERSION, VER_GREATER_EQUAL);
-        VER_SET_CONDITION(conditions, VER_MINORVERSION, VER_GREATER_EQUAL);
-        VER_SET_CONDITION(conditions, VER_BUILDNUMBER, VER_GREATER_EQUAL);
-        VER_SET_CONDITION(conditions, VER_SERVICEPACKMAJOR, VER_GREATER_EQUAL);
-        VER_SET_CONDITION(conditions, VER_SERVICEPACKMINOR, VER_GREATER_EQUAL);
-
-        BOOL result = VerifyVersionInfoW(&osVersionInfo, mask, conditions);
-        if (!result)
-        {
-            THROW_LAST_ERROR_IF(GetLastError() != ERROR_OLD_WIN_VERSION);
-        }
-        return !!result;
-    }
-
-    bool IsRunningAsAdmin()
-    {
-        return wil::test_token_membership(nullptr, SECURITY_NT_AUTHORITY, SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS);
     }
 
     // Determines whether developer mode is enabled.
@@ -750,22 +558,25 @@ namespace AppInstaller::Runtime
         }
     }
 
-    constexpr bool IsReleaseBuild()
-    {
-#ifdef WINGET_ENABLE_RELEASE_BUILD
-        return true;
-#else
-        return false;
-#endif
-    }
-
     // Using "standard" user agent format
     // Keeping `winget-cli` for historical reasons
     Utility::LocIndString GetDefaultUserAgent()
     {
         std::ostringstream strstr;
         strstr <<
-            "winget-cli"
+            "winget-cli" <<
+            " WindowsPackageManager/" << GetClientVersion() <<
+            " DesktopAppInstaller/" << GetPackageVersion();
+        return Utility::LocIndString{ strstr.str() };
+    }
+
+    Utility::LocIndString GetUserAgent(std::string_view caller)
+    {
+        auto escapedCaller = winrt::Windows::Foundation::Uri::EscapeComponent(Utility::ConvertToUTF16(caller));
+
+        std::ostringstream strstr;
+        strstr <<
+            Utility::ConvertToUTF8(escapedCaller) <<
             " WindowsPackageManager/" << GetClientVersion() <<
             " DesktopAppInstaller/" << GetPackageVersion();
         return Utility::LocIndString{ strstr.str() };

@@ -23,7 +23,7 @@ namespace AppInstaller::CLI::Workflow
         auto currentSources = Repository::Source::GetCurrentSources();
         if (context.Args.Contains(Args::Type::SourceName))
         {
-            std::string_view name = context.Args.GetArg(Args::Type::SourceName);
+            auto name = Utility::LocIndString{ context.Args.GetArg(Args::Type::SourceName) };
 
             for (auto const& source : currentSources)
             {
@@ -36,7 +36,7 @@ namespace AppInstaller::CLI::Workflow
                 }
             }
 
-            context.Reporter.Error() << Resource::String::SourceListNoneFound << ' ' << name << std::endl;
+            context.Reporter.Error() << Resource::String::SourceListNoneFound(name) << std::endl;
             AICLI_TERMINATE_CONTEXT(APPINSTALLER_CLI_ERROR_SOURCE_NAME_DOES_NOT_EXIST);
         }
         else
@@ -51,6 +51,18 @@ namespace AppInstaller::CLI::Workflow
         std::string_view name = context.Args.GetArg(Args::Type::SourceName);
         std::string_view arg = context.Args.GetArg(Args::Type::SourceArg);
         std::string_view type = context.Args.GetArg(Args::Type::SourceType);
+
+        // In the absence of a specified type, the default is Microsoft.PreIndexed.Package for comparison.
+        // The default type assignment to the source takes place during the add operation (Source::Add in Repository.cpp).
+        // This is necessary for the comparison to function correctly; otherwise, it would allow the addition of multiple
+        // sources with different names but the same argument for all default type cases.
+        // For example, the following commands would be allowed, but they acts as different alias to same source:
+        //      winget source add "mysource1" "https:\\mysource" --trust - level trusted
+        //      winget source add "mysource2" "https:\\mysource" --trust - level trusted
+        if (type.empty())
+        {
+            type = Repository::Source::GetDefaultSourceType();
+        }
 
         for (const auto& details : sourceList)
         {
@@ -108,7 +120,26 @@ namespace AppInstaller::CLI::Workflow
             std::string_view arg = context.Args.GetArg(Args::Type::SourceArg);
             std::string_view type = context.Args.GetArg(Args::Type::SourceType);
 
-            Repository::Source sourceToAdd{ name, arg, type };
+            Repository::SourceTrustLevel trustLevel = Repository::SourceTrustLevel::None;
+            if (context.Args.Contains(Execution::Args::Type::SourceTrustLevel))
+            {
+                std::vector<std::string> trustLevelArgs = Utility::Split(std::string{ context.Args.GetArg(Execution::Args::Type::SourceTrustLevel) }, '|', true);
+                trustLevel = Repository::ConvertToSourceTrustLevelFlag(trustLevelArgs);
+            }
+
+            Repository::SourceEdit additionalProperties;
+
+            if (context.Args.Contains(Args::Type::SourceExplicit))
+            {
+                additionalProperties.Explicit = true;
+            }
+
+            if (context.Args.Contains(Args::Type::SourcePriority))
+            {
+                additionalProperties.Priority = Utility::TryConvertStringToInt32(context.Args.GetArg(Args::Type::SourcePriority));
+            }
+
+            Repository::Source sourceToAdd{ name, arg, type, trustLevel, additionalProperties};
 
             if (context.Args.Contains(Execution::Args::Type::CustomHeader))
             {
@@ -117,6 +148,12 @@ namespace AppInstaller::CLI::Workflow
                 {
                     context.Reporter.Warn() << Resource::String::HeaderArgumentNotApplicableForNonRestSourceWarning << std::endl;
                 }
+            }
+
+            if (sourceToAdd.GetInformation().Authentication.Type == Authentication::AuthenticationType::Unknown)
+            {
+                context.Reporter.Error() << Resource::String::SourceAddFailedAuthenticationNotSupported << std::endl;
+                AICLI_TERMINATE_CONTEXT(APPINSTALLER_CLI_ERROR_AUTHENTICATION_TYPE_NOT_SUPPORTED);
             }
 
             context << Workflow::HandleSourceAgreements(sourceToAdd);
@@ -145,24 +182,27 @@ namespace AppInstaller::CLI::Workflow
 
             Execution::TableOutput<2> table(context.Reporter, { Resource::String::SourceListField, Resource::String::SourceListValue });
 
-            table.OutputLine({ Resource::Loader::Instance().ResolveString(Resource::String::SourceListName), source.Name });
-            table.OutputLine({ Resource::Loader::Instance().ResolveString(Resource::String::SourceListType), source.Type });
-            table.OutputLine({ Resource::Loader::Instance().ResolveString(Resource::String::SourceListArg), source.Arg });
-            table.OutputLine({ Resource::Loader::Instance().ResolveString(Resource::String::SourceListData), source.Data });
-            table.OutputLine({ Resource::Loader::Instance().ResolveString(Resource::String::SourceListIdentifier), source.Identifier });
+            table.OutputLine({ Resource::LocString(Resource::String::SourceListName), source.Name });
+            table.OutputLine({ Resource::LocString(Resource::String::SourceListType), source.Type });
+            table.OutputLine({ Resource::LocString(Resource::String::SourceListArg), source.Arg });
+            table.OutputLine({ Resource::LocString(Resource::String::SourceListData), source.Data });
+            table.OutputLine({ Resource::LocString(Resource::String::SourceListIdentifier), source.Identifier });
+            table.OutputLine({ Resource::LocString(Resource::String::SourceListTrustLevel), Repository::GetSourceTrustLevelForDisplay(source.TrustLevel)});
+            table.OutputLine({ Resource::LocString(Resource::String::SourceListExplicit), std::string{ Utility::ConvertBoolToString(source.Explicit) } });
+            table.OutputLine({ Resource::LocString(Resource::String::SourceListPriority), std::to_string(source.Priority) });
 
             if (source.LastUpdateTime == Utility::ConvertUnixEpochToSystemClock(0))
             {
                 table.OutputLine({
-                    Resource::Loader::Instance().ResolveString(Resource::String::SourceListUpdated),
-                    Resource::Loader::Instance().ResolveString(Resource::String::SourceListUpdatedNever)
+                    Resource::LocString(Resource::String::SourceListUpdated),
+                    Resource::LocString(Resource::String::SourceListUpdatedNever)
                     });
             }
             else
             {
                 std::ostringstream strstr;
                 strstr << source.LastUpdateTime;
-                table.OutputLine({ Resource::Loader::Instance().ResolveString(Resource::String::SourceListUpdated), strstr.str() });
+                table.OutputLine({ Resource::LocString(Resource::String::SourceListUpdated), strstr.str() });
             }
 
             table.Complete();
@@ -175,10 +215,10 @@ namespace AppInstaller::CLI::Workflow
             }
             else
             {
-                Execution::TableOutput<2> table(context.Reporter, { Resource::String::SourceListName, Resource::String::SourceListArg });
+                Execution::TableOutput<3> table(context.Reporter, { Resource::String::SourceListName, Resource::String::SourceListArg, Resource::String::SourceListExplicit });
                 for (const auto& source : sources)
                 {
-                    table.OutputLine({ source.Name, source.Arg });
+                    table.OutputLine({ source.Name, source.Arg, std::string{ Utility::ConvertBoolToString(source.Explicit) }});
                 }
                 table.Complete();
             }
@@ -193,14 +233,23 @@ namespace AppInstaller::CLI::Workflow
         }
 
         const std::vector<Repository::SourceDetails>& sources = context.Get<Data::SourceList>();
+
         for (const auto& sd : sources)
         {
             Repository::Source source{ sd.Name };
-            context.Reporter.Info() << Resource::String::SourceUpdateOne << ' ' << sd.Name << "..."_liv << std::endl;
+            context.Reporter.Info() << Resource::String::SourceUpdateOne(Utility::LocIndView{ sd.Name }) << std::endl;
             auto updateFunction = [&](IProgressCallback& progress)->std::vector<Repository::SourceDetails> { return source.Update(progress); };
-            if (!context.Reporter.ExecuteWithProgress(updateFunction).empty())
+            auto sourceDetails = context.Reporter.ExecuteWithProgress(updateFunction);
+            if (!sourceDetails.empty())
             {
-                context.Reporter.Info() << Resource::String::Cancelled << std::endl;
+                if (std::chrono::system_clock::now() < sourceDetails[0].DoNotUpdateBefore)
+                {
+                    context.Reporter.Warn() << Resource::String::Unavailable << std::endl;
+                }
+                else
+                {
+                    context.Reporter.Info() << Resource::String::Cancelled << std::endl;
+                }
             }
             else
             {
@@ -222,7 +271,7 @@ namespace AppInstaller::CLI::Workflow
         for (const auto& sd : sources)
         {
             Repository::Source source{ sd.Name };
-            context.Reporter.Info() << Resource::String::SourceRemoveOne << ' ' << sd.Name << "..."_liv << std::endl;
+            context.Reporter.Info() << Resource::String::SourceRemoveOne(Utility::LocIndView{ sd.Name }) << std::endl;
             auto removeFunction = [&](IProgressCallback& progress)->bool { return source.Remove(progress); };
             if (context.Reporter.ExecuteWithProgress(removeFunction))
             {
@@ -232,6 +281,56 @@ namespace AppInstaller::CLI::Workflow
             {
                 context.Reporter.Info() << Resource::String::Cancelled << std::endl;
             }
+        }
+    }
+
+    void EditSources(Execution::Context& context)
+    {
+        // We are assuming there is only one match, as SourceName is a required parameter.
+        const std::vector<Repository::SourceDetails>& sources = context.Get<Data::SourceList>();
+
+        for (const auto& sd : sources)
+        {
+            // Get the current source with this name.
+            Repository::Source targetSource{ sd.Name };
+            auto oldExplicitValue = sd.Explicit;
+            auto oldPriorityValue = sd.Priority;
+
+            Repository::SourceEdit edits;
+
+            if (context.Args.Contains(Execution::Args::Type::SourceEditExplicit))
+            {
+                edits.Explicit = Utility::TryConvertStringToBool(context.Args.GetArg(Execution::Args::Type::SourceEditExplicit));
+            }
+
+            if (context.Args.Contains(Execution::Args::Type::SourcePriority))
+            {
+                edits.Priority = Utility::TryConvertStringToInt32(context.Args.GetArg(Execution::Args::Type::SourcePriority));
+            }
+
+            if (!targetSource.RequiresChanges(edits))
+            {
+                context.Reporter.Info() << Resource::String::SourceEditNoChanges(Utility::LocIndView{ sd.Name }) << std::endl;
+                continue;
+            }
+
+            context.Reporter.Info() << Resource::String::SourceEditOne(Utility::LocIndView{ sd.Name }) << std::endl;
+            targetSource.Edit(edits);
+
+            // Output changed source information table. The name of the source being edited is listed prior to the edits.
+            Execution::TableOutput<3> table(context.Reporter, { Resource::String::SourceListField, Resource::String::SourceEditOldValue, Resource::String::SourceEditNewValue });
+
+            if (edits.Explicit)
+            {
+                table.OutputLine({ Resource::LocString(Resource::String::SourceListExplicit), std::string{ Utility::ConvertBoolToString(oldExplicitValue) }, std::string{ Utility::ConvertBoolToString(edits.Explicit.value()) } });
+            }
+
+            if (edits.Priority)
+            {
+                table.OutputLine({ Resource::LocString(Resource::String::SourceListPriority), std::to_string(oldPriorityValue), std::to_string(edits.Priority.value()) });
+            }
+
+            table.Complete();
         }
     }
 
@@ -258,10 +357,24 @@ namespace AppInstaller::CLI::Workflow
 
         for (const auto& source : sources)
         {
-            context.Reporter.Info() << Resource::String::SourceResetOne << ' ' << source.Name << "..."_liv;
+            context.Reporter.Info() << Resource::String::SourceResetOne(Utility::LocIndView{ source.Name });
             Repository::Source::DropSource(source.Name);
             context.Reporter.Info() << Resource::String::Done << std::endl;
         }
+    }
+
+    void ResetNamedSource(Execution::Context& context)
+    {
+        std::string_view name = context.Args.GetArg(Args::Type::SourceName);
+
+        context.Reporter.Info() << Resource::String::SourceResetOne(Utility::LocIndView{ name }) << std::endl;
+        if (!Repository::Source::DropSource(name))
+        {
+            context.Reporter.Error() << Resource::String::SourceListNoneFound(Utility::LocIndView{ name }) << std::endl;
+            AICLI_TERMINATE_CONTEXT(APPINSTALLER_CLI_ERROR_SOURCE_NAME_DOES_NOT_EXIST);
+        }
+
+        context.Reporter.Info() << Resource::String::Done << std::endl;
     }
 
     void ResetAllSources(Execution::Context& context)
@@ -289,8 +402,21 @@ namespace AppInstaller::CLI::Workflow
                 s.Arg = source.Arg;
                 s.Data = source.Data;
                 s.Identifier = source.Identifier;
+
+                std::vector<std::string_view> sourceTrustLevels = Repository::SourceTrustLevelFlagToList(source.TrustLevel);
+                s.TrustLevel = std::vector<std::string>(sourceTrustLevels.begin(), sourceTrustLevels.end());
+                s.Explicit = source.Explicit;
+
+                s.Priority = source.Priority;
+
                 context.Reporter.Info() << s.ToJsonString() << std::endl;
             }
         }
+    }
+
+    void ForceInstalledCacheUpdate(Execution::Context&)
+    {
+        // Creating this object is currently sufficient to mark the cache as needing an update for the next time it is opened.
+        Repository::Source ignore{ Repository::PredefinedSource::InstalledForceCacheUpdate };
     }
 }

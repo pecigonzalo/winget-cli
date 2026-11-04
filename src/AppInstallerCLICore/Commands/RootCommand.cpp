@@ -2,6 +2,7 @@
 // Licensed under the MIT License.
 #include "pch.h"
 #include "RootCommand.h"
+#include <AppInstallerRuntime.h>
 
 #include "InstallCommand.h"
 #include "ShowCommand.h"
@@ -14,18 +15,30 @@
 #include "ValidateCommand.h"
 #include "SettingsCommand.h"
 #include "FeaturesCommand.h"
+#include "FontCommand.h"
 #include "ExperimentalCommand.h"
 #include "CompleteCommand.h"
 #include "ExportCommand.h"
 #include "ImportCommand.h"
+#include "PinCommand.h"
+#include "ConfigureCommand.h"
+#include "DebugCommand.h"
+#include "TestCommand.h"
+#include "DownloadCommand.h"
+#include "ErrorCommand.h"
+#include "ResumeCommand.h"
+#include "RepairCommand.h"
+#include "DscCommand.h"
+#include "McpCommand.h"
 
 #include "Resources.h"
 #include "TableOutput.h"
 
-using namespace AppInstaller::Utility::literals;
-
 namespace AppInstaller::CLI
 {
+    using namespace AppInstaller::Utility::literals;
+    using namespace Settings;
+
     namespace
     {
         void OutputGroupPolicySourceList(Execution::Context& context, const std::vector<Settings::SourceFromPolicy>& sources, Resource::StringId header)
@@ -64,7 +77,7 @@ namespace AppInstaller::CLI
                 auto info = context.Reporter.Info();
                 info << std::endl;
 
-                Execution::TableOutput<2> policiesTable{ context.Reporter, { Resource::String::PoliciesPolicy, Resource::String::PoliciesState } };
+                Execution::TableOutput<2> policiesTable{ context.Reporter, { Resource::String::PoliciesPolicy, Resource::String::StateHeader } };
 
                 // Output the toggle policies.
                 for (const auto& activePolicy : activePolicies)
@@ -72,7 +85,7 @@ namespace AppInstaller::CLI
                     auto policy = Settings::TogglePolicy::GetPolicy(activePolicy.first);
                     policiesTable.OutputLine({
                         Resource::LocString{ policy.PolicyName() }.get(),
-                        Resource::LocString{ activePolicy.second == Settings::PolicyState::Enabled ? Resource::String::PoliciesEnabled : Resource::String::PoliciesDisabled }.get() });
+                        Resource::LocString{ activePolicy.second == Settings::PolicyState::Enabled ? Resource::String::StateEnabled : Resource::String::StateDisabled }.get() });
                 }
 
                 // Output the update interval in the same table if needed.
@@ -89,23 +102,75 @@ namespace AppInstaller::CLI
                 if (groupPolicies.GetState(Settings::TogglePolicy::Policy::AdditionalSources) == Settings::PolicyState::Enabled)
                 {
                     info << std::endl;
-                    auto sources = groupPolicies.GetValueRef<Settings::ValuePolicy::AdditionalSources>();
-                    if (sources.has_value() && !sources->get().empty())
+                    auto sources = groupPolicies.GetValue<Settings::ValuePolicy::AdditionalSources>();
+                    if (sources.has_value() && !sources->empty())
                     {
-                        OutputGroupPolicySourceList(context, sources->get(), Resource::String::SourceListAdditionalSource);
+                        OutputGroupPolicySourceList(context, sources.value(), Resource::String::SourceListAdditionalSource);
                     }
                 }
 
                 if (groupPolicies.GetState(Settings::TogglePolicy::Policy::AllowedSources) == Settings::PolicyState::Enabled)
                 {
                     info << std::endl;
-                    auto sources = groupPolicies.GetValueRef<Settings::ValuePolicy::AllowedSources>();
-                    if (sources.has_value() && !sources->get().empty())
+                    auto sources = groupPolicies.GetValue<Settings::ValuePolicy::AllowedSources>();
+                    if (sources.has_value() && !sources->empty())
                     {
-                        OutputGroupPolicySourceList(context, sources->get(), Resource::String::SourceListAllowedSource);
+                        OutputGroupPolicySourceList(context, sources.value(), Resource::String::SourceListAllowedSource);
                     }
                 }
+                info << std::endl;
             }
+        }
+
+        void OutputAdminSettings(Execution::Context& context)
+        {
+            Execution::TableOutput<2> adminSettingsTable{ context.Reporter, { Resource::String::AdminSettingHeader, Resource::String::StateHeader } };
+
+            // Output the admin settings.
+            for (const auto& setting : Settings::GetAllBoolAdminSettings())
+            {
+                adminSettingsTable.OutputLine({
+                    std::string{ AdminSettingToString(setting)},
+                    Resource::LocString{ IsAdminSettingEnabled(setting) ? Resource::String::StateEnabled : Resource::String::StateDisabled }
+                });
+            }
+            for (const auto& setting : Settings::GetAllStringAdminSettings())
+            {
+                auto settingValue = GetAdminSetting(setting);
+                adminSettingsTable.OutputLine({
+                    std::string{ AdminSettingToString(setting)},
+                    settingValue ? Utility::LocIndString{ settingValue.value() } : Resource::LocString{ Resource::String::StateDisabled }
+                    });
+            }
+            adminSettingsTable.Complete();
+        }
+
+        void OutputKeyDirectories(Execution::Context& context)
+        {
+            Execution::TableOutput<2> keyDirectories{ context.Reporter, { Resource::String::KeyDirectoriesHeader, {} } };
+            keyDirectories.OutputLine({ Resource::LocString{ Resource::String::Logs }, Runtime::GetPathTo(Runtime::PathName::DefaultLogLocation, true).u8string() });
+            keyDirectories.OutputLine({ Resource::LocString{ Resource::String::UserSettings }, UserSettings::SettingsFilePath(true).u8string() });
+            keyDirectories.OutputLine({ Resource::LocString{ Resource::String::PortableLinksUser }, Runtime::GetPathTo(Runtime::PathName::PortableLinksUserLocation, true).u8string() });
+            keyDirectories.OutputLine({ Resource::LocString{ Resource::String::PortableLinksMachine }, Runtime::GetPathTo(Runtime::PathName::PortableLinksMachineLocation, true).u8string() });
+            keyDirectories.OutputLine({ Resource::LocString{ Resource::String::PortableRootUser }, Runtime::GetPathTo(Runtime::PathName::PortablePackageUserRoot, true).u8string() });
+            keyDirectories.OutputLine({ Resource::LocString{ Resource::String::PortableRoot }, Runtime::GetPathTo(Runtime::PathName::PortablePackageMachineRoot, true).u8string() });
+            keyDirectories.OutputLine({ Resource::LocString{ Resource::String::PortableRoot86 }, Runtime::GetPathTo(Runtime::PathName::PortablePackageMachineRootX86, true).u8string() });
+            keyDirectories.OutputLine({ Resource::LocString{ Resource::String::InstallerDownloads }, Runtime::GetPathTo(Runtime::PathName::UserProfileDownloads, true).u8string() });
+            keyDirectories.OutputLine({ Resource::LocString{ Resource::String::ConfigurationModules }, Runtime::GetPathTo(Runtime::PathName::ConfigurationModules, true).u8string() });
+            keyDirectories.Complete();
+            context.Reporter.Info() << std::endl;
+        }
+
+        void OutputLinks(Execution::Context& context)
+        {
+            Execution::TableOutput<2> links{ context.Reporter, { Resource::String::Links, {} } };
+            links.OutputLine({ Resource::LocString{ Resource::String::PrivacyStatement }, "https://aka.ms/winget-privacy" });
+            links.OutputLine({ Resource::LocString{ Resource::String::LicenseAgreement }, "https://aka.ms/winget-license" });
+            links.OutputLine({ Resource::LocString{ Resource::String::ThirdPartSoftwareNotices }, "https://aka.ms/winget-3rdPartyNotice" });
+            links.OutputLine({ Resource::LocString{ Resource::String::MainHomepage }, "https://aka.ms/winget" });
+            links.OutputLine({ Resource::LocString{ Resource::String::WindowsStoreTerms }, "https://www.microsoft.com/en-us/storedocs/terms-of-sale" });
+            links.Complete();
+            context.Reporter.Info() << std::endl;
         }
     }
 
@@ -127,6 +192,21 @@ namespace AppInstaller::CLI
             std::make_unique<CompleteCommand>(FullName()),
             std::make_unique<ExportCommand>(FullName()),
             std::make_unique<ImportCommand>(FullName()),
+            std::make_unique<PinCommand>(FullName()),
+            std::make_unique<ConfigureCommand>(FullName()),
+            std::make_unique<DownloadCommand>(FullName()),
+            std::make_unique<ErrorCommand>(FullName()),
+            std::make_unique<ResumeCommand>(FullName()),
+            std::make_unique<RepairCommand>(FullName()),
+            std::make_unique<FontCommand>(FullName()),
+            std::make_unique<DscCommand>(FullName()),
+            std::make_unique<McpCommand>(FullName()),
+#if _DEBUG
+            std::make_unique<DebugCommand>(FullName()),
+#endif
+#ifndef AICLI_DISABLE_TEST_HOOKS
+            std::make_unique<TestCommand>(FullName()),
+#endif
         });
     }
 
@@ -134,9 +214,14 @@ namespace AppInstaller::CLI
     {
         return
         {
-            Argument{ "version", 'v', Execution::Args::Type::ListVersions, Resource::String::ToolVersionArgumentDescription, ArgumentType::Flag, Argument::Visibility::Help },
-            Argument{ "info", Argument::NoAlias, Execution::Args::Type::Info, Resource::String::ToolInfoArgumentDescription, ArgumentType::Flag, Argument::Visibility::Help },
+            Argument{ Execution::Args::Type::ToolVersion, Resource::String::ToolVersionArgumentDescription, ArgumentType::Flag, Argument::Visibility::Help },
+            Argument{ Execution::Args::Type::Info, Resource::String::ToolInfoArgumentDescription, ArgumentType::Flag, Argument::Visibility::Help },
         };
+    }
+
+    Resource::LocString RootCommand::ShortDescription() const
+    {
+        return {};
     }
 
     Resource::LocString RootCommand::LongDescription() const
@@ -144,9 +229,9 @@ namespace AppInstaller::CLI
         return { Resource::String::ToolDescription };
     }
 
-    std::string RootCommand::HelpLink() const
+    Utility::LocIndView RootCommand::HelpLink() const
     {
-        return "https://aka.ms/winget-command-help";
+        return "https://aka.ms/winget-command-help"_liv;
     }
 
     void RootCommand::Execute(Execution::Context& context) const
@@ -159,6 +244,11 @@ namespace AppInstaller::CLI
         else
         {
             ExecuteInternal(context);
+        }
+
+        if (context.Args.Contains(Execution::Args::Type::OpenLogs))
+        {
+            ShellExecute(NULL, NULL, Runtime::GetPathTo(Runtime::PathName::DefaultLogLocation).wstring().c_str(), NULL, NULL, SW_SHOWNORMAL);
         }
 
         if (context.Args.Contains(Execution::Args::Type::Wait))
@@ -178,30 +268,21 @@ namespace AppInstaller::CLI
             info << std::endl <<
                 "Windows: "_liv << Runtime::GetOSVersion() << std::endl;
 
-            info << Resource::String::SystemArchitecture << ": "_liv << Utility::ToString(Utility::GetSystemArchitecture()) << std::endl;
+            info << Resource::String::SystemArchitecture(Utility::ToString(Utility::GetSystemArchitecture())) << std::endl;
 
             if (Runtime::IsRunningInPackagedContext())
             {
-                info << Resource::String::Package << ": "_liv << Runtime::GetPackageVersion() << std::endl;
+                info << Resource::String::Package(Runtime::GetPackageVersion()) << std::endl;
             };
-
-            info << std::endl << Resource::String::Logs << ": "_liv << Runtime::GetPathTo(Runtime::PathName::DefaultLogLocationForDisplay).u8string() << std::endl;
 
             info << std::endl;
 
-            Execution::TableOutput<2> links{ context.Reporter, { Resource::String::Links, {} } };
-
-            links.OutputLine({ Resource::LocString(Resource::String::PrivacyStatement).get(), "https://aka.ms/winget-privacy" });
-            links.OutputLine({ Resource::LocString(Resource::String::LicenseAgreement).get(), "https://aka.ms/winget-license" });
-            links.OutputLine({ Resource::LocString(Resource::String::ThirdPartSoftwareNotices).get(), "https://aka.ms/winget-3rdPartyNotice" });
-            links.OutputLine({ Resource::LocString(Resource::String::MainHomepage).get(), "https://aka.ms/winget" });
-            links.OutputLine({ Resource::LocString(Resource::String::WindowsStoreTerms).get(), "https://www.microsoft.com/en-us/storedocs/terms-of-sale" });
-
-            links.Complete();
-
+            OutputKeyDirectories(context);
+            OutputLinks(context);
             OutputGroupPolicies(context);
+            OutputAdminSettings(context);
         }
-        else if (context.Args.Contains(Execution::Args::Type::ListVersions))
+        else if (context.Args.Contains(Execution::Args::Type::ToolVersion))
         {
             context.Reporter.Info() << 'v' << Runtime::GetClientVersion() << std::endl;
         }

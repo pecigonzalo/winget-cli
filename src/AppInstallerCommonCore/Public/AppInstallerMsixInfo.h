@@ -5,6 +5,7 @@
 #include "winget/ManagedFile.h"
 #include "winget/Manifest.h"
 #include "winget/MsixManifest.h"
+#include <AppInstallerVersions.h>
 
 #include <AppxPackaging.h>
 
@@ -46,6 +47,15 @@ namespace AppInstaller::Msix
     // Gets the package location from the given full name.
     std::optional<std::filesystem::path> GetPackageLocationFromFullName(std::string_view fullName);
 
+    struct PackageIdInfo
+    {
+        std::string Name;
+        AppInstaller::Utility::UInt64Version Version;
+    };
+
+    // Gets the package id info from the given full name.
+    PackageIdInfo GetPackageIdInfoFromFullName(std::string_view fullName);
+
     // MsixInfo class handles all appx/msix related query.
     struct MsixInfo
     {
@@ -69,8 +79,11 @@ namespace AppInstaller::Msix
         // If skipP7xFileId is true, returns content of converted .p7s
         std::vector<byte> GetSignature(bool skipP7xFileId = false);
 
-        // Get the signature sha256 hash.
+        // Gets the signature sha256 hash.
         Utility::SHA256::HashBuffer GetSignatureHash();
+
+        // Gets the digest of the package.
+        std::wstring GetDigest();
 
         // Gets the package full name.
         std::wstring GetPackageFullNameWide();
@@ -91,7 +104,7 @@ namespace AppInstaller::Msix
         void WriteToFileHandle(std::string_view packageFile, HANDLE target, IProgressCallback& progress);
 
         // Get application package manifests from msix and msixbundle.
-        std::vector<MsixPackageManifest> GetAppPackageManifests() const;
+        std::vector<MsixPackageManifest> GetAppPackageManifests(bool includeStub = false) const;
 
     private:
         bool m_isBundle;
@@ -99,8 +112,8 @@ namespace AppInstaller::Msix
         Microsoft::WRL::ComPtr<IAppxBundleReader> m_bundleReader;
         Microsoft::WRL::ComPtr<IAppxPackageReader> m_packageReader;
 
-        // Get application packages.
-        std::vector<Microsoft::WRL::ComPtr<IAppxPackageReader>> GetAppPackages() const;
+        // Get application packages. Ignore stub packages if any.
+        std::vector<Microsoft::WRL::ComPtr<IAppxPackageReader>> GetAppPackages(bool includeStub = false) const;
     };
 
     struct GetCertContextResult

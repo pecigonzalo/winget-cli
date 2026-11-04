@@ -1,11 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 #pragma once
+#include <winget/Hash.h>
 #include <winget/ManifestValidation.h>
 #include <winget/Manifest.h>
 #include <winget/Yaml.h>
-#include <AppInstallerSHA256.h>
-
 #include <filesystem>
 
 namespace AppInstaller::Manifest::YamlParser
@@ -17,6 +16,9 @@ namespace AppInstaller::Manifest::YamlParser
 
         // File name of the manifest file if applicable for error reporting
         std::string FileName;
+
+        // Schema header string found in the manifest file
+        YAML::DocumentSchemaHeader DocumentSchemaHeader;
 
         // The SHA256 hash of the stream
         Utility::SHA256::HashBuffer StreamSha256;

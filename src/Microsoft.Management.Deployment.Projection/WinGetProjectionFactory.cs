@@ -1,4 +1,4 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
 namespace Microsoft.Management.Deployment.Projection
@@ -27,8 +27,20 @@ namespace Microsoft.Management.Deployment.Projection
 
         public UninstallOptions CreateUninstallOptions() => InstanceInitializer.CreateInstance<UninstallOptions>();
 
+        public DownloadOptions CreateDownloadOptions() => InstanceInitializer.CreateInstance<DownloadOptions>();
+
         public PackageMatchFilter CreatePackageMatchFilter() => InstanceInitializer.CreateInstance<PackageMatchFilter>();
 
+        public AuthenticationArguments CreateAuthenticationArguments() => InstanceInitializer.CreateInstance<AuthenticationArguments>();
+
         public PackageManagerSettings CreatePackageManagerSettings() => InstanceInitializer.CreateInstance<PackageManagerSettings>();
+
+        public RepairOptions CreateRepairOptions() => InstanceInitializer.CreateInstance<RepairOptions>();
+
+        public AddPackageCatalogOptions CreateAddPackageCatalogOptions() => InstanceInitializer.CreateInstance<AddPackageCatalogOptions>();
+
+        public RemovePackageCatalogOptions CreateRemovePackageCatalogOptions() => InstanceInitializer.CreateInstance<RemovePackageCatalogOptions>();
+
+        public EditPackageCatalogOptions CreateEditPackageCatalogOptions() => InstanceInitializer.CreateInstance<EditPackageCatalogOptions>();
     }
 }

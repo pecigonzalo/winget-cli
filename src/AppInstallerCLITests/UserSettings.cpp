@@ -43,7 +43,7 @@ TEST_CASE("UserSettingsType", "[settings]")
     // 2 - Bad settings.json file
     // 3 - No settings.json.backup file exists
     // 4 - Bad settings.json.backup file exists.
-    DeleteUserSettingsFiles();
+    auto again = DeleteUserSettingsFiles();
 
     SECTION("No setting.json No setting.json.backup")
     {
@@ -114,7 +114,7 @@ TEST_CASE("UserSettingsType", "[settings]")
 
 TEST_CASE("UserSettingsCreateFiles", "[settings]")
 {
-    DeleteUserSettingsFiles();
+    auto again = DeleteUserSettingsFiles();
 
     auto settingsPath = UserSettings::SettingsFilePath();
     auto settingsBackupPath = GetPathTo(Stream::BackupUserSettings);
@@ -148,7 +148,7 @@ TEST_CASE("UserSettingsCreateFiles", "[settings]")
 
 TEST_CASE("SettingProgressBar", "[settings]")
 {
-    DeleteUserSettingsFiles();
+    auto again = DeleteUserSettingsFiles();
 
     SECTION("Default value")
     {
@@ -204,9 +204,49 @@ TEST_CASE("SettingProgressBar", "[settings]")
     }
 }
 
+TEST_CASE("SettingsAnonymizePathForDisplay", "[settings]")
+{
+    auto again = DeleteUserSettingsFiles();
+
+    SECTION("Default")
+    {
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::AnonymizePathForDisplay>() == true);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("True")
+    {
+        std::string_view json = R"({ "visual": { "anonymizeDisplayedPaths": true } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::AnonymizePathForDisplay>() == true);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("False")
+    {
+        std::string_view json = R"({ "visual": { "anonymizeDisplayedPaths": false } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::AnonymizePathForDisplay>() == false);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Invalid Value")
+    {
+        std::string_view json = R"({ "visual": { "anonymizeDisplayedPaths": "notBoolean" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::AnonymizePathForDisplay>() == true);
+        REQUIRE(userSettingTest.GetWarnings().size() == 1);
+    }
+}
+
 TEST_CASE("SettingLoggingLevelPreference", "[settings]")
 {
-    DeleteUserSettingsFiles();
+    auto again = DeleteUserSettingsFiles();
 
     SECTION("Default value")
     {
@@ -280,22 +320,89 @@ TEST_CASE("SettingLoggingLevelPreference", "[settings]")
     }
 }
 
-TEST_CASE("SettingAutoUpdateIntervalInMinutes", "[settings]")
-{
-    DeleteUserSettingsFiles();
-
-    constexpr static auto cinq = 5min;
-    constexpr static auto cero = 0min;
-    constexpr static auto threehundred = 300min;
+TEST_CASE("SettingLoggingFileNameStrategy", "[settings]") {
+    auto again = DeleteUserSettingsFiles();
 
     SECTION("Default value")
     {
         UserSettingsTest userSettingTest;
 
-        REQUIRE(userSettingTest.Get<Setting::AutoUpdateTimeInMinutes>() == cinq);
+        REQUIRE(userSettingTest.Get<Setting::LoggingFileNameStrategy>() == LogNameStrategy::Manifest);
         REQUIRE(userSettingTest.GetWarnings().size() == 0);
     }
-    SECTION("Valid value")
+    SECTION("Manifest")
+    {
+        std::string_view json = R"({ "logging": { "fileNameStrategy": "manifest" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::LoggingFileNameStrategy>() == LogNameStrategy::Manifest);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Timestamp")
+    {
+        std::string_view json = R"({ "logging": { "fileNameStrategy": "timestamp" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::LoggingFileNameStrategy>() == LogNameStrategy::Timestamp);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Guid")
+    {
+        std::string_view json = R"({ "logging": { "fileNameStrategy": "guid" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::LoggingFileNameStrategy>() == LogNameStrategy::Guid);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Short Guid")
+    {
+        std::string_view json = R"({ "logging": { "fileNameStrategy": "shortguid" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::LoggingFileNameStrategy>() == LogNameStrategy::ShortGuid);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Bad value")
+    {
+        std::string_view json = R"({ "logging": { "fileNameStrategy": "fake" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::LoggingFileNameStrategy>() == LogNameStrategy::Manifest);
+        REQUIRE(userSettingTest.GetWarnings().size() == 1);
+    }
+    SECTION("Bad value type")
+    {
+        std::string_view json = R"({ "logging": { "fileNameStrategy": 5 } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::LoggingFileNameStrategy>() == LogNameStrategy::Manifest);
+        REQUIRE(userSettingTest.GetWarnings().size() == 1);
+    }
+}
+
+TEST_CASE("SettingAutoUpdateIntervalInMinutes", "[settings]")
+{
+    auto again = DeleteUserSettingsFiles();
+
+    constexpr static auto cinq = 5min;
+    constexpr static auto cero = 0min;
+    constexpr static auto threehundred = 300min;
+
+    std::chrono::minutes defaultAutoUpdateTime{};
+
+    {
+        SetSetting(Stream::PrimaryUserSettings, "");
+        UserSettingsTest userSettingTest;
+        defaultAutoUpdateTime = userSettingTest.Get<Setting::AutoUpdateTimeInMinutes>();
+    }
+
+    SECTION("Valid value 0")
     {
         std::string_view json = R"({ "source": { "autoUpdateIntervalInMinutes": 0 } })";
         SetSetting(Stream::PrimaryUserSettings, json);
@@ -304,7 +411,7 @@ TEST_CASE("SettingAutoUpdateIntervalInMinutes", "[settings]")
         REQUIRE(userSettingTest.Get<Setting::AutoUpdateTimeInMinutes>() == cero);
         REQUIRE(userSettingTest.GetWarnings().size() == 0);
     }
-    SECTION("Valid value 0")
+    SECTION("Valid value 300")
     {
         std::string_view json = R"({ "source": { "autoUpdateIntervalInMinutes": 300 } })";
         SetSetting(Stream::PrimaryUserSettings, json);
@@ -319,7 +426,7 @@ TEST_CASE("SettingAutoUpdateIntervalInMinutes", "[settings]")
         SetSetting(Stream::PrimaryUserSettings, json);
         UserSettingsTest userSettingTest;
 
-        REQUIRE(userSettingTest.Get<Setting::AutoUpdateTimeInMinutes>() == cinq);
+        REQUIRE(userSettingTest.Get<Setting::AutoUpdateTimeInMinutes>() == defaultAutoUpdateTime);
         REQUIRE(userSettingTest.GetWarnings().size() == 1);
     }
     SECTION("Invalid type string")
@@ -328,7 +435,7 @@ TEST_CASE("SettingAutoUpdateIntervalInMinutes", "[settings]")
         SetSetting(Stream::PrimaryUserSettings, json);
         UserSettingsTest userSettingTest;
 
-        REQUIRE(userSettingTest.Get<Setting::AutoUpdateTimeInMinutes>() == cinq);
+        REQUIRE(userSettingTest.Get<Setting::AutoUpdateTimeInMinutes>() == defaultAutoUpdateTime);
         REQUIRE(userSettingTest.GetWarnings().size() == 1);
     }
     SECTION("Overridden by Group Policy")
@@ -361,7 +468,7 @@ TEST_CASE("SettingAutoUpdateIntervalInMinutes", "[settings]")
 
 TEST_CASE("SettingsExperimentalCmd", "[settings]")
 {
-    DeleteUserSettingsFiles();
+    auto again = DeleteUserSettingsFiles();
 
     SECTION("Feature off default")
     {
@@ -416,19 +523,23 @@ TEST_CASE("SettingsExperimentalCmd", "[settings]")
 
 TEST_CASE("SettingsPortablePackageUserRoot", "[settings]")
 {
+    auto again = DeleteUserSettingsFiles();
+
     SECTION("Relative path")
     {
-        DeleteUserSettingsFiles();
-        std::string_view json = R"({ "installBehavior": { "portablePackageUserRoot": %LOCALAPPDATA%/Portable/Root } })";
+        std::string_view json = R"({ "installBehavior": { "portablePackageUserRoot": "%LOCALAPPDATA%/Portable/Root" } })";
         SetSetting(Stream::PrimaryUserSettings, json);
         UserSettingsTest userSettingTest;
         
         REQUIRE(userSettingTest.Get<Setting::PortablePackageUserRoot>().empty());
-        REQUIRE(userSettingTest.GetWarnings().size() == 1);
+
+        auto warnings = userSettingTest.GetWarnings();
+        REQUIRE(warnings.size() == 1);
+        REQUIRE(warnings[0].Message == AppInstaller::StringResource::String::SettingsWarningInvalidFieldValue);
+        REQUIRE(warnings[0].Path == ".installBehavior.portablePackageUserRoot");
     }
     SECTION("Valid path")
     {
-        DeleteUserSettingsFiles();
         std::string_view json = R"({ "installBehavior": { "portablePackageUserRoot": "C:/Foo/Bar" } })";
         SetSetting(Stream::PrimaryUserSettings, json);
         UserSettingsTest userSettingTest;
@@ -440,24 +551,476 @@ TEST_CASE("SettingsPortablePackageUserRoot", "[settings]")
 
 TEST_CASE("SettingsPortablePackageMachineRoot", "[settings]")
 {
+    auto again = DeleteUserSettingsFiles();
+
     SECTION("Relative path")
     {
-        DeleteUserSettingsFiles();
-        std::string_view json = R"({ "installBehavior": { "portablePackageMachineRoot": %LOCALAPPDATA%/Portable/Root } })";
+        std::string_view json = R"({ "installBehavior": { "portablePackageMachineRoot": "%LOCALAPPDATA%/Portable/Root" } })";
         SetSetting(Stream::PrimaryUserSettings, json);
         UserSettingsTest userSettingTest;
 
         REQUIRE(userSettingTest.Get<Setting::PortablePackageMachineRoot>().empty());
-        REQUIRE(userSettingTest.GetWarnings().size() == 1);
+
+        auto warnings = userSettingTest.GetWarnings();
+        REQUIRE(warnings.size() == 1);
+        REQUIRE(warnings[0].Message == AppInstaller::StringResource::String::SettingsWarningInvalidFieldValue);
+        REQUIRE(warnings[0].Path == ".installBehavior.portablePackageMachineRoot");
     }
     SECTION("Valid path")
     {
-        DeleteUserSettingsFiles();
         std::string_view json = R"({ "installBehavior": { "portablePackageMachineRoot": "C:/Foo/Bar" } })";
         SetSetting(Stream::PrimaryUserSettings, json);
         UserSettingsTest userSettingTest;
 
         REQUIRE(userSettingTest.Get<Setting::PortablePackageMachineRoot>() == "C:/Foo/Bar");
         REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+}
+
+TEST_CASE("SettingsDownloadDefaultDirectory", "[settings]")
+{
+    auto again = DeleteUserSettingsFiles();
+
+    SECTION("Valid path")
+    {
+        std::string_view json = R"({ "downloadBehavior": { "defaultDownloadDirectory": "C:/Foo/Bar" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::DownloadDefaultDirectory>() == "C:/Foo/Bar");
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+}
+
+TEST_CASE("SettingsConfigureDefaultModuleRoot", "[settings]")
+{
+    auto again = DeleteUserSettingsFiles();
+
+    SECTION("Valid path")
+    {
+        std::string_view json = R"({ "configureBehavior": { "defaultModuleRoot": "C:/Foo/Bar" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::ConfigureDefaultModuleRoot>() == "C:/Foo/Bar");
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+}
+
+TEST_CASE("SettingsArchiveExtractionMethod", "[settings]")
+{
+    auto again = DeleteUserSettingsFiles();
+
+    SECTION("Shell api")
+    {
+        std::string_view json = R"({ "installBehavior": { "archiveExtractionMethod": "shellApi" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::ArchiveExtractionMethod>() == AppInstaller::Archive::ExtractionMethod::ShellApi);
+    }
+    SECTION("Shell api")
+    {
+        std::string_view json = R"({ "installBehavior": { "archiveExtractionMethod": "tar" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::ArchiveExtractionMethod>() == AppInstaller::Archive::ExtractionMethod::Tar);
+    }
+}
+
+TEST_CASE("SettingsInstallScope", "[settings]")
+{
+    auto again = DeleteUserSettingsFiles();
+
+    SECTION("User scope preference")
+    {
+        std::string_view json = R"({ "installBehavior": { "preferences": { "scope": "user" } } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::InstallScopePreference>() == AppInstaller::Manifest::ScopeEnum::User);
+    }
+    SECTION("Machine scope preference")
+    {
+        std::string_view json = R"({ "installBehavior": { "preferences": { "scope": "machine" } } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::InstallScopePreference>() == AppInstaller::Manifest::ScopeEnum::Machine);
+    }
+    SECTION("User scope requirement")
+    {
+        std::string_view json = R"({ "installBehavior": { "requirements": { "scope": "user" } } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::InstallScopeRequirement>() == AppInstaller::Manifest::ScopeEnum::User);
+    }
+    SECTION("Machine scope requirement")
+    {
+        std::string_view json = R"({ "installBehavior": { "requirements": { "scope": "machine" } } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::InstallScopeRequirement>() == AppInstaller::Manifest::ScopeEnum::Machine);
+    }
+}
+
+TEST_CASE("SettingsMaxResumes", "[settings]")
+{
+    auto again = DeleteUserSettingsFiles();
+
+    SECTION("Modify max number of resumes")
+    {
+        std::string_view json = R"({ "installBehavior": { "maxResumes": 5 } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::MaxResumes>() == 5);
+    }
+}
+
+TEST_CASE("LoggingChannels", "[settings]")
+{
+    auto again = DeleteUserSettingsFiles();
+
+    SECTION("Not provided")
+    {
+        std::string_view json = R"({ })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::LoggingChannelPreference>() == Channel::Defaults);
+    }
+    SECTION("No channels")
+    {
+        std::string_view json = R"({ "logging": { "channels": [] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::LoggingChannelPreference>() == Channel::None);
+    }
+    SECTION("Default")
+    {
+        std::string_view json = R"({ "logging": { "channels": ["default"] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::LoggingChannelPreference>() == Channel::Defaults);
+    }
+    SECTION("Multiple")
+    {
+        std::string_view json = R"({ "logging": { "channels": ["core","Repo","YAML"] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::LoggingChannelPreference>() == (Channel::Core | Channel::Repo | Channel::YAML));
+    }
+    SECTION("Some invalid")
+    {
+        std::string_view json = R"({ "logging": { "channels": ["cli","sql","INVALID"] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::LoggingChannelPreference>() == (Channel::CLI | Channel::SQL));
+    }
+}
+
+TEST_CASE("SettingOutputSortOrder", "[settings]")
+{
+    auto again = DeleteUserSettingsFiles();
+
+    SECTION("Default value - empty vector sentinel for context-aware defaults")
+    {
+        UserSettingsTest userSettingTest;
+
+        auto sortOrder = userSettingTest.Get<Setting::OutputSortOrder>();
+        REQUIRE(sortOrder.empty());
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Single field")
+    {
+        std::string_view json = R"({ "output": { "sortOrder": ["id"] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        auto sortOrder = userSettingTest.Get<Setting::OutputSortOrder>();
+        REQUIRE(sortOrder.size() == 1);
+        REQUIRE(sortOrder[0] == SortField::Id);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Relevance field")
+    {
+        std::string_view json = R"({ "output": { "sortOrder": ["relevance"] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        auto sortOrder = userSettingTest.Get<Setting::OutputSortOrder>();
+        REQUIRE(sortOrder.size() == 1);
+        REQUIRE(sortOrder[0] == SortField::Relevance);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Multiple fields")
+    {
+        std::string_view json = R"({ "output": { "sortOrder": ["available", "name"] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        auto sortOrder = userSettingTest.Get<Setting::OutputSortOrder>();
+        REQUIRE(sortOrder.size() == 2);
+        REQUIRE(sortOrder[0] == SortField::Available);
+        REQUIRE(sortOrder[1] == SortField::Name);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("All valid fields")
+    {
+        std::string_view json = R"({ "output": { "sortOrder": ["relevance", "name", "id", "version", "source", "available"] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        auto sortOrder = userSettingTest.Get<Setting::OutputSortOrder>();
+        REQUIRE(sortOrder.size() == 6);
+        REQUIRE(sortOrder[0] == SortField::Relevance);
+        REQUIRE(sortOrder[1] == SortField::Name);
+        REQUIRE(sortOrder[2] == SortField::Id);
+        REQUIRE(sortOrder[3] == SortField::Version);
+        REQUIRE(sortOrder[4] == SortField::Source);
+        REQUIRE(sortOrder[5] == SortField::Available);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Case insensitive")
+    {
+        std::string_view json = R"({ "output": { "sortOrder": ["Name", "ID", "VERSION"] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        auto sortOrder = userSettingTest.Get<Setting::OutputSortOrder>();
+        REQUIRE(sortOrder.size() == 3);
+        REQUIRE(sortOrder[0] == SortField::Name);
+        REQUIRE(sortOrder[1] == SortField::Id);
+        REQUIRE(sortOrder[2] == SortField::Version);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Empty array disables sorting")
+    {
+        std::string_view json = R"({ "output": { "sortOrder": [] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        auto sortOrder = userSettingTest.Get<Setting::OutputSortOrder>();
+        REQUIRE(sortOrder.size() == 0);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Invalid field name")
+    {
+        std::string_view json = R"({ "output": { "sortOrder": ["invalid"] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        auto sortOrder = userSettingTest.Get<Setting::OutputSortOrder>();
+        REQUIRE(sortOrder.empty());
+        REQUIRE(userSettingTest.GetWarnings().size() == 1);
+    }
+    SECTION("Mixed valid and invalid field")
+    {
+        std::string_view json = R"({ "output": { "sortOrder": ["name", "bogus"] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        auto sortOrder = userSettingTest.Get<Setting::OutputSortOrder>();
+        REQUIRE(sortOrder.empty());
+        REQUIRE(userSettingTest.GetWarnings().size() == 1);
+    }
+    SECTION("Duplicate values - case-insensitive")
+    {
+        std::string_view json = R"({ "output": { "sortOrder": ["name", "id", "Name"] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        auto sortOrder = userSettingTest.Get<Setting::OutputSortOrder>();
+        REQUIRE(sortOrder.size() == 3);
+        REQUIRE(sortOrder[0] == SortField::Name);
+        REQUIRE(sortOrder[1] == SortField::Id);
+        REQUIRE(sortOrder[2] == SortField::Name);
+        REQUIRE(userSettingTest.GetWarnings().empty());
+    }
+    SECTION("Wrong type - string instead of array")
+    {
+        std::string_view json = R"({ "output": { "sortOrder": "name" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        auto sortOrder = userSettingTest.Get<Setting::OutputSortOrder>();
+        REQUIRE(sortOrder.empty());
+        REQUIRE(userSettingTest.GetWarnings().size() == 1);
+    }
+    SECTION("Wrong type - number in array")
+    {
+        std::string_view json = R"({ "output": { "sortOrder": [1] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        auto sortOrder = userSettingTest.Get<Setting::OutputSortOrder>();
+        REQUIRE(sortOrder.empty());
+        REQUIRE(userSettingTest.GetWarnings().size() == 1);
+    }
+}
+
+TEST_CASE("SettingOutputSortDirection", "[settings]")
+{
+    auto again = DeleteUserSettingsFiles();
+
+    SECTION("Default value")
+    {
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::OutputSortDirection>() == SortDirection::Ascending);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Ascending")
+    {
+        std::string_view json = R"({ "output": { "sortDirection": "ascending" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::OutputSortDirection>() == SortDirection::Ascending);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Descending")
+    {
+        std::string_view json = R"({ "output": { "sortDirection": "descending" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::OutputSortDirection>() == SortDirection::Descending);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Case insensitive")
+    {
+        std::string_view json = R"({ "output": { "sortDirection": "DESCENDING" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::OutputSortDirection>() == SortDirection::Descending);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Invalid value")
+    {
+        std::string_view json = R"({ "output": { "sortDirection": "sideways" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::OutputSortDirection>() == SortDirection::Ascending);
+        REQUIRE(userSettingTest.GetWarnings().size() == 1);
+    }
+    SECTION("Wrong type - array instead of string")
+    {
+        std::string_view json = R"({ "output": { "sortDirection": ["ascending"] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::OutputSortDirection>() == SortDirection::Ascending);
+        REQUIRE(userSettingTest.GetWarnings().size() == 1);
+    }
+}
+
+TEST_CASE("SettingOutputLocale", "[settings]")
+{
+    auto again = DeleteUserSettingsFiles();
+
+    SECTION("Default value")
+    {
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::OutputLocale>().empty());
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Valid locale")
+    {
+        std::string_view json = R"({ "output": { "locale": "en-US" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::OutputLocale>() == "en-US"sv);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Case insensitive locale")
+    {
+        std::string_view json = R"({ "output": { "locale": "EN-us" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::OutputLocale>() == "en-US"sv);
+        REQUIRE(userSettingTest.GetWarnings().size() == 0);
+    }
+    SECTION("Unsupported locale")
+    {
+        std::string_view json = R"({ "output": { "locale": "el-GR" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::OutputLocale>().empty());
+        REQUIRE(userSettingTest.GetWarnings().size() == 1);
+    }
+    SECTION("Invalid locale")
+    {
+        std::string_view json = R"({ "output": { "locale": "en_US.UTF-8" } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::OutputLocale>().empty());
+        REQUIRE(userSettingTest.GetWarnings().size() == 1);
+    }
+    SECTION("Wrong type")
+    {
+        std::string_view json = R"({ "output": { "locale": ["en-US"] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        REQUIRE(userSettingTest.Get<Setting::OutputLocale>().empty());
+        REQUIRE(userSettingTest.GetWarnings().size() == 1);
+    }
+}
+
+TEST_CASE("ConvertToSortField", "[settings]")
+{
+    SECTION("Valid values - lowercase")
+    {
+        REQUIRE(ConvertToSortField("relevance") == SortField::Relevance);
+        REQUIRE(ConvertToSortField("name") == SortField::Name);
+        REQUIRE(ConvertToSortField("id") == SortField::Id);
+        REQUIRE(ConvertToSortField("version") == SortField::Version);
+        REQUIRE(ConvertToSortField("source") == SortField::Source);
+        REQUIRE(ConvertToSortField("available") == SortField::Available);
+    }
+    SECTION("Case-insensitive")
+    {
+        REQUIRE(ConvertToSortField("RELEVANCE") == SortField::Relevance);
+        REQUIRE(ConvertToSortField("NAME") == SortField::Name);
+        REQUIRE(ConvertToSortField("Id") == SortField::Id);
+        REQUIRE(ConvertToSortField("VERSION") == SortField::Version);
+        REQUIRE(ConvertToSortField("Source") == SortField::Source);
+        REQUIRE(ConvertToSortField("AVAILABLE") == SortField::Available);
+    }
+    SECTION("Invalid values return nullopt")
+    {
+        REQUIRE_FALSE(ConvertToSortField("").has_value());
+        REQUIRE_FALSE(ConvertToSortField("foo").has_value());
+        REQUIRE_FALSE(ConvertToSortField("names").has_value());
+        REQUIRE_FALSE(ConvertToSortField("nam").has_value());
+    }
+    SECTION("Settings round-trip with ConvertToSortField")
+    {
+        auto again = DeleteUserSettingsFiles();
+
+        std::string_view json = R"({ "output": { "sortOrder": ["name", "id"] } })";
+        SetSetting(Stream::PrimaryUserSettings, json);
+        UserSettingsTest userSettingTest;
+
+        auto fields = userSettingTest.Get<Setting::OutputSortOrder>();
+        REQUIRE(fields.size() == 2);
+        REQUIRE(fields[0] == SortField::Name);
+        REQUIRE(fields[1] == SortField::Id);
     }
 }

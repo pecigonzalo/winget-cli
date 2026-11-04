@@ -3,18 +3,34 @@
 #include "pch.h"
 #include "WorkflowBase.h"
 #include "ExecutionContext.h"
-#include "ManifestComparator.h"
+#include "PackageTableSortHelper.h"
 #include "PromptFlow.h"
+#include "ShowFlow.h"
+#include "Sixel.h"
 #include "TableOutput.h"
+#include <winget/UserSettings.h>
+#include <winget/ManifestComparator.h>
+#include <winget/FileCache.h>
+#include <winget/ExperimentalFeature.h>
+#include <winget/Hash.h>
 #include <winget/ManifestYamlParser.h>
+#include <winget/Pin.h>
+#include <winget/PinningData.h>
+#include <winget/Runtime.h>
+#include <winget/PackageVersionSelection.h>
+#include <winget/IconExtraction.h>
 
+EXTERN_C IMAGE_DOS_HEADER __ImageBase;
+
+using namespace std::string_literals;
+using namespace AppInstaller::Utility::literals;
+using namespace AppInstaller::Pinning;
+using namespace AppInstaller::Repository;
+using namespace AppInstaller::Settings;
+using namespace winrt::Windows::Foundation;
 
 namespace AppInstaller::CLI::Workflow
 {
-    using namespace std::string_literals;
-    using namespace AppInstaller::Utility::literals;
-    using namespace AppInstaller::Repository;
-
     namespace
     {
         std::string GetMatchCriteriaDescriptor(const ResultMatch& match)
@@ -30,6 +46,65 @@ namespace AppInstaller::CLI::Workflow
             {
                 return {};
             }
+        }
+
+        Execution::TableOutputBase GetMultiplePackageFoundResultTable(Execution::Context& context)
+        {
+            auto& searchResult = context.Get<Execution::Data::SearchResult>();
+
+            Execution::TableOutput<2> table(context.Reporter,
+                {
+                    Resource::String::SearchName,
+                    Resource::String::SearchId
+                });
+
+            for (size_t i = 0; i < searchResult.Matches.size(); ++i)
+            {
+                auto package = searchResult.Matches[i].Package;
+
+                table.OutputLine({
+                    package->GetProperty(PackageProperty::Name),
+                    package->GetProperty(PackageProperty::Id)
+                    });
+            }
+
+            return table;
+        }
+
+        Execution::TableOutputBase GetMultiplePackageFoundResultTableWithSource(Execution::Context& context)
+        {
+            auto& searchResult = context.Get<Execution::Data::SearchResult>();
+
+            Execution::TableOutput<3> table(context.Reporter,
+                {
+                    Resource::String::SearchName,
+                    Resource::String::SearchId,
+                    Resource::String::SearchSource
+                });
+
+            for (size_t i = 0; i < searchResult.Matches.size(); ++i)
+            {
+                auto package = searchResult.Matches[i].Package;
+
+                std::string sourceName;
+                auto available = package->GetAvailable();
+                if (!available.empty())
+                {
+                    auto source = available[0]->GetSource();
+                    if (source)
+                    {
+                        sourceName = source.GetDetails().Name;
+                    }
+                }
+
+                table.OutputLine({
+                    package->GetProperty(PackageProperty::Name),
+                    package->GetProperty(PackageProperty::Id),
+                    std::move(sourceName)
+                    });
+            }
+
+            return table;
         }
 
         void ReportIdentity(
@@ -57,7 +132,115 @@ namespace AppInstaller::CLI::Workflow
             out << std::endl;
         }
 
-        Repository::Source OpenNamedSource(Execution::Context& context, std::string_view sourceName)
+        bool IsSecondIconResolutionBetter(Manifest::IconResolutionEnum current, Manifest::IconResolutionEnum alternative)
+        {
+            static constexpr std::array<uint8_t, ToIntegral(Manifest::IconResolutionEnum::Square256) + 1> s_iconResolutionOrder
+            {
+                9, // Unknown
+                8, // Custom
+                15, // Square16
+                14, // Square20
+                13, // Square24
+                12, // Square30
+                11, // Square32
+                10, // Square36
+                6, // Square40
+                5, // Square48
+                4, // Square60
+                3, // Square64
+                2, // Square72
+                0, // Square80
+                1, // Square96
+                7, // Square256
+            };
+
+            return s_iconResolutionOrder.at(ToIntegral(alternative)) < s_iconResolutionOrder.at(ToIntegral(current));
+        }
+
+        // Determines icon fit given two options.
+        // Targets an 80x80 icon as the best resolution for this use case.
+        // TODO: Consider theme based on current background color.
+        bool IsSecondIconBetter(const Manifest::Icon& current, const Manifest::Icon& alternative)
+        {
+            return IsSecondIconResolutionBetter(current.Resolution, alternative.Resolution);
+        }
+
+        bool IsSecondIconBetter(const ExtractedIconInfo& current, const ExtractedIconInfo& alternative)
+        {
+            return IsSecondIconResolutionBetter(current.IconResolution, alternative.IconResolution);
+        }
+
+        void ShowIcon(Execution::OutputStream& outputStream, VirtualTerminal::Sixel::Image& icon)
+        {
+            // Using a height of 4 arbitrarily; allow width up to the entire console.
+            UINT imageHeightCells = 4;
+            UINT imageWidthCells = static_cast<UINT>(Execution::GetConsoleWidth().value_or(120));
+
+            icon.RenderSizeInCells(imageWidthCells, imageHeightCells);
+            icon.RenderTo(outputStream);
+
+            // Force the final sixel line to not be overwritten
+            outputStream << std::endl;
+        }
+
+        void ShowManifestIcon(Execution::Context& context, const Manifest::Manifest& manifest) try
+        {
+            if (!context.Reporter.SixelsEnabled())
+            {
+                return;
+            }
+
+            auto icons = manifest.CurrentLocalization.Get<Manifest::Localization::Icons>();
+            const Manifest::Icon* bestFitIcon = nullptr;
+
+            for (const auto& icon : icons)
+            {
+                if (!bestFitIcon || IsSecondIconBetter(*bestFitIcon, icon))
+                {
+                    bestFitIcon = &icon;
+                }
+            }
+
+            if (!bestFitIcon)
+            {
+                return;
+            }
+
+            // Use a cache to hold the icons
+            auto splitUri = Utility::SplitFileNameFromURI(bestFitIcon->Url);
+            Caching::FileCache fileCache{ Caching::FileCache::Type::Icon, Utility::SHA256::ConvertToString(bestFitIcon->Sha256), { splitUri.first } };
+            auto iconStream = fileCache.GetFile(splitUri.second, bestFitIcon->Sha256);
+
+            VirtualTerminal::Sixel::Image sixelIcon{ *iconStream, bestFitIcon->FileType };
+            auto infoOut = context.Reporter.Info();
+
+            ShowIcon(infoOut, sixelIcon);
+        }
+        CATCH_LOG();
+
+        void ShowExtractedIcon(Execution::OutputStream& outputStream, const std::vector<ExtractedIconInfo>& icons) try
+        {
+            const ExtractedIconInfo* bestFitIcon = nullptr;
+
+            for (const auto& icon : icons)
+            {
+                if (!bestFitIcon || IsSecondIconBetter(*bestFitIcon, icon))
+                {
+                    bestFitIcon = &icon;
+                }
+            }
+
+            if (!bestFitIcon)
+            {
+                return;
+            }
+
+            VirtualTerminal::Sixel::Image sixelIcon{ bestFitIcon->IconContent, bestFitIcon->IconFileType };
+            ShowIcon(outputStream, sixelIcon);
+        }
+        CATCH_LOG();
+
+        Repository::Source OpenNamedSource(Execution::Context& context, Utility::LocIndView sourceName)
         {
             Repository::Source source;
 
@@ -72,7 +255,7 @@ namespace AppInstaller::CLI::Workflow
                     if (!sourceName.empty() && !sources.empty())
                     {
                         // A bad name was given, try to help.
-                        context.Reporter.Error() << Resource::String::OpenSourceFailedNoMatch << ' ' << sourceName << std::endl;
+                        context.Reporter.Error() << Resource::String::OpenSourceFailedNoMatch(sourceName) << std::endl;
                         context.Reporter.Info() << Resource::String::OpenSourceFailedNoMatchHelp << std::endl;
                         for (const auto& details : sources)
                         {
@@ -98,13 +281,35 @@ namespace AppInstaller::CLI::Workflow
                     }
                 }
 
-                auto openFunction = [&](IProgressCallback& progress)->std::vector<Repository::SourceDetails> { return source.Open(progress); };
+                auto openFunction = [&](IProgressCallback& progress)->std::vector<Repository::SourceDetails>
+                {
+                    source.SetCaller("winget-cli");
+                    source.SetAuthenticationArguments(GetAuthenticationArguments(context));
+                    source.SetThreadGlobals(context.GetSharedThreadGlobals());
+                    return source.Open(progress);
+                };
                 auto updateFailures = context.Reporter.ExecuteWithProgress(openFunction, true);
 
                 // We'll only report the source update failure as warning and continue
                 for (const auto& s : updateFailures)
                 {
-                    context.Reporter.Warn() << Resource::String::SourceOpenWithFailedUpdate << ' ' << s.Name << std::endl;
+                    context.Reporter.Warn() << Resource::String::SourceOpenWithFailedUpdate(Utility::LocIndView{ s.Name }) << std::endl;
+                }
+
+                // Report sources that may need authentication
+                if (source.IsComposite())
+                {
+                    for (const auto& s : source.GetAvailableSources())
+                    {
+                        if (s.GetInformation().Authentication.Type != Authentication::AuthenticationType::None)
+                        {
+                            context.Reporter.Info() << Execution::AuthenticationEmphasis << Resource::String::SourceRequiresAuthentication(Utility::LocIndView{ s.GetDetails().Name }) << std::endl;
+                        }
+                    }
+                }
+                else if (source.GetInformation().Authentication.Type != Authentication::AuthenticationType::None)
+                {
+                    context.Reporter.Info() << Execution::AuthenticationEmphasis << Resource::String::SourceRequiresAuthentication(Utility::LocIndView{ source.GetDetails().Name }) << std::endl;
                 }
             }
             catch (const wil::ResultException& re)
@@ -173,8 +378,20 @@ namespace AppInstaller::CLI::Workflow
         // Data shown on a line of a table displaying installed packages
         struct InstalledPackagesTableLine
         {
-            InstalledPackagesTableLine(Utility::LocIndString name, Utility::LocIndString id, Utility::LocIndString installedVersion, Utility::LocIndString availableVersion, Utility::LocIndString source)
-                : Name(name), Id(id), InstalledVersion(installedVersion), AvailableVersion(availableVersion), Source(source) {}
+            InstalledPackagesTableLine(
+                std::shared_ptr<ICompositePackage> package,
+                std::shared_ptr<IPackageVersion> installedVersion,
+                const Utility::LocIndString& availableVersion,
+                const Utility::LocIndString& source)
+                : Package(std::move(package)), InstalledPackageVersion(std::move(installedVersion)), AvailableVersion(availableVersion), Source(source)
+            {
+                Name = InstalledPackageVersion->GetProperty(PackageVersionProperty::Name);
+                Id = Package->GetProperty(PackageProperty::Id);
+                InstalledVersion = InstalledPackageVersion->GetProperty(PackageVersionProperty::Version);
+            }
+
+            std::shared_ptr<ICompositePackage> Package;
+            std::shared_ptr<IPackageVersion> InstalledPackageVersion;
 
             Utility::LocIndString Name;
             Utility::LocIndString Id;
@@ -183,7 +400,7 @@ namespace AppInstaller::CLI::Workflow
             Utility::LocIndString Source;
         };
 
-        void OutputInstalledPackagesTable(Execution::Context& context, const std::vector<InstalledPackagesTableLine>& lines)
+        void OutputInstalledPackagesTable(Execution::Context& context, std::vector<InstalledPackagesTableLine>& lines)
         {
             Execution::TableOutput<5> table(context.Reporter,
                 {
@@ -194,7 +411,7 @@ namespace AppInstaller::CLI::Workflow
                     Resource::String::SearchSource
                 });
 
-            for (const auto& line : lines)
+            for (auto& line : lines)
             {
                 table.OutputLine({
                     line.Name,
@@ -206,6 +423,148 @@ namespace AppInstaller::CLI::Workflow
             }
 
             table.Complete();
+        }
+
+        void ShowMetadataField(
+            Execution::OutputStream& outputStream,
+            StringResource::StringId label,
+            const IPackageVersion::Metadata& metadata,
+            PackageVersionMetadata field)
+        {
+            auto itr = metadata.find(field);
+            if (itr != metadata.end())
+            {
+                ShowSingleLineField(outputStream, label, Utility::LocIndView{ itr->second });
+            }
+        }
+
+        // Outputs every package "line" with many details, with a format similar to the `show` command.
+        void OutputInstalledPackagesDetails(Execution::Context& context, std::vector<InstalledPackagesTableLine>& lines)
+        {
+            auto info = context.Reporter.Info();
+            size_t packageIndex = 0;
+            size_t totalLines = lines.size();
+            bool shouldGetIcon = context.Reporter.SixelsEnabled();
+            for (const auto& line : lines)
+            {
+                // Identity header including package count indicator if multiple lines provided
+                if (totalLines > 1)
+                {
+                    info << '(' << ++packageIndex << '/' << totalLines << ") "_liv;
+                }
+
+                ReportIdentity(context, {}, std::nullopt, line.Name, line.Id);
+
+                auto metadata = line.InstalledPackageVersion->GetMetadata();
+                auto productCodes = line.InstalledPackageVersion->GetMultiProperty(PackageVersionMultiProperty::ProductCode);
+
+                if (shouldGetIcon && !productCodes.empty())
+                {
+                    Manifest::ScopeEnum scope = Manifest::ScopeEnum::Unknown;
+
+                    auto itr = metadata.find(PackageVersionMetadata::InstalledScope);
+                    if (itr != metadata.end())
+                    {
+                        scope = Manifest::ConvertToScopeEnum(itr->second);
+                    }
+
+                    auto icons = ExtractIconFromArpEntry(productCodes[0], scope);
+                    ShowExtractedIcon(info, icons);
+                }
+
+                ShowSingleLineField(info, Resource::String::ShowLabelVersion, line.InstalledVersion);
+                ShowSingleLineField(info, Resource::String::ShowLabelChannel, line.InstalledPackageVersion->GetProperty(PackageVersionProperty::Channel));
+                ShowSingleLineField(info, Resource::String::ShowLabelPublisher, line.InstalledPackageVersion->GetProperty(PackageVersionProperty::Publisher));
+                auto localIdentifier = line.InstalledPackageVersion->GetProperty(PackageVersionProperty::Id);
+                if (line.Id != localIdentifier)
+                {
+                    ShowSingleLineField(info, Resource::String::ShowListLocalIdentifier, localIdentifier);
+                }
+
+                ShowMultiValueField(info, Resource::String::ShowListPackageFamilyName, line.InstalledPackageVersion->GetMultiProperty(PackageVersionMultiProperty::PackageFamilyName));
+                ShowMultiValueField(info, Resource::String::ShowListProductCode, productCodes);
+                ShowMultiValueField(info, Resource::String::ShowListUpgradeCode, line.InstalledPackageVersion->GetMultiProperty(PackageVersionMultiProperty::UpgradeCode));
+
+                ShowMetadataField(info, Resource::String::ShowListInstallerCategory, metadata, PackageVersionMetadata::InstalledType);
+                ShowMetadataField(info, Resource::String::ShowListInstalledScope, metadata, PackageVersionMetadata::InstalledScope);
+                ShowMetadataField(info, Resource::String::ShowListInstalledArchitecture, metadata, PackageVersionMetadata::InstalledArchitecture);
+                ShowMetadataField(info, Resource::String::ShowListInstalledLocale, metadata, PackageVersionMetadata::InstalledLocale);
+                ShowMetadataField(info, Resource::String::ShowListInstalledLocation, metadata, PackageVersionMetadata::InstalledLocation);
+
+                auto source = line.InstalledPackageVersion->GetSource();
+                if (source.ContainsAvailablePackages())
+                {
+                    ShowSingleLineField(info, Resource::String::ShowListInstalledSource, Utility::LocIndView{ source.GetDetails().Name });
+                }
+
+                Utility::Version currentVersion{ line.InstalledVersion };
+                bool hasUpgradeVersion = false;
+                for (const auto& available : line.Package->GetAvailable())
+                {
+                    auto latestAvailable = available->GetLatestVersion();
+                    auto availableVersion = latestAvailable->GetProperty(PackageVersionProperty::Version);
+                    if (Utility::Version{ availableVersion } > currentVersion)
+                    {
+                        if (!hasUpgradeVersion)
+                        {
+                            hasUpgradeVersion = true;
+                            info << details::GetIndentFor(0) << Execution::ManifestInfoEmphasis << Resource::String::ShowListAvailableUpgrades << '\n';
+                        }
+
+                        info << details::GetIndentFor(1) << Utility::LocIndView{ available->GetSource().GetDetails().Name } <<
+                            " ["_liv << availableVersion << "]\n"_liv;
+                    }
+                }
+
+                // FUTURE: We could also pull data from the tracking database to show some things that we store there specifically.
+            }
+        }
+
+        // Sorts a vector of InstalledPackagesTableLine according to the user's sort preferences.
+        // Resolution order: CLI args (--sort) > settings (output.sortOrder) > query-aware default.
+        void SortInstalledPackagesTableLines(Execution::Context& context, std::vector<InstalledPackagesTableLine>& lines)
+        {
+            if (lines.size() <= 1)
+            {
+                return;
+            }
+
+            const SortParameters params(context);
+
+            // Not strictly required — SortBy handles this internally — but avoids
+            // constructing the SortablePackageEntry vector when no sorting is needed.
+            if (!params.ShouldSort)
+            {
+                return;
+            }
+
+            const SortField mask = ComputeSortFieldMask(params.Fields);
+            SortBy(lines,
+                [mask](const InstalledPackagesTableLine& line, size_t index) {
+                    return SortablePackageEntry(
+                        index,
+                        line.Name.get(),
+                        line.Id.get(),
+                        line.InstalledVersion.get(),
+                        line.AvailableVersion.get(),
+                        line.Source.get(),
+                        mask);
+                },
+                params);
+        }
+
+        void OutputInstalledPackages(Execution::Context& context, std::vector<InstalledPackagesTableLine>& lines)
+        {
+            SortInstalledPackagesTableLines(context, lines);
+
+            if (context.Args.Contains(Execution::Args::Type::ListDetails))
+            {
+                OutputInstalledPackagesDetails(context, lines);
+            }
+            else
+            {
+                OutputInstalledPackagesTable(context, lines);
+            }
         }
     }
 
@@ -231,7 +590,60 @@ namespace AppInstaller::CLI::Workflow
         m_func(context);
     }
 
-    HRESULT HandleException(Execution::Context& context, std::exception_ptr exception)
+    void WorkflowTask::Log() const
+    {
+        if (m_isFunc)
+        {
+            // Using `00000001`80000000` as base address default when loading dll into windbg as dump file.
+            AICLI_LOG(Workflow, Verbose, << "Running task: 0x" << m_func << " [ln 00000001`80000000+" << std::hex << (reinterpret_cast<char*>(m_func) - reinterpret_cast<char*>(&__ImageBase)) << "]");
+        }
+        else
+        {
+            AICLI_LOG(Workflow, Verbose, << "Running task: " << m_name);
+        }
+    }
+
+    Repository::PredefinedSource DetermineInstalledSource(const Execution::Context& context)
+    {
+        Repository::PredefinedSource installedSource = Repository::PredefinedSource::Installed;
+        Manifest::ScopeEnum scope = Manifest::ConvertToScopeEnum(context.Args.GetArg(Execution::Args::Type::InstallScope));
+        if (scope == Manifest::ScopeEnum::Machine)
+        {
+            installedSource = Repository::PredefinedSource::InstalledMachine;
+        }
+        else if (scope == Manifest::ScopeEnum::User)
+        {
+            installedSource = Repository::PredefinedSource::InstalledUser;
+        }
+
+        return installedSource;
+    }
+
+    Authentication::AuthenticationArguments GetAuthenticationArguments(const Execution::Context& context)
+    {
+        AppInstaller::Authentication::AuthenticationArguments authArgs;
+
+        if (context.Args.Contains(Execution::Args::Type::AuthenticationMode))
+        {
+            authArgs.Mode = Authentication::ConvertToAuthenticationMode(context.Args.GetArg(Execution::Args::Type::AuthenticationMode));
+        }
+        else
+        {
+            // If user did not specify authentication mode, determine based on if disable interactivity flag exists.
+            authArgs.Mode = context.Args.Contains(Execution::Args::Type::DisableInteractivity) ? Authentication::AuthenticationMode::Silent : Authentication::AuthenticationMode::SilentPreferred;
+        }
+
+        if (context.Args.Contains(Execution::Args::Type::AuthenticationAccount))
+        {
+            authArgs.AuthenticationAccount = context.Args.GetArg(Execution::Args::Type::AuthenticationAccount);
+        }
+
+        AICLI_LOG(CLI, Info, << "Created authentication arguments. Mode: " << Authentication::AuthenticationModeToString(authArgs.Mode) << ", Account: " << authArgs.AuthenticationAccount);
+
+        return authArgs;
+    }
+
+    HRESULT HandleException(Execution::Context* context, std::exception_ptr exception)
     {
         try
         {
@@ -242,50 +654,116 @@ namespace AppInstaller::CLI::Workflow
         {
             // Even though they are logged at their source, log again here for completeness.
             Logging::Telemetry().LogException(Logging::FailureTypeEnum::ResultException, re.what());
-            context.Reporter.Error() <<
-                Resource::String::UnexpectedErrorExecutingCommand << ' ' << std::endl <<
-                GetUserPresentableMessage(re) << std::endl;
+            if (context)
+            {
+                context->Reporter.Error() <<
+                    Resource::String::UnexpectedErrorExecutingCommand << ' ' << std::endl <<
+                    GetUserPresentableMessage(re) << std::endl;
+            }
             return re.GetErrorCode();
         }
         catch (const winrt::hresult_error& hre)
         {
             std::string message = GetUserPresentableMessage(hre);
             Logging::Telemetry().LogException(Logging::FailureTypeEnum::WinrtHResultError, message);
-            context.Reporter.Error() <<
-                Resource::String::UnexpectedErrorExecutingCommand << ' ' << std::endl <<
-                message << std::endl;
+            if (context)
+            {
+                context->Reporter.Error() <<
+                    Resource::String::UnexpectedErrorExecutingCommand << ' ' << std::endl <<
+                    message << std::endl;
+            }
             return hre.code();
         }
         catch (const Settings::GroupPolicyException& e)
         {
-            auto policy = Settings::TogglePolicy::GetPolicy(e.Policy());
-            context.Reporter.Error() << Resource::String::DisabledByGroupPolicy << ": "_liv << policy.PolicyName() << std::endl;
+            if (context)
+            {
+                auto policy = Settings::TogglePolicy::GetPolicy(e.Policy());
+                auto policyNameId = policy.PolicyName();
+                context->Reporter.Error() << Resource::String::DisabledByGroupPolicy(policyNameId) << std::endl;
+            }
             return APPINSTALLER_CLI_ERROR_BLOCKED_BY_POLICY;
-        }
-        catch (const Resource::ResourceOpenException& e)
-        {
-            Logging::Telemetry().LogException(Logging::FailureTypeEnum::ResourceOpen, e.what());
-            context.Reporter.Error() << GetUserPresentableMessage(e) << std::endl;
-            return APPINSTALLER_CLI_ERROR_MISSING_RESOURCE_FILE;
         }
         catch (const std::exception& e)
         {
             Logging::Telemetry().LogException(Logging::FailureTypeEnum::StdException, e.what());
-            context.Reporter.Error() <<
-                Resource::String::UnexpectedErrorExecutingCommand << ' ' << std::endl <<
-                GetUserPresentableMessage(e) << std::endl;
+            if (context)
+            {
+                context->Reporter.Error() <<
+                    Resource::String::UnexpectedErrorExecutingCommand << ' ' << std::endl <<
+                    GetUserPresentableMessage(e) << std::endl;
+            }
             return APPINSTALLER_CLI_ERROR_COMMAND_FAILED;
         }
         catch (...)
         {
             LOG_CAUGHT_EXCEPTION();
             Logging::Telemetry().LogException(Logging::FailureTypeEnum::Unknown, {});
-            context.Reporter.Error() <<
-                Resource::String::UnexpectedErrorExecutingCommand << " ???"_liv << std::endl;
+            if (context)
+            {
+                context->Reporter.Error() <<
+                    Resource::String::UnexpectedErrorExecutingCommand << " ???"_liv << std::endl;
+            }
             return APPINSTALLER_CLI_ERROR_COMMAND_FAILED;
         }
 
         return E_UNEXPECTED;
+    }
+
+    HRESULT HandleException(Execution::Context& context, std::exception_ptr exception)
+    {
+        return HandleException(&context, exception);
+    }
+
+    AppInstaller::Manifest::ManifestComparator::Options GetManifestComparatorOptions(const Execution::Context& context, const IPackageVersion::Metadata& metadata)
+    {
+        AppInstaller::Manifest::ManifestComparator::Options options;
+        bool getAllowedArchitecturesFromMetadata = false;
+
+        if (context.Contains(Execution::Data::AllowedArchitectures))
+        {
+            // Com caller can directly set allowed architectures
+            options.AllowedArchitectures = context.Get<Execution::Data::AllowedArchitectures>();
+        }
+        else if (context.Args.Contains(Execution::Args::Type::InstallArchitecture))
+        {
+            // Arguments provided in command line
+            options.AllowedArchitectures.emplace_back(Utility::ConvertToArchitectureEnum(context.Args.GetArg(Execution::Args::Type::InstallArchitecture)));
+        }
+        else if (context.Args.Contains(Execution::Args::Type::InstallerArchitecture))
+        {
+            // Arguments provided in command line. Also skips applicability check.
+            options.AllowedArchitectures.emplace_back(Utility::ConvertToArchitectureEnum(context.Args.GetArg(Execution::Args::Type::InstallerArchitecture)));
+            options.SkipApplicabilityCheck = true;
+        }
+        else
+        {
+            getAllowedArchitecturesFromMetadata = true;
+        }
+
+        if (context.Args.Contains(Execution::Args::Type::InstallerType))
+        {
+            options.RequestedInstallerType = Manifest::ConvertToInstallerTypeEnum(std::string(context.Args.GetArg(Execution::Args::Type::InstallerType)));
+        }
+
+        if (context.Args.Contains(Execution::Args::Type::InstallScope))
+        {
+            options.RequestedInstallerScope = Manifest::ConvertToScopeEnum(context.Args.GetArg(Execution::Args::Type::InstallScope));
+        }
+
+        if (context.Contains(Execution::Data::AllowUnknownScope))
+        {
+            options.AllowUnknownScope = context.Get<Execution::Data::AllowUnknownScope>();
+        }
+
+        if (context.Args.Contains(Execution::Args::Type::Locale))
+        {
+            options.RequestedInstallerLocale = context.Args.GetArg(Execution::Args::Type::Locale);
+        }
+
+        Repository::GetManifestComparatorOptionsFromMetadata(options, metadata, getAllowedArchitecturesFromMetadata);
+
+        return options;
     }
 
     void OpenSource::operator()(Execution::Context& context) const
@@ -306,7 +784,7 @@ namespace AppInstaller::CLI::Workflow
             }
         }
 
-        auto source = OpenNamedSource(context, sourceName);
+        auto source = OpenNamedSource(context, Utility::LocIndView{ sourceName });
         if (context.IsTerminated())
         {
             return;
@@ -362,7 +840,10 @@ namespace AppInstaller::CLI::Workflow
             // A well known predefined source should return a value.
             THROW_HR_IF(E_UNEXPECTED, !source);
 
-            auto openFunction = [&](IProgressCallback& progress)->std::vector<Repository::SourceDetails> { return source.Open(progress); };
+            auto openFunction = [&](IProgressCallback& progress)->std::vector<Repository::SourceDetails>
+            {
+                return source.Open(progress);
+            };
             context.Reporter.ExecuteWithProgress(openFunction, true);
         }
         catch (...)
@@ -399,17 +880,16 @@ namespace AppInstaller::CLI::Workflow
 
         // Create the composite source from the two.
         Repository::Source source;
-        Repository::Source compositeSource;
         if (m_forDependencies)
         {
             source = context.Get<Execution::Data::DependencySource>();
-            compositeSource = Repository::Source{ source, availableSource, CompositeSearchBehavior::AvailablePackages };
         }
         else
         {
             source = context.Get<Execution::Data::Source>();
-            compositeSource = Repository::Source{ source, availableSource };
         }
+
+        Repository::Source compositeSource{ source, availableSource, m_searchBehavior };
 
         // Overwrite the source with the composite.
         if (m_forDependencies)
@@ -433,6 +913,7 @@ namespace AppInstaller::CLI::Workflow
         }
 
         SearchRequest searchRequest;
+
         if (args.Contains(Execution::Args::Type::Query))
         {
             searchRequest.Query.emplace(RequestMatch(matchType, args.GetArg(Execution::Args::Type::Query)));
@@ -454,7 +935,7 @@ namespace AppInstaller::CLI::Workflow
         context.Add<Execution::Data::SearchResult>(context.Get<Execution::Data::Source>().Search(searchRequest));
     }
 
-    void SearchSourceForSingle(Execution::Context& context)
+    void GetSearchRequestForSingle(Execution::Context& context)
     {
         const auto& args = context.Args;
 
@@ -465,13 +946,15 @@ namespace AppInstaller::CLI::Workflow
         }
 
         SearchRequest searchRequest;
+        // Note: MultiQuery when we need search for single is handled with one sub-context per query.
         if (args.Contains(Execution::Args::Type::Query))
         {
             std::string_view query = args.GetArg(Execution::Args::Type::Query);
 
-            // Regardless of match type, always use an exact match for the system reference strings.
+            // Package family names use folded exact matching in the local index. Product codes
+            // must be case-insensitive for REST sources, which may preserve manifest casing.
             searchRequest.Inclusions.emplace_back(PackageMatchFilter(PackageMatchField::PackageFamilyName, MatchType::Exact, query));
-            searchRequest.Inclusions.emplace_back(PackageMatchFilter(PackageMatchField::ProductCode, MatchType::Exact, query));
+            searchRequest.Inclusions.emplace_back(PackageMatchFilter(PackageMatchField::ProductCode, MatchType::CaseInsensitive, query));
             searchRequest.Inclusions.emplace_back(PackageMatchFilter(PackageMatchField::Id, matchType, query));
             searchRequest.Inclusions.emplace_back(PackageMatchFilter(PackageMatchField::Name, matchType, query));
             searchRequest.Inclusions.emplace_back(PackageMatchFilter(PackageMatchField::Moniker, matchType, query));
@@ -479,18 +962,30 @@ namespace AppInstaller::CLI::Workflow
 
         SearchSourceApplyFilters(context, searchRequest, matchType);
 
-        Logging::Telemetry().LogSearchRequest(
-            "single",
-            args.GetArg(Execution::Args::Type::Query),
-            args.GetArg(Execution::Args::Type::Id),
-            args.GetArg(Execution::Args::Type::Name),
-            args.GetArg(Execution::Args::Type::Moniker),
-            args.GetArg(Execution::Args::Type::Tag),
-            args.GetArg(Execution::Args::Type::Command),
-            searchRequest.MaximumResults,
-            searchRequest.ToString());
+        context.Add<Execution::Data::SearchRequest>(std::move(searchRequest));
+    }
 
-        context.Add<Execution::Data::SearchResult>(context.Get<Execution::Data::Source>().Search(searchRequest));
+    void SearchSourceForSingle(Execution::Context& context)
+    {
+        const auto& args = context.Args;
+        context << GetSearchRequestForSingle;
+        if (!context.IsTerminated())
+        {
+            const auto& searchRequest = context.Get<Execution::Data::SearchRequest>();
+
+            Logging::Telemetry().LogSearchRequest(
+                "single",
+                args.GetArg(Execution::Args::Type::Query),
+                args.GetArg(Execution::Args::Type::Id),
+                args.GetArg(Execution::Args::Type::Name),
+                args.GetArg(Execution::Args::Type::Moniker),
+                args.GetArg(Execution::Args::Type::Tag),
+                args.GetArg(Execution::Args::Type::Command),
+                searchRequest.MaximumResults,
+                searchRequest.ToString());
+
+            context.Add<Execution::Data::SearchResult>(context.Get<Execution::Data::Source>().Search(searchRequest));
+        }
     }
 
     void SearchSourceForManyCompletion(Execution::Context& context)
@@ -550,7 +1045,7 @@ namespace AppInstaller::CLI::Workflow
 
         for (size_t i = 0; i < searchResult.Matches.size(); ++i)
         {
-            auto latestVersion = searchResult.Matches[i].Package->GetLatestAvailableVersion();
+            auto latestVersion = GetAllAvailableVersions(searchResult.Matches[i].Package)->GetLatestVersion();
 
             table.OutputLine({
                 latestVersion->GetProperty(PackageVersionProperty::Name),
@@ -580,7 +1075,7 @@ namespace AppInstaller::CLI::Workflow
                 auto warn = context.Reporter.Warn();
                 for (const auto& failure : searchResult.Failures)
                 {
-                    warn << Resource::String::SearchFailureWarning << ' ' << failure.SourceName << std::endl;
+                    warn << Resource::String::SearchFailureWarning(Utility::LocIndView{ failure.SourceName }) << std::endl;
                 }
             }
             else
@@ -589,7 +1084,7 @@ namespace AppInstaller::CLI::Workflow
                 auto error = context.Reporter.Error();
                 for (const auto& failure : searchResult.Failures)
                 {
-                    error << Resource::String::SearchFailureError << ' ' << failure.SourceName << std::endl;
+                    error << Resource::String::SearchFailureError(Utility::LocIndView{ failure.SourceName }) << std::endl;
                     HRESULT failureHR = HandleException(context, failure.Exception);
 
                     // Just take first failure for now
@@ -608,81 +1103,17 @@ namespace AppInstaller::CLI::Workflow
                     else
                     {
                         context.Reporter.Info() << std::endl << Resource::String::SearchFailureErrorListMatches << std::endl;
-                        context << ReportMultiplePackageFoundResultWithSource;
+                        auto table = GetMultiplePackageFoundResultTableWithSource(context);
+                        table.Complete();
+                        if (searchResult.Truncated)
+                        {
+                            context.Reporter.Info() << '<' << Resource::String::SearchTruncated << '>' << std::endl;
+                        }
                     }
                 }
 
                 context.SetTerminationHR(overallHR);
             }
-        }
-    }
-
-    void ReportMultiplePackageFoundResult(Execution::Context& context)
-    {
-        auto& searchResult = context.Get<Execution::Data::SearchResult>();
-
-        Execution::TableOutput<2> table(context.Reporter,
-            {
-                Resource::String::SearchName,
-                Resource::String::SearchId
-            });
-
-        for (size_t i = 0; i < searchResult.Matches.size(); ++i)
-        {
-            auto package = searchResult.Matches[i].Package;
-
-            table.OutputLine({
-                package->GetProperty(PackageProperty::Name),
-                package->GetProperty(PackageProperty::Id)
-                });
-        }
-
-        table.Complete();
-
-        if (searchResult.Truncated)
-        {
-            context.Reporter.Info() << '<' << Resource::String::SearchTruncated << '>' << std::endl;
-        }
-    }
-
-    void ReportMultiplePackageFoundResultWithSource(Execution::Context& context)
-    {
-        auto& searchResult = context.Get<Execution::Data::SearchResult>();
-
-        Execution::TableOutput<3> table(context.Reporter,
-            {
-                Resource::String::SearchName,
-                Resource::String::SearchId,
-                Resource::String::SearchSource
-            });
-
-        for (size_t i = 0; i < searchResult.Matches.size(); ++i)
-        {
-            auto package = searchResult.Matches[i].Package;
-
-            std::string sourceName;
-            auto latest = package->GetLatestAvailableVersion();
-            if (latest)
-            {
-                auto source = latest->GetSource();
-                if (source)
-                {
-                    sourceName = source.GetDetails().Name;
-                }
-            }
-
-            table.OutputLine({
-                package->GetProperty(PackageProperty::Name),
-                package->GetProperty(PackageProperty::Id),
-                std::move(sourceName)
-                });
-        }
-
-        table.Complete();
-
-        if (searchResult.Truncated)
-        {
-            context.Reporter.Info() << '<' << Resource::String::SearchTruncated << '>' << std::endl;
         }
     }
 
@@ -692,20 +1123,58 @@ namespace AppInstaller::CLI::Workflow
 
         std::vector<InstalledPackagesTableLine> lines;
         std::vector<InstalledPackagesTableLine> linesForExplicitUpgrade;
+        std::vector<InstalledPackagesTableLine> linesForPins;
 
         int availableUpgradesCount = 0;
+
+        // We will show a line with a summary for skipped and pinned packages at the end.
+        // The strings suggest using a --include-unknown/pinned argument, so we should
+        // ensure that the count is 0 when using the arguments.
         int packagesWithUnknownVersionSkipped = 0;
+        int packagesWithUserPinsSkipped = 0;
+
         auto &source = context.Get<Execution::Data::Source>();
         bool shouldShowSource = source.IsComposite() && source.GetAvailableSources().size() > 1;
+        bool sourceFilterProvided = context.Args.Contains(Execution::Args::Type::Source);
+
+        PinBehavior pinBehavior;
+        if (m_onlyShowUpgrades && !context.Args.Contains(Execution::Args::Type::Force))
+        {
+            // For listing upgrades, show the version we would upgrade to with the given pins.
+            pinBehavior = context.Args.Contains(Execution::Args::Type::IncludePinned) ? PinBehavior::IncludePinned : PinBehavior::ConsiderPins;
+        }
+        else
+        {
+            // For listing installed apps or if we are ignoring pins due to --force, show the latest available.
+            pinBehavior = PinBehavior::IgnorePins;
+        }
+
+        PinningData pinningData{ PinningData::Disposition::ReadOnly };
 
         for (const auto& match : searchResult.Matches)
         {
-            auto installedVersion = match.Package->GetInstalledVersion();
-
-            if (installedVersion)
+            auto installedPackage = match.Package->GetInstalled();
+            if (!installedPackage)
             {
-                auto latestVersion = match.Package->GetLatestAvailableVersion();
-                bool updateAvailable = match.Package->IsUpdateAvailable();
+                continue;
+            }
+
+            // We only want to evaluate update availability for the latest version.
+            bool isFirstInstalledVersion = true;
+
+            for (const auto& installedVersionKey : installedPackage->GetVersionKeys())
+            {
+                bool isFirstInstalledVersionLocal = isFirstInstalledVersion;
+                isFirstInstalledVersion = false;
+
+                auto installedVersion = installedPackage->GetVersion(installedVersionKey);
+
+                auto evaluator = pinningData.CreatePinStateEvaluator(pinBehavior, installedVersion);
+                auto availableVersions = GetAvailableVersionsForInstalledVersion(match.Package, installedVersion);
+
+                auto latestVersion = evaluator.GetLatestAvailableVersionForPins(availableVersions);
+                bool updateAvailable = isFirstInstalledVersionLocal && evaluator.IsUpdate(latestVersion);
+                bool updateIsPinned = false;
 
                 if (m_onlyShowUpgrades && !context.Args.Contains(Execution::Args::Type::IncludeUnknown) && Utility::Version(installedVersion->GetProperty(PackageVersionProperty::Version)).IsUnknown() && updateAvailable)
                 {
@@ -714,7 +1183,39 @@ namespace AppInstaller::CLI::Workflow
                     continue;
                 }
 
-                // The only time we don't want to output a line is when filtering and no update is available.
+                if (m_onlyShowUpgrades && !updateAvailable && isFirstInstalledVersionLocal)
+                {
+                    // Reuse the evaluator to check if there is an update outside of the pinning
+                    auto unpinnedLatestVersion = availableVersions->GetLatestVersion();
+                    bool updateAvailableWithoutPins = evaluator.IsUpdate(unpinnedLatestVersion);
+
+                    if (updateAvailableWithoutPins)
+                    {
+                        // When given the --include-pinned argument, report blocking and gating pins in a separate table.
+                        // Otherwise, simply show a count of them
+                        if (context.Args.Contains(Execution::Args::Type::IncludePinned))
+                        {
+                            updateIsPinned = true;
+
+                            // Override these so we generate the table line below.
+                            latestVersion = std::move(unpinnedLatestVersion);
+                            updateAvailable = true;
+                        }
+                        else
+                        {
+                            ++packagesWithUserPinsSkipped;
+                            continue;
+                        }
+                    }
+                }
+
+                // When --source is given, only show packages that have a correlation (available version)
+                // in the specified source. Packages with no available match are not from that source.
+                if (sourceFilterProvided && !latestVersion)
+                {
+                    continue;
+                }
+
                 if (updateAvailable || !m_onlyShowUpgrades)
                 {
                     Utility::LocIndString availableVersion, sourceName;
@@ -735,16 +1236,18 @@ namespace AppInstaller::CLI::Workflow
                     // Add/Remove Programs entries.
                     // TODO: De-duplicate this list, and only show (by default) one entry per matched package.
                     InstalledPackagesTableLine line(
-                         installedVersion->GetProperty(PackageVersionProperty::Name),
-                         match.Package->GetProperty(PackageProperty::Id),
-                         installedVersion->GetProperty(PackageVersionProperty::Version),
+                         match.Package,
+                         installedVersion,
                          availableVersion,
                          shouldShowSource ? sourceName : Utility::LocIndString()
                     );
 
-                    auto pinnedState = ConvertToPackagePinnedStateEnum(installedVersion->GetMetadata()[PackageVersionMetadata::PinnedState]);
-                    bool requiresExplicitUpgrade = m_onlyShowUpgrades && pinnedState != PackagePinnedState::NotPinned;
-                    if (requiresExplicitUpgrade)
+                    auto pinnedState = ConvertToPinTypeEnum(installedVersion->GetMetadata()[PackageVersionMetadata::PinnedState]);
+                    if (updateIsPinned)
+                    {
+                        linesForPins.push_back(std::move(line));
+                    }
+                    else if (m_onlyShowUpgrades && pinnedState == PinType::PinnedByManifest)
                     {
                         linesForExplicitUpgrade.push_back(std::move(line));
                     }
@@ -756,7 +1259,7 @@ namespace AppInstaller::CLI::Workflow
             }
         }
 
-        OutputInstalledPackagesTable(context, lines);
+        OutputInstalledPackages(context, lines);
 
         if (lines.empty())
         {
@@ -771,14 +1274,20 @@ namespace AppInstaller::CLI::Workflow
 
             if (m_onlyShowUpgrades)
             {
-                context.Reporter.Info() << availableUpgradesCount << ' ' << Resource::String::AvailableUpgrades << std::endl;
+                context.Reporter.Info() << Resource::String::AvailableUpgrades(availableUpgradesCount) << std::endl;
             }
         }
 
         if (!linesForExplicitUpgrade.empty())
         {
             context.Reporter.Info() << std::endl << Resource::String::UpgradeAvailableForPinned << std::endl;
-            OutputInstalledPackagesTable(context, linesForExplicitUpgrade);
+            OutputInstalledPackages(context, linesForExplicitUpgrade);
+        }
+
+        if (!linesForPins.empty())
+        {
+            context.Reporter.Info() << std::endl << Resource::String::UpgradeBlockedByPinCount(linesForPins.size()) << std::endl;
+            OutputInstalledPackages(context, linesForPins);
         }
 
         if (m_onlyShowUpgrades)
@@ -786,7 +1295,13 @@ namespace AppInstaller::CLI::Workflow
             if (packagesWithUnknownVersionSkipped > 0)
             {
                 AICLI_LOG(CLI, Info, << packagesWithUnknownVersionSkipped << " package(s) skipped due to unknown installed version");
-                context.Reporter.Info() << packagesWithUnknownVersionSkipped << " " << Resource::String::UpgradeUnknownVersionCount << std::endl;
+                context.Reporter.Info() << Resource::String::UpgradeUnknownVersionCount(packagesWithUnknownVersionSkipped) << std::endl;
+            }
+
+            if (packagesWithUserPinsSkipped > 0)
+            {
+                AICLI_LOG(CLI, Info, << packagesWithUserPinsSkipped << " package(s) skipped due to user pins");
+                context.Reporter.Info() << Resource::String::UpgradePinnedByUserCount(packagesWithUserPinsSkipped) << std::endl;
             }
         }
     }
@@ -800,14 +1315,26 @@ namespace AppInstaller::CLI::Workflow
         if (searchResult.Matches.size() == 0)
         {
             Logging::Telemetry().LogNoAppMatch();
-
-            if (m_isFromInstalledSource)
+            
+            switch (m_operationType)
             {
-                context.Reporter.Info() << Resource::String::NoInstalledPackageFound << std::endl;
-            }
-            else
-            {
-                context.Reporter.Info() << Resource::String::NoPackageFound << std::endl;
+                // These search purposes require a package to be found in the Installed Packages
+                case OperationType::Export:
+                case OperationType::List:
+                case OperationType::Uninstall:
+                case OperationType::Pin:
+                case OperationType::Upgrade:
+                case OperationType::Repair:
+                    context.Reporter.Info() << Resource::String::NoInstalledPackageFound << std::endl;
+                    break;
+                case OperationType::Completion:
+                case OperationType::Install:
+                case OperationType::Search:
+                case OperationType::Show:
+                case OperationType::Download:
+                default:
+                    context.Reporter.Info() << Resource::String::NoPackageFound << std::endl;
+                    break;
             }
 
             AICLI_TERMINATE_CONTEXT(APPINSTALLER_CLI_ERROR_NO_APPLICATIONS_FOUND);
@@ -817,31 +1344,94 @@ namespace AppInstaller::CLI::Workflow
     void EnsureOneMatchFromSearchResult::operator()(Execution::Context& context) const
     {
         context <<
-            EnsureMatchesFromSearchResult(m_isFromInstalledSource);
+            EnsureMatchesFromSearchResult(m_operationType);
 
         if (!context.IsTerminated())
         {
             auto& searchResult = context.Get<Execution::Data::SearchResult>();
 
+            bool operationTargetsInstalled = m_operationType == OperationType::Upgrade || m_operationType == OperationType::Uninstall ||
+                m_operationType == OperationType::Repair || m_operationType == OperationType::Export;
+
+            // Try limiting results to highest priority sources
+            if (searchResult.Matches.size() > 1 && !operationTargetsInstalled)
+            {
+                // Find the set of matches that have the highest priority
+                std::vector<ResultMatch> highestPriorityMatches;
+                std::optional<int32_t> highestPriority;
+
+                for (const auto& match : searchResult.Matches)
+                {
+                    std::optional<int32_t> priority = GetSourcePriority(match.Package);
+
+                    // Optional provides overloads that make empty less than valued and empties equal.
+                    if (highestPriority < priority)
+                    {
+                        // Current priority is higher; reset.
+                        highestPriority = priority;
+                        highestPriorityMatches.clear();
+                    }
+                    else if (highestPriority == priority)
+                    {
+                        // Priority is equal, add to the list.
+                    }
+                    else
+                    {
+                        // Current priority is lower, ignore the match.
+                        continue;
+                    }
+
+                    highestPriorityMatches.emplace_back(match);
+                }
+
+                if (highestPriorityMatches.size() < searchResult.Matches.size())
+                {
+                    AICLI_LOG(CLI, Info, << "Replacing search results with only those from the highest priority [" << (highestPriority ? std::to_string(highestPriority.value()) : "none"s) << "].");
+                    searchResult.Matches = std::move(highestPriorityMatches);
+                    context.Reporter.Warn() << Resource::String::MultiplePackagesFoundFilteredBySourcePriority << std::endl;
+                }
+            }
+
+            size_t selectedIndex = 0;
             if (searchResult.Matches.size() > 1)
             {
                 Logging::Telemetry().LogMultiAppMatch();
 
-                if (m_isFromInstalledSource)
+                auto table = operationTargetsInstalled ? GetMultiplePackageFoundResultTable(context) :
+                    GetMultiplePackageFoundResultTableWithSource(context);
+                bool selectionSupported = m_selectionBehavior == PackageSelectionBehavior::Prompt &&
+                    Settings::ExperimentalFeature::IsEnabled(Settings::ExperimentalFeature::Feature::InteractivePackageSelection);
+                std::optional<size_t> selection;
+                if (selectionSupported && !searchResult.Truncated)
                 {
-                    context.Reporter.Warn() << Resource::String::MultipleInstalledPackagesFound << std::endl;
-                    context << ReportMultiplePackageFoundResult;
+                    context << PromptForSelection(table, Resource::String::PackageSelectionTitle);
+                    AICLI_RETURN_IF_TERMINATED(context);
+                    selection = context.Get<Execution::Data::SelectedIndex>();
+                }
+
+                if (selection)
+                {
+                    selectedIndex = *selection;
+                    auto package = searchResult.Matches[selectedIndex].Package;
+                    context.Reporter.Info() << Resource::String::PackageSelectionSelected(package->GetProperty(PackageProperty::Name),
+                        package->GetProperty(PackageProperty::Id)) << std::endl;
                 }
                 else
                 {
-                    context.Reporter.Warn() << Resource::String::MultiplePackagesFound << std::endl;
-                    context << ReportMultiplePackageFoundResultWithSource;
+                    context.Reporter.Warn() << (operationTargetsInstalled ? Resource::String::MultipleInstalledPackagesFound :
+                        Resource::String::MultiplePackagesFound) << std::endl;
+                    table.Complete();
+                    if (searchResult.Truncated)
+                    {
+                        context.Reporter.Info() << '<' << Resource::String::SearchTruncated << '>' << std::endl;
+                    }
+                    context.Reporter.Info() << (m_operationType == OperationType::Export ?
+                        Resource::String::PackageSelectionRefineForExport : Resource::String::PackageSelectionRefine) << std::endl;
+                    AICLI_TERMINATE_CONTEXT(APPINSTALLER_CLI_ERROR_MULTIPLE_APPLICATIONS_FOUND);
                 }
-
-                AICLI_TERMINATE_CONTEXT(APPINSTALLER_CLI_ERROR_MULTIPLE_APPLICATIONS_FOUND);
             }
 
-            std::shared_ptr<IPackage> package = searchResult.Matches.at(0).Package;
+            std::shared_ptr<ICompositePackage> package = searchResult.Matches.at(selectedIndex).Package;
             Logging::Telemetry().LogAppFound(package->GetProperty(PackageProperty::Name), package->GetProperty(PackageProperty::Id));
 
             context.Add<Execution::Data::Package>(std::move(package));
@@ -851,7 +1441,69 @@ namespace AppInstaller::CLI::Workflow
     void GetManifestWithVersionFromPackage::operator()(Execution::Context& context) const
     {
         PackageVersionKey key("", m_version, m_channel);
-        auto requestedVersion = context.Get<Execution::Data::Package>()->GetAvailableVersion(key);
+
+        std::shared_ptr<ICompositePackage> package = context.Get<Execution::Data::Package>();
+        std::shared_ptr<IPackageVersion> requestedVersion;
+        auto availableVersions = GetAvailableVersionsForInstalledVersion(package);
+
+        if (m_considerPins)
+        {
+            bool isPinned = false;
+
+            PinBehavior pinBehavior;
+            if (context.Args.Contains(Execution::Args::Type::Force))
+            {
+                // --force ignores any pins
+                pinBehavior = PinBehavior::IgnorePins;
+            }
+            else
+            {
+                pinBehavior = context.Args.Contains(Execution::Args::Type::IncludePinned) ? PinBehavior::IncludePinned : PinBehavior::ConsiderPins;
+            }
+
+            PinningData pinningData{ PinningData::Disposition::ReadOnly };
+            auto evaluator = pinningData.CreatePinStateEvaluator(pinBehavior, GetInstalledVersion(package));
+
+            // TODO: The logic here will probably have to get more difficult once we support channels
+            if (Utility::IsEmptyOrWhitespace(m_version) && Utility::IsEmptyOrWhitespace(m_channel))
+            {
+                requestedVersion = evaluator.GetLatestAvailableVersionForPins(availableVersions);
+
+                if (!requestedVersion)
+                {
+                    // Check whether we didn't find the latest version because it was pinned or because there wasn't one
+                    auto latestVersion = availableVersions->GetLatestVersion();
+                    if (latestVersion)
+                    {
+                        isPinned = true;
+                    }
+                }
+            }
+            else
+            {
+                requestedVersion = availableVersions->GetVersion(key);
+                isPinned = evaluator.EvaluatePinType(requestedVersion) != PinType::Unknown;
+            }
+
+            if (isPinned)
+            {
+                if (context.Args.Contains(Execution::Args::Type::Force))
+                {
+                    AICLI_LOG(CLI, Info, << "Ignoring pin on package due to --force argument");
+                }
+                else
+                {
+                    AICLI_LOG(CLI, Error, << "The requested package version is unavailable because of a pin");
+                    context.Reporter.Error() << Resource::String::PackageIsPinned << std::endl;
+                    AICLI_TERMINATE_CONTEXT(APPINSTALLER_CLI_ERROR_PACKAGE_IS_PINNED);
+                }
+            }
+        }
+        else
+        {
+            // The simple case: Just look up the requested version
+            requestedVersion = availableVersions->GetVersion(key);
+        }
 
         std::optional<Manifest::Manifest> manifest;
         if (requestedVersion)
@@ -861,18 +1513,17 @@ namespace AppInstaller::CLI::Workflow
 
         if (!manifest)
         {
-            auto errorStream = context.Reporter.Error();
-            errorStream << Resource::String::GetManifestResultVersionNotFound << ' ';
+            std::ostringstream ssVersionInfo;
             if (!m_version.empty())
             {
-                errorStream << m_version;
+                ssVersionInfo << m_version;
             }
             if (!m_channel.empty())
             {
-                errorStream << '[' << m_channel << ']';
+                ssVersionInfo << '[' << m_channel << ']';
             }
 
-            errorStream << std::endl;
+            context.Reporter.Error() << Resource::String::GetManifestResultVersionNotFound(Utility::LocIndView{ ssVersionInfo.str()}) << std::endl;
             AICLI_TERMINATE_CONTEXT(APPINSTALLER_CLI_ERROR_NO_MANIFEST_FOUND);
         }
 
@@ -889,9 +1540,12 @@ namespace AppInstaller::CLI::Workflow
         context.Add<Execution::Data::PackageVersion>(std::move(requestedVersion));
     }
 
-    void GetManifestFromPackage(Execution::Context& context)
+    void GetManifestFromPackage::operator()(Execution::Context& context) const
     {
-        context << GetManifestWithVersionFromPackage(context.Args.GetArg(Execution::Args::Type::Version), context.Args.GetArg(Execution::Args::Type::Channel));
+        context << GetManifestWithVersionFromPackage(
+            context.Args.GetArg(Execution::Args::Type::Version),
+            context.Args.GetArg(Execution::Args::Type::Channel),
+            m_considerPins);
     }
 
     void VerifyFile::operator()(Execution::Context& context) const
@@ -900,13 +1554,13 @@ namespace AppInstaller::CLI::Workflow
 
         if (!std::filesystem::exists(path))
         {
-            context.Reporter.Error() << Resource::String::VerifyFileFailedNotExist << ' ' << path.u8string() << std::endl;
+            context.Reporter.Error() << Resource::String::VerifyFileFailedNotExist(Utility::LocIndView{ path.u8string() }) << std::endl;
             AICLI_TERMINATE_CONTEXT(HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND));
         }
 
         if (std::filesystem::is_directory(path))
         {
-            context.Reporter.Error() << Resource::String::VerifyFileFailedIsDirectory << ' ' << path.u8string() << std::endl;
+            context.Reporter.Error() << Resource::String::VerifyFileFailedIsDirectory(Utility::LocIndView{ path.u8string() }) << std::endl;
             AICLI_TERMINATE_CONTEXT(HRESULT_FROM_WIN32(ERROR_DIRECTORY_NOT_SUPPORTED));
         }
     }
@@ -917,8 +1571,57 @@ namespace AppInstaller::CLI::Workflow
 
         if (!std::filesystem::exists(path))
         {
-            context.Reporter.Error() << Resource::String::VerifyPathFailedNotExist << ' ' << path.u8string() << std::endl;
+            context.Reporter.Error() << Resource::String::VerifyPathFailedNotExist(Utility::LocIndView{ path.u8string() }) << std::endl;
             AICLI_TERMINATE_CONTEXT(HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND));
+        }
+    }
+
+    void VerifyFileOrUri::operator()(Execution::Context& context) const
+    {
+        // Argument requirement is handled elsewhere.
+        if (!context.Args.Contains(m_arg))
+        {
+            return;
+        }
+
+        auto path = context.Args.GetArg(m_arg);
+
+        // try uri first
+        Uri pathAsUri = nullptr;
+        try
+        {
+            pathAsUri = Uri{ Utility::ConvertToUTF16(path) };
+        }
+        catch (...) {}
+
+        if (pathAsUri)
+        {
+            if (pathAsUri.Suspicious())
+            {
+                context.Reporter.Error() << Resource::String::UriNotWellFormed(Utility::LocIndView{ path }) << std::endl;
+                AICLI_TERMINATE_CONTEXT(HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED));
+            }
+            // SchemeName() always returns lower case
+            else if (L"file" == pathAsUri.SchemeName() && !Utility::CaseInsensitiveStartsWith(path, "file:"))
+            {
+                // Uri constructor is smart enough to parse an absolute local file path to file uri.
+                // In this case, we should continue with VerifyFile.
+                context << VerifyFile(m_arg);
+            }
+            else if (std::find(m_supportedSchemes.begin(), m_supportedSchemes.end(), pathAsUri.SchemeName()) != m_supportedSchemes.end())
+            {
+                // Scheme supported.
+                return;
+            }
+            else
+            {
+                context.Reporter.Error() << Resource::String::UriSchemeNotSupported(Utility::LocIndView{ path }) << std::endl;
+                AICLI_TERMINATE_CONTEXT(HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED));
+            }
+        }
+        else
+        {
+            context << VerifyFile(m_arg);
         }
     }
 
@@ -950,77 +1653,57 @@ namespace AppInstaller::CLI::Workflow
         ReportIdentity(context, {}, Resource::String::ReportIdentityFound, package->GetProperty(PackageProperty::Name), package->GetProperty(PackageProperty::Id));
     }
 
+    void ReportInstalledPackageVersionIdentity(Execution::Context& context)
+    {
+        auto package = context.Get<Execution::Data::Package>();
+        auto version = context.Get<Execution::Data::InstalledPackageVersion>();
+        ReportIdentity(context, {}, Resource::String::ReportIdentityFound, version->GetProperty(PackageVersionProperty::Name), package ? package->GetProperty(PackageProperty::Id) : version->GetProperty(PackageVersionProperty::Id));
+    }
+
     void ReportManifestIdentity(Execution::Context& context)
     {
         const auto& manifest = context.Get<Execution::Data::Manifest>();
         ReportIdentity(context, {}, Resource::String::ReportIdentityFound, manifest.CurrentLocalization.Get<Manifest::Localization::PackageName>(), manifest.Id);
+        ShowManifestIcon(context, manifest);
     }
 
     void ReportManifestIdentityWithVersion::operator()(Execution::Context& context) const
     {
         const auto& manifest = context.Get<Execution::Data::Manifest>();
         ReportIdentity(context, m_prefix, m_label, manifest.CurrentLocalization.Get<Manifest::Localization::PackageName>(), manifest.Id, manifest.Version, m_level);
-    }
-
-    void GetManifest(Execution::Context& context)
-    {
-        if (context.Args.Contains(Execution::Args::Type::Manifest))
-        {
-            context <<
-                GetManifestFromArg;
-        }
-        else
-        {
-            context <<
-                OpenSource() <<
-                SearchSourceForSingle <<
-                HandleSearchResultFailures <<
-                EnsureOneMatchFromSearchResult(false) <<
-                GetManifestFromPackage;
-        }
+        ShowManifestIcon(context, manifest);
     }
 
     void SelectInstaller(Execution::Context& context)
     {
         bool isUpdate = WI_IsFlagSet(context.GetFlags(), Execution::ContextFlag::InstallerExecutionUseUpdate);
+        bool isRepair = WI_IsFlagSet(context.GetFlags(), Execution::ContextFlag::InstallerExecutionUseRepair);
 
         IPackageVersion::Metadata installationMetadata;
 
-        if (isUpdate)
+        if (isUpdate || isRepair)
         {
             installationMetadata = context.Get<Execution::Data::InstalledPackageVersion>()->GetMetadata();
         }
-        if (context.Args.Contains(Execution::Args::Type::InstallArchitecture))
-        {
-            // arguments override settings.
-            context.Add<Execution::Data::AllowedArchitectures>({ Utility::ConvertToArchitectureEnum(std::string(context.Args.GetArg(Execution::Args::Type::InstallArchitecture))) });
-        }
-        else 
-        {
-            std::vector<Utility::Architecture> requiredArchitectures = Settings::User().Get<Settings::Setting::InstallArchitectureRequirement>();
-            std::vector<Utility::Architecture> optionalArchitectures = Settings::User().Get<Settings::Setting::InstallArchitecturePreference>();
 
-            if (!requiredArchitectures.empty())
-            {
-                context.Add<Execution::Data::AllowedArchitectures>({ requiredArchitectures.begin(), requiredArchitectures.end() });
-            }
-            else if (!optionalArchitectures.empty())
-            {
-                optionalArchitectures.emplace_back(Utility::Architecture::Unknown);
-                context.Add<Execution::Data::AllowedArchitectures>({ optionalArchitectures.begin(), optionalArchitectures.end() });
-            }
-        }
-
-        ManifestComparator manifestComparator(context, installationMetadata);
+        Manifest::ManifestComparator manifestComparator(GetManifestComparatorOptions(context, installationMetadata));
         auto [installer, inapplicabilities] = manifestComparator.GetPreferredInstaller(context.Get<Execution::Data::Manifest>());
 
         if (!installer.has_value())
         {
-            auto onlyInstalledType = std::find(inapplicabilities.begin(), inapplicabilities.end(), InapplicabilityFlags::InstalledType);
+            auto onlyInstalledType = std::find(inapplicabilities.begin(), inapplicabilities.end(), Manifest::InapplicabilityFlags::InstalledType);
             if (onlyInstalledType != inapplicabilities.end())
             {
-                context.Reporter.Info() << Resource::String::UpgradeDifferentInstallTechnology << std::endl;
-                AICLI_TERMINATE_CONTEXT(APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE);
+                if (isRepair)
+                {
+                    context.Reporter.Info() << Resource::String::RepairDifferentInstallTechnology << std::endl;
+                    AICLI_TERMINATE_CONTEXT(APPINSTALLER_CLI_ERROR_REPAIR_NOT_APPLICABLE);
+                }
+                else
+                {
+                    context.Reporter.Info() << Resource::String::UpgradeDifferentInstallTechnology << std::endl;
+                    AICLI_TERMINATE_CONTEXT(APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE);
+                }
             }
         }
 
@@ -1050,8 +1733,9 @@ namespace AppInstaller::CLI::Workflow
     {
         if (!Settings::ExperimentalFeature::IsEnabled(m_feature))
         {
-            context.Reporter.Error() << Resource::String::FeatureDisabledMessage << " : '" <<
-                Settings::ExperimentalFeature::GetFeature(m_feature).JsonName() << '\'' << std::endl;
+            context.Reporter.Error()
+                << Resource::String::FeatureDisabledMessage(Utility::LocIndView{ Settings::ExperimentalFeature::GetFeature(m_feature).JsonName() })
+                << std::endl;
             AICLI_LOG(CLI, Error, << Settings::ExperimentalFeature::GetFeature(m_feature).Name() << " feature is disabled. Execution cancelled.");
             AICLI_TERMINATE_CONTEXT(APPINSTALLER_CLI_ERROR_EXPERIMENTAL_FEATURE_DISABLED);
         }
@@ -1076,8 +1760,13 @@ namespace AppInstaller::CLI::Workflow
             }
             else if (installer.EffectiveInstallerType() == Manifest::InstallerTypeEnum::Portable)
             {
-                const auto& productCode = Utility::MakeSuitablePathPart(manifest.Id + "_" + source.GetIdentifier());
+                const auto& productCode = Utility::MakeSuitablePathPart(manifest.Id + '_' + source.GetIdentifier());
                 searchRequest.Inclusions.emplace_back(PackageMatchFilter(PackageMatchField::ProductCode, MatchType::CaseInsensitive, Utility::Normalize(productCode)));
+            }
+            else if (installer.EffectiveInstallerType() == Manifest::InstallerTypeEnum::Font)
+            {
+                // Font Packages match by Package Id first.
+                searchRequest.Inclusions.emplace_back(PackageMatchFilter(PackageMatchField::Id, MatchType::CaseInsensitive, manifest.Id));
             }
 
             if (!searchRequest.Inclusions.empty())
@@ -1113,12 +1802,52 @@ namespace AppInstaller::CLI::Workflow
 
     void GetInstalledPackageVersion(Execution::Context& context)
     {
-        context.Add<Execution::Data::InstalledPackageVersion>(context.Get<Execution::Data::Package>()->GetInstalledVersion());
+        std::shared_ptr<IPackage> installed = context.Get<Execution::Data::Package>()->GetInstalled();
+
+        if (installed)
+        {
+            // TODO: This may need to be expanded dramatically to enable targeting across a variety of dimensions (architecture, etc.)
+            //       Alternatively, if we make it easier to see the fully unique package identifiers, we may avoid that need.
+            if (context.Args.Contains(Execution::Args::Type::TargetVersion))
+            {
+                Repository::PackageVersionKey versionKey{ "", context.Args.GetArg(Execution::Args::Type::TargetVersion) , "" };
+                std::shared_ptr<IPackageVersion> installedVersion = installed->GetVersion(versionKey);
+
+                if (!installedVersion)
+                {
+                    context.Reporter.Error() << Resource::String::GetManifestResultVersionNotFound(Utility::LocIndView{ versionKey.Version }) << std::endl;
+                    // This error maintains consistency with passing an available version to commands
+                    AICLI_TERMINATE_CONTEXT(APPINSTALLER_CLI_ERROR_NO_MANIFEST_FOUND);
+                }
+
+                context.Add<Execution::Data::InstalledPackageVersion>(std::move(installedVersion));
+            }
+            else
+            {
+                context.Add<Execution::Data::InstalledPackageVersion>(installed->GetLatestVersion());
+            }
+        }
+        else
+        {
+            context.Add<Execution::Data::InstalledPackageVersion>(nullptr);
+        }
     }
 
     void ReportExecutionStage::operator()(Execution::Context& context) const
     {
         context.SetExecutionStage(m_stage);
+    }
+
+    void ShowAppVersions(Execution::Context& context)
+    {
+        auto versions = GetAllAvailableVersions(context.Get<Execution::Data::Package>())->GetVersionKeys();
+
+        Execution::TableOutput<2> table(context.Reporter, { Resource::String::ShowVersion, Resource::String::ShowChannel });
+        for (const auto& version : versions)
+        {
+            table.OutputLine({ version.Version, version.Channel });
+        }
+        table.Complete();
     }
 }
 
@@ -1129,12 +1858,13 @@ AppInstaller::CLI::Execution::Context& operator<<(AppInstaller::CLI::Execution::
 
 AppInstaller::CLI::Execution::Context& operator<<(AppInstaller::CLI::Execution::Context& context, const AppInstaller::CLI::Workflow::WorkflowTask& task)
 {
-    if (!context.IsTerminated())
+    if (!context.IsTerminated() || task.ExecuteAlways())
     {
 #ifndef AICLI_DISABLE_TEST_HOOKS
         if (context.ShouldExecuteWorkflowTask(task))
 #endif
         {
+            task.Log();
             task(context);
         }
     }

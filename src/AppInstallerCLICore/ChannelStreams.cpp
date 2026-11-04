@@ -6,8 +6,35 @@
 
 namespace AppInstaller::CLI::Execution
 {
-    using namespace Settings;
     using namespace VirtualTerminal;
+
+#ifndef AICLI_DISABLE_TEST_HOOKS
+    static std::optional<size_t>* s_consoleWidthOverride = nullptr;
+
+    void TestHook_SetConsoleWidth_Override(std::optional<size_t>* value)
+    {
+        s_consoleWidthOverride = value;
+    }
+#endif
+
+    std::optional<size_t> GetConsoleWidth()
+    {
+#ifndef AICLI_DISABLE_TEST_HOOKS
+        if (s_consoleWidthOverride)
+        {
+            return *s_consoleWidthOverride;
+        }
+#endif
+        CONSOLE_SCREEN_BUFFER_INFO consoleInfo{};
+        if (GetConsoleScreenBufferInfo(GetStdHandle(STD_OUTPUT_HANDLE), &consoleInfo))
+        {
+            return static_cast<size_t>(consoleInfo.dwSize.X);
+        }
+        else
+        {
+            return std::nullopt;
+        }
+    }
 
     BaseStream::BaseStream(std::ostream& out, bool enabled, bool VTEnabled) :
         m_out(out), m_enabled(enabled), m_VTEnabled(VTEnabled) {}
@@ -59,6 +86,11 @@ namespace AppInstaller::CLI::Execution
         m_enabled = false;
     }
 
+    std::ostream& BaseStream::Get()
+    {
+        return m_out;
+    }
+
     OutputStream::OutputStream(BaseStream& out, bool enabled, bool VTEnabled) :
         m_out(out),
         m_enabled(enabled),
@@ -68,6 +100,11 @@ namespace AppInstaller::CLI::Execution
     void OutputStream::AddFormat(const Sequence& sequence)
     {
         m_format.Append(sequence);
+    }
+
+    void OutputStream::ClearFormat()
+    {
+        m_format.Clear();
     }
 
     void OutputStream::ApplyFormat()
@@ -96,6 +133,9 @@ namespace AppInstaller::CLI::Execution
     {
         if (m_enabled && m_VTEnabled)
         {
+            // Apply format as normal to ensure that any previous format doesn't bleed through.
+            ApplyFormat();
+
             m_out << sequence;
 
             // An incoming sequence will be valid for 1 "standard" output after this one.
@@ -111,6 +151,9 @@ namespace AppInstaller::CLI::Execution
     {
         if (m_enabled && m_VTEnabled)
         {
+            // Apply format as normal to ensure that any previous format doesn't bleed through.
+            ApplyFormat();
+
             m_out << sequence;
             // An incoming sequence will be valid for 1 "standard" output after this one.
             // We set this to 2 to make that happen, because when it is 1, we will output

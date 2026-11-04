@@ -1,14 +1,15 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 #include "pch.h"
 #include "TestCommon.h"
 #include <AppInstallerStrings.h>
-#include <AppInstallerSHA256.h>
 #include <ExecutionReporter.h>
+#include <winget/Hash.h>
 
+using namespace std::string_literals;
 using namespace std::string_view_literals;
 using namespace AppInstaller::Utility;
-
+using namespace AppInstaller::Utility::literals;
 
 TEST_CASE("UTF8Length", "[strings]")
 {
@@ -117,6 +118,9 @@ TEST_CASE("Trim", "[strings]")
     REQUIRE(Trim(str.assign("Multiple words")) == "Multiple words");
     REQUIRE(Trim(str.assign("         Multiple words")) == "Multiple words");
     REQUIRE(Trim(str.assign("Much after is taken \f\n\r\t\v\v\t\r\n\f ")) == "Much after is taken");
+
+    REQUIRE(Trim(L" Test"sv) == L"Test");
+    REQUIRE(Trim(L"   "sv) == L"");
 }
 
 TEST_CASE("CaseInsensitiveStartsWith", "[strings]")
@@ -130,6 +134,25 @@ TEST_CASE("CaseInsensitiveStartsWith", "[strings]")
     REQUIRE(!CaseInsensitiveStartsWith("", "nuffing"));
     REQUIRE(!CaseInsensitiveStartsWith("withstarts", "starts"));
     REQUIRE(!CaseInsensitiveStartsWith(" starts", "starts"));
+}
+
+TEST_CASE("ICUCaseInsensitiveStartsWith", "[strings]")
+{
+    REQUIRE(ICUCaseInsensitiveStartsWith("startswith", "starts"));
+    REQUIRE(ICUCaseInsensitiveStartsWith("startswith", "STAR"));
+    REQUIRE(ICUCaseInsensitiveStartsWith("startswith", "STARTSWITH"));
+    REQUIRE(ICUCaseInsensitiveStartsWith("startswith", ""));
+    REQUIRE(ICUCaseInsensitiveStartsWith("", ""));
+    REQUIRE_FALSE(ICUCaseInsensitiveStartsWith("starts", "startswith"));
+    REQUIRE_FALSE(ICUCaseInsensitiveStartsWith("", "starts"));
+    REQUIRE_FALSE(ICUCaseInsensitiveStartsWith("withstarts", "starts"));
+    REQUIRE_FALSE(ICUCaseInsensitiveStartsWith(" starts", "starts"));
+
+    REQUIRE(ICUCaseInsensitiveStartsWith(u8"Vendor.\u1E9EApp", u8"vendor.\u00DF"));
+    REQUIRE(ICUCaseInsensitiveStartsWith(u8"Vendor.\u00DFApp", u8"vendor.\u1E9E"));
+    REQUIRE(ICUCaseInsensitiveStartsWith(u8"Stra\u00DFe", "STRASSE"));
+    REQUIRE(ICUCaseInsensitiveStartsWith("STRASSE", u8"stra\u00DFe"));
+    REQUIRE_FALSE(ICUCaseInsensitiveStartsWith(u8"Vendor.\u00DFApp", "vendor.st"));
 }
 
 TEST_CASE("FoldCase", "[strings]")
@@ -190,6 +213,47 @@ TEST_CASE("MakeSuitablePathPart", "[strings]")
     REQUIRE(MakeSuitablePathPart(std::string(300, ' ')) == SHA256::ConvertToString(SHA256::ComputeHash(std::string(300, ' '))));
     REQUIRE_THROWS_HR(MakeSuitablePathPart("COM1"), E_INVALIDARG);
     REQUIRE_THROWS_HR(MakeSuitablePathPart("NUL.txt"), E_INVALIDARG);
+
+    // The superscript digit forms of COM and LPT are reserved as well.
+    REQUIRE_THROWS_HR(MakeSuitablePathPart("COM\xC2\xB9"), E_INVALIDARG);
+    REQUIRE_THROWS_HR(MakeSuitablePathPart("COM\xC2\xB2"), E_INVALIDARG);
+    REQUIRE_THROWS_HR(MakeSuitablePathPart("COM\xC2\xB3"), E_INVALIDARG);
+    REQUIRE_THROWS_HR(MakeSuitablePathPart("LPT\xC2\xB9"), E_INVALIDARG);
+    REQUIRE_THROWS_HR(MakeSuitablePathPart("LPT\xC2\xB2"), E_INVALIDARG);
+    REQUIRE_THROWS_HR(MakeSuitablePathPart("LPT\xC2\xB3"), E_INVALIDARG);
+    REQUIRE_THROWS_HR(MakeSuitablePathPart("lpt\xC2\xB3.txt"), E_INVALIDARG);
+
+    // Only the exact superscript digits are reserved; other trailing values are not.
+    REQUIRE(MakeSuitablePathPart("COM\xC2\xB4") == "COM\xC2\xB4");
+    REQUIRE(MakeSuitablePathPart("COM\xC2\xB9" "0") == "COM\xC2\xB9" "0");
+
+    // A prepended character such as U+0600 joins the next character into its cluster, which must still be replaced.
+    REQUIRE(MakeSuitablePathPart("file\xD8\x80:stream") == "file\xD8\x80_stream");
+    REQUIRE(MakeSuitablePathPart("a\xD8\x80\\b") == "a\xD8\x80_b");
+
+    // Win32 removes trailing spaces when normalizing a path, so they are removed here too. Otherwise two
+    // values that differ only by trailing spaces would collide on disk while appearing distinct.
+    REQUIRE(MakeSuitablePathPart("AB ") == "AB");
+    REQUIRE(MakeSuitablePathPart("AB   ") == "AB");
+    REQUIRE(MakeSuitablePathPart("A B") == "A B");
+    REQUIRE(MakeSuitablePathPart(" AB") == " AB");
+
+    // Removing the trailing spaces can expose a . at the end of the name, which is also not allowed.
+    REQUIRE(MakeSuitablePathPart("AB. ") == "AB_");
+    REQUIRE(MakeSuitablePathPart("AB.  ") == "AB_");
+    REQUIRE(MakeSuitablePathPart("AB. . ") == "AB. _");
+
+    // A reserved name is still reserved once the trailing spaces are removed, as Win32 would remove them
+    // before resolving the name.
+    REQUIRE_THROWS_HR(MakeSuitablePathPart("CON "), E_INVALIDARG);
+    REQUIRE_THROWS_HR(MakeSuitablePathPart("NUL.txt  "), E_INVALIDARG);
+
+    // A candidate that is left with nothing cannot be used as a path part.
+    REQUIRE_THROWS_HR(MakeSuitablePathPart(" "), E_INVALIDARG);
+    REQUIRE_THROWS_HR(MakeSuitablePathPart("   "), E_INVALIDARG);
+
+    // An empty candidate is unchanged; emptiness is the caller's concern.
+    REQUIRE(MakeSuitablePathPart("") == "");
 }
 
 TEST_CASE("GetFileNameFromURI", "[strings]")
@@ -197,6 +261,20 @@ TEST_CASE("GetFileNameFromURI", "[strings]")
     REQUIRE(GetFileNameFromURI("https://github.com/microsoft/winget-cli/pull/1722").u8string() == "1722");
     REQUIRE(GetFileNameFromURI("https://github.com/microsoft/winget-cli/README.md").u8string() == "README.md");
     REQUIRE(GetFileNameFromURI("https://microsoft.com/").u8string() == "");
+}
+
+void ValidateSplitFileName(std::string_view uri, std::string_view base, std::string_view fileName)
+{
+    auto split = SplitFileNameFromURI(uri);
+    REQUIRE(split.first == base);
+    REQUIRE(split.second.u8string() == fileName);
+}
+
+TEST_CASE("SplitFileNameFromURI", "[strings]")
+{
+    ValidateSplitFileName("https://github.com/microsoft/winget-cli/pull/1722", "https://github.com/microsoft/winget-cli/pull/", "1722");
+    ValidateSplitFileName("https://github.com/microsoft/winget-cli/README.md", "https://github.com/microsoft/winget-cli/", "README.md");
+    ValidateSplitFileName("https://microsoft.com/", "https://microsoft.com/", "");
 }
 
 TEST_CASE("SplitIntoWords", "[strings]")
@@ -224,4 +302,140 @@ TEST_CASE("HexStrings", "[strings]")
 
     REQUIRE(value == ConvertToHexString(buffer));
     REQUIRE(std::equal(buffer.begin(), buffer.end(), ParseFromHexString(value).begin()));
+}
+
+TEST_CASE("Join", "[strings]")
+{
+    std::vector<LocIndString> list_0{ };
+    std::vector<LocIndString> list_1{ "A"_lis };
+    std::vector<LocIndString> list_2{ "A"_lis, "B"_lis };
+
+    REQUIRE(""_lis == Join(", "_liv, list_0));
+    REQUIRE("A"_lis == Join(", "_liv, list_1));
+    REQUIRE("A, B"_lis == Join(", "_liv, list_2));
+    REQUIRE("AB"_lis == Join(""_liv, list_2));
+}
+
+TEST_CASE("Format", "[strings]")
+{
+    REQUIRE("First Second" == Format("{0} {1}", "First", "Second"));
+    REQUIRE("First Second" == Format("{1} {0}", "Second", "First"));
+    REQUIRE("First Second" == Format("{0} {1}", "First", "Second", "(Extra", "Input", "Ignored)"));
+    REQUIRE("First Second First Second" == Format("{0} {1} {0} {1}", "First", "Second"));
+
+    // Note: C++20 std::format will throw an exception for this test case
+    REQUIRE("First {1}" == Format("{0} {1}", "First"));
+}
+
+TEST_CASE("SplitIntoLines", "[strings]")
+{
+    REQUIRE(SplitIntoLines("Boring test") == std::vector<std::string>{ "Boring test" });
+    REQUIRE(SplitIntoLines(
+        "I'm Luffy! The Man Who Will Become the Pirate King!\r-Monkey D. Luffy") == std::vector<std::string>{ "I'm Luffy! The Man Who Will Become the Pirate King!", "-Monkey D. Luffy" });
+    REQUIRE(SplitIntoLines(
+        "I want live!\n-Nico Robin") == std::vector<std::string>{ "I want live!", "-Nico Robin" });
+    REQUIRE(SplitIntoLines(
+        "You want my treasure?\rYou can have it!\nI left everything I gathered in one place!\r\nYou just have to find it!")
+        == std::vector<std::string>{ "You want my treasure?", "You can have it!", "I left everything I gathered in one place!", "You just have to find it!" });
+}
+
+TEST_CASE("SplitWithSeparator", "[strings]")
+{
+    std::vector<std::string> test1 = Split("first;second;third"s, ';');
+    REQUIRE(test1.size() == 3);
+    REQUIRE(test1[0] == "first");
+    REQUIRE(test1[1] == "second");
+    REQUIRE(test1[2] == "third");
+
+    std::vector<std::string> test2 = Split("two  spaces"s, ' ');
+    REQUIRE(test2.size() == 3);
+    REQUIRE(test2[0] == "two");
+    REQUIRE(test2[1] == "");
+    REQUIRE(test2[2] == "spaces");
+
+    std::vector<std::string> test3 = Split("test"s, '.');
+    REQUIRE(test3.size() == 1);
+    REQUIRE(test3[0] == "test");
+
+    std::vector<std::string> test4 = Split(" trim |    spaces "s, '|', true);
+    REQUIRE(test4.size() == 2);
+    REQUIRE(test4[0] == "trim");
+    REQUIRE(test4[1] == "spaces");
+
+    std::vector<std::wstring_view> test5 = Split(L" trim /spaces /  "sv, '/', true);
+    REQUIRE(test5.size() == 3);
+    REQUIRE(test5[0] == L"trim");
+    REQUIRE(test5[1] == L"spaces");
+    REQUIRE(test5[2] == L"");
+
+    std::vector<std::wstring_view> test6 = Split(L" "sv, '/', true);
+    REQUIRE(test6.size() == 1);
+    REQUIRE(test6[0] == L"");
+
+    std::vector<std::string> test7 = Split(""s, ';');
+    REQUIRE(test7.size() == 1);
+    REQUIRE(test7[0] == "");
+}
+
+TEST_CASE("ConvertGuid", "[strings]")
+{
+    std::string validGuidString = "{4d1e55b2-f16f-11cf-88cb-001111000030}";
+    GUID guid = { 0x4d1e55b2, 0xf16f, 0x11cf, 0x88, 0xcb, 0x00, 0x11, 0x11, 0x00, 0x00, 0x30 };
+
+    REQUIRE(CaseInsensitiveEquals(ConvertGuidToString(guid), validGuidString));
+}
+
+TEST_CASE("FindControlCodeToConvert", "[strings]")
+{
+    REQUIRE(FindControlCodeToConvert("No codes") == std::string::npos);
+    REQUIRE(FindControlCodeToConvert("Allowed codes: \t\r\n") == std::string::npos);
+    REQUIRE(FindControlCodeToConvert("\x1bSkipped code", 1) == std::string::npos);
+
+    REQUIRE(FindControlCodeToConvert("\x1bUnskipped code") == 0);
+    REQUIRE(FindControlCodeToConvert("Escape code: \x1b") == 13);
+
+    std::string_view allCodes{ "\x0\x1\x2\x3\x4\x5\x6\x7\x8\xb\xc\xe\xf\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"sv };
+    for (size_t i = 0; i < allCodes.length(); ++i)
+    {
+        REQUIRE(FindControlCodeToConvert(allCodes, i) == i);
+    }
+}
+
+TEST_CASE("ConvertControlCodesToPictures", "[strings]")
+{
+    REQUIRE(ConvertControlCodesToPictures("No codes") == "No codes");
+    REQUIRE(ConvertControlCodesToPictures("Allowed codes: \t\r\n") == "Allowed codes: \t\r\n");
+
+    REQUIRE(ConvertControlCodesToPictures("\x1b Code First") == ConvertToUTF8(L"\x241b Code First"));
+    REQUIRE(ConvertControlCodesToPictures("Escape code: \x1b") == ConvertToUTF8(L"Escape code: \x241b"));
+
+    std::string_view allCodes{ "\x0\x1\x2\x3\x4\x5\x6\x7\x8\xb\xc\xe\xf\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"sv };
+    std::wstring_view allPictures{ L"\x2400\x2401\x2402\x2403\x2404\x2405\x2406\x2407\x2408\x240b\x240c\x240e\x240f\x2410\x2411\x2412\x2413\x2414\x2415\x2416\x2417\x2418\x2419\x241a\x241b\x241c\x241d\x241e\x241f\x2421"sv };
+
+    REQUIRE(ConvertControlCodesToPictures(allCodes) == ConvertToUTF8(allPictures));
+}
+
+TEST_CASE("IsValidWindowsFeaturePattern_AllFound_True", "[strings][111981]")
+{
+    for (const auto& name : {
+            "IIS-ODBCLogging",
+            "NetFx3",
+            "SMB1Protocol",
+        })
+    {
+        INFO(name);
+        REQUIRE(IsValidWindowsFeaturePattern(name));
+    }
+}
+
+TEST_CASE("IsValidWindowsFeaturePattern_Bad_False", "[strings][111981]")
+{
+    for (const auto& name : {
+            "MediaPlayback /LogPath:C:\\file.txt",
+            "\"MediaPlayback /LogPath:C:\\file.txt\"",
+        })
+    {
+        INFO(name);
+        REQUIRE(!IsValidWindowsFeaturePattern(name));
+    }
 }

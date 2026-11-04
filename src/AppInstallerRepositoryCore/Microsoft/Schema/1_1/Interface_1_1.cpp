@@ -25,58 +25,7 @@
 
 namespace AppInstaller::Repository::Microsoft::Schema::V1_1
 {
-    namespace
-    {
-        std::vector<Utility::NormalizedString> GetSystemReferenceStrings(
-            const Manifest::Manifest& manifest,
-            std::function<const Utility::NormalizedString&(const Manifest::ManifestInstaller&)> extractStringFromInstaller,
-            std::function<const Utility::NormalizedString& (const Manifest::AppsAndFeaturesEntry&)> extractStringFromAppsAndFeaturesEntry = {})
-        {
-            std::set<Utility::NormalizedString> set;
-
-            for (const auto& installer : manifest.Installers)
-            {
-                const auto& installerString = extractStringFromInstaller(installer);
-                if (!installerString.empty())
-                {
-                    set.emplace(Utility::FoldCase(installerString));
-                }
-
-                if (extractStringFromAppsAndFeaturesEntry)
-                {
-                    for (const auto& entry : installer.AppsAndFeaturesEntries)
-                    {
-                        const auto& entryString = extractStringFromAppsAndFeaturesEntry(entry);
-                        if (!entryString.empty())
-                        {
-                            set.emplace(Utility::FoldCase(entryString));
-                        }
-                    }
-                }
-            }
-
-            std::vector<Utility::NormalizedString> result(
-                std::make_move_iterator(set.begin()),
-                std::make_move_iterator(set.end()));
-
-            return result;
-        }
-
-        std::vector<Utility::NormalizedString> GetPackageFamilyNames(const Manifest::Manifest& manifest)
-        {
-            return GetSystemReferenceStrings(manifest, [](const Manifest::ManifestInstaller& i) -> const Utility::NormalizedString& { return i.PackageFamilyName; });
-        }
-
-        std::vector<Utility::NormalizedString> GetProductCodes(const Manifest::Manifest& manifest)
-        {
-            return GetSystemReferenceStrings(
-                manifest,
-                [](const Manifest::ManifestInstaller& i) -> const Utility::NormalizedString& { return i.ProductCode; },
-                [](const Manifest::AppsAndFeaturesEntry& e) -> const Utility::NormalizedString& { return e.ProductCode; });
-        }
-    }
-
-    Schema::Version Interface::GetVersion() const
+    SQLite::Version Interface::GetVersion() const
     {
         return { 1, 1 };
     }
@@ -102,10 +51,10 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_1
             { V1_0::PathPartTable::ValueName(), false, WI_IsFlagClear(options, CreateOptions::SupportPathless) }
             });
 
-        V1_0::TagsTable::Create(connection);
-        V1_0::CommandsTable::Create(connection);
-        PackageFamilyNameTable::Create(connection);
-        ProductCodeTable::Create(connection);
+        V1_0::TagsTable::Create(connection, GetOneToManyTableSchema());
+        V1_0::CommandsTable::Create(connection, GetOneToManyTableSchema());
+        PackageFamilyNameTable::Create(connection, GetOneToManyTableSchema());
+        ProductCodeTable::Create(connection, GetOneToManyTableSchema());
 
         savepoint.Commit();
     }
@@ -119,8 +68,8 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_1
         // Add the new 1.1 data
         // These system reference strings are all stored with their cases folded so that they can be
         // looked up ordinally; enabling the index to provide efficient searches.
-        PackageFamilyNameTable::EnsureExistsAndInsert(connection, GetPackageFamilyNames(manifest), manifestId);
-        ProductCodeTable::EnsureExistsAndInsert(connection, GetProductCodes(manifest), manifestId);
+        PackageFamilyNameTable::EnsureExistsAndInsert(connection, manifest.GetPackageFamilyNames(), manifestId);
+        ProductCodeTable::EnsureExistsAndInsert(connection, manifest.GetProductCodes(), manifestId);
 
         savepoint.Commit();
 
@@ -134,8 +83,8 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_1
         auto [indexModified, manifestId] = V1_0::Interface::UpdateManifest(connection, manifest, relativePath);
 
         // Update new 1:N tables as necessary
-        indexModified = PackageFamilyNameTable::UpdateIfNeededByManifestId(connection, GetPackageFamilyNames(manifest), manifestId) || indexModified;
-        indexModified = ProductCodeTable::UpdateIfNeededByManifestId(connection, GetProductCodes(manifest), manifestId) || indexModified;
+        indexModified = PackageFamilyNameTable::UpdateIfNeededByManifestId(connection, manifest.GetPackageFamilyNames(), manifestId) || indexModified;
+        indexModified = ProductCodeTable::UpdateIfNeededByManifestId(connection, manifest.GetProductCodes(), manifestId) || indexModified;
 
         savepoint.Commit();
 
@@ -189,16 +138,16 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_1
         return SearchInternal(connection, updatedRequest);
     }
 
-    std::vector<std::string> Interface::GetMultiPropertyByManifestId(const SQLite::Connection& connection, SQLite::rowid_t manifestId, PackageVersionMultiProperty property) const
+    std::vector<std::string> Interface::GetMultiPropertyByPrimaryId(const SQLite::Connection& connection, SQLite::rowid_t primaryId, PackageVersionMultiProperty property) const
     {
         switch (property)
         {
         case PackageVersionMultiProperty::PackageFamilyName:
-            return PackageFamilyNameTable::GetValuesByManifestId(connection, manifestId);
+            return PackageFamilyNameTable::GetValuesByManifestId(connection, primaryId);
         case PackageVersionMultiProperty::ProductCode:
-            return ProductCodeTable::GetValuesByManifestId(connection, manifestId);
+            return ProductCodeTable::GetValuesByManifestId(connection, primaryId);
         default:
-            return V1_0::Interface::GetMultiPropertyByManifestId(connection, manifestId, property);
+            return V1_0::Interface::GetMultiPropertyByPrimaryId(connection, primaryId, property);
         }
     }
 
@@ -228,6 +177,20 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_1
         savepoint.Commit();
     }
 
+    void Interface::DropTables(SQLite::Connection& connection)
+    {
+        SQLite::Savepoint savepoint = SQLite::Savepoint::Create(connection, "drop_tables_v1_1");
+
+        V1_0::Interface::DropTables(connection);
+
+        PackageFamilyNameTable::Drop(connection);
+        ProductCodeTable::Drop(connection);
+
+        ManifestMetadataTable::Drop(connection);
+
+        savepoint.Commit();
+    }
+
     std::unique_ptr<V1_0::SearchResultsTable> Interface::CreateSearchResultsTable(const SQLite::Connection& connection) const
     {
         return std::make_unique<V1_1::SearchResultsTable>(connection);
@@ -245,6 +208,11 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_1
 
         // Then do the 1.0 search
         V1_0::Interface::PerformQuerySearch(resultsTable, query);
+    }
+
+    V1_0::OneToManyTableSchema Interface::GetOneToManyTableSchema() const
+    {
+        return V1_0::OneToManyTableSchema::Version_1_1;
     }
 
     ISQLiteIndex::SearchResult Interface::SearchInternal(const SQLite::Connection& connection, SearchRequest& request) const
@@ -290,10 +258,10 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_1
             V1_0::PathPartTable::ValueName(),
             });
 
-        V1_0::TagsTable::PrepareForPackaging(connection, false);
-        V1_0::CommandsTable::PrepareForPackaging(connection, false);
-        PackageFamilyNameTable::PrepareForPackaging(connection, true, true);
-        ProductCodeTable::PrepareForPackaging(connection, true, true);
+        V1_0::TagsTable::PrepareForPackaging(connection, GetOneToManyTableSchema(), false, false);
+        V1_0::CommandsTable::PrepareForPackaging(connection, GetOneToManyTableSchema(), false, false);
+        PackageFamilyNameTable::PrepareForPackaging(connection, GetOneToManyTableSchema(), true, true);
+        ProductCodeTable::PrepareForPackaging(connection, GetOneToManyTableSchema(), true, true);
 
         savepoint.Commit();
 

@@ -2,11 +2,12 @@
 // Licensed under the MIT License.
 #include "pch.h"
 #include "Rest/Schema/1_0/Interface.h"
-#include "Rest/Schema/IRestClient.h"
-#include "Rest/Schema/HttpClientHelper.h"
-#include "ManifestDeserializer.h"
-#include <winget/JsonUtil.h>
 #include "Rest/Schema/CommonRestConstants.h"
+#include "Rest/Schema/IRestClient.h"
+#include "ManifestDeserializer.h"
+#include <AppInstallerStrings.h>
+#include <winget/HttpClientHelper.h>
+#include <winget/JsonUtil.h>
 
 using namespace AppInstaller::Manifest;
 
@@ -150,6 +151,10 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
             THROW_HR(APPINSTALLER_CLI_ERROR_RESTSOURCE_INVALID_DATA);
         }
 
+        // The schema allows surrounding whitespace in the id and version values, but they are used to construct file system
+        // paths and version comparison trims, so trim them here as the YAML parser does.
+        Utility::Trim(id.value());
+
         std::optional<std::reference_wrapper<const web::json::array>> versions = JSON::GetRawJsonArrayFromJsonNode(dataJsonObject, JSON::GetUtilityString(Versions));
         if (!versions || versions.value().get().size() == 0)
         {
@@ -160,6 +165,9 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
         for (auto& versionItem : versions.value().get())
         {
             Manifest::Manifest manifest;
+
+            manifest.ManifestVersion = GetManifestVersion();
+
             manifest.Id = id.value();
 
             std::optional<std::string> packageVersion = JSON::GetRawStringValueFromJsonNode(versionItem, JSON::GetUtilityString(PackageVersion));
@@ -168,7 +176,7 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
                 AICLI_LOG(Repo, Error, << "Missing package version in package: " << manifest.Id);
                 THROW_HR(APPINSTALLER_CLI_ERROR_RESTSOURCE_INVALID_DATA);
             }
-            manifest.Version = std::move(packageVersion.value());
+            manifest.Version = Utility::Trim(std::move(packageVersion.value()));
 
             manifest.Channel = JSON::GetRawStringValueFromJsonNode(versionItem, JSON::GetUtilityString(Channel)).value_or("");
 
@@ -216,6 +224,16 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
                 std::optional<Manifest::ManifestInstaller> installerObject = DeserializeInstaller(installer);
                 if (installerObject)
                 {
+                    // Merge default switches after parsing.
+                    auto defaultSwitches = Manifest::GetDefaultKnownSwitches(installerObject->EffectiveInstallerType());
+                    for (auto const& defaultSwitch : defaultSwitches)
+                    {
+                        if (installerObject->Switches.find(defaultSwitch.first) == installerObject->Switches.end())
+                        {
+                            installerObject->Switches[defaultSwitch.first] = defaultSwitch.second;
+                        }
+                    }
+
                     manifest.Installers.emplace_back(std::move(installerObject.value()));
                 }
             }
@@ -247,6 +265,11 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
     }
 
     std::vector<Manifest::AppsAndFeaturesEntry> ManifestDeserializer::DeserializeAppsAndFeaturesEntries(const web::json::array&) const
+    {
+        return {};
+    }
+
+    std::optional<Manifest::InstallationMetadataInfo> ManifestDeserializer::DeserializeInstallationMetadata(const web::json::value&) const
     {
         return {};
     }
@@ -301,12 +324,6 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
 
         installer.Url = JSON::GetRawStringValueFromJsonNode(installerJsonObject, JSON::GetUtilityString(InstallerUrl)).value_or("");
 
-        std::optional<std::string> sha256 = JSON::GetRawStringValueFromJsonNode(installerJsonObject, JSON::GetUtilityString(InstallerSha256));
-        if (JSON::IsValidNonEmptyStringValue(sha256))
-        {
-            installer.Sha256 = Utility::SHA256::ConvertToBytes(sha256.value());
-        }
-
         std::optional<std::string> arch = JSON::GetRawStringValueFromJsonNode(installerJsonObject, JSON::GetUtilityString(Architecture));
         if (!JSON::IsValidNonEmptyStringValue(arch))
         {
@@ -322,6 +339,18 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
             return {};
         }
         installer.BaseInstallerType = ConvertToInstallerType(installerType.value());
+
+        std::optional<std::string> sha256 = JSON::GetRawStringValueFromJsonNode(installerJsonObject, JSON::GetUtilityString(InstallerSha256));
+        if (JSON::IsValidNonEmptyStringValue(sha256))
+        {
+            installer.Sha256 = Utility::SHA256::ConvertToBytes(sha256.value());
+        }
+        else if (DoesInstallerTypeRequireHash(installer.BaseInstallerType))
+        {
+            AICLI_LOG(Repo, Error, << "Missing installer SHA256.");
+            return {};
+        }
+
         installer.Locale = JSON::GetRawStringValueFromJsonNode(installerJsonObject, JSON::GetUtilityString(InstallerLocale)).value_or("");
 
         // platform
@@ -366,19 +395,11 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
         }
 
         // Installer Switches
-        installer.Switches = Manifest::GetDefaultKnownSwitches(installer.EffectiveInstallerType());
         std::optional<std::reference_wrapper<const web::json::value>> switches =
             JSON::GetJsonValueFromNode(installerJsonObject, JSON::GetUtilityString(InstallerSwitches));
         if (switches)
         {
-            const auto& installerSwitches = switches.value().get();
-            TryParseInstallerSwitchField(installer.Switches, InstallerSwitchType::Silent, installerSwitches, Silent);
-            TryParseInstallerSwitchField(installer.Switches, InstallerSwitchType::SilentWithProgress, installerSwitches, SilentWithProgress);
-            TryParseInstallerSwitchField(installer.Switches, InstallerSwitchType::Interactive, installerSwitches, Interactive);
-            TryParseInstallerSwitchField(installer.Switches, InstallerSwitchType::InstallLocation, installerSwitches, InstallLocation);
-            TryParseInstallerSwitchField(installer.Switches, InstallerSwitchType::Log, installerSwitches, Log);
-            TryParseInstallerSwitchField(installer.Switches, InstallerSwitchType::Update, installerSwitches, Upgrade);
-            TryParseInstallerSwitchField(installer.Switches, InstallerSwitchType::Custom, installerSwitches, Custom);
+            installer.Switches = DeserializeInstallerSwitches(switches.value().get());
         }
 
         // Installer SuccessCodes
@@ -398,7 +419,7 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
         std::optional<std::string> updateBehavior = JSON::GetRawStringValueFromJsonNode(installerJsonObject, JSON::GetUtilityString(UpgradeBehavior));
         if (updateBehavior)
         {
-            installer.UpdateBehavior = Manifest::ConvertToUpdateBehaviorEnum(updateBehavior.value());
+            installer.UpdateBehavior = ConvertToUpdateBehavior(updateBehavior.value());
         }
 
         installer.Commands = ConvertToManifestStringArray(JSON::GetRawStringArrayFromJsonNode(installerJsonObject, JSON::GetUtilityString(Commands)));
@@ -423,6 +444,21 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
         installer.RestrictedCapabilities = ConvertToManifestStringArray(JSON::GetRawStringArrayFromJsonNode(installerJsonObject, JSON::GetUtilityString(RestrictedCapabilities)));
 
         return installer;
+    }
+
+    std::map<Manifest::InstallerSwitchType, Manifest::string_t> ManifestDeserializer::DeserializeInstallerSwitches(const web::json::value& installerSwitchesJsonObject) const
+    {
+        std::map<Manifest::InstallerSwitchType, Manifest::string_t> installerSwitches;
+
+        TryParseInstallerSwitchField(installerSwitches, InstallerSwitchType::Silent, installerSwitchesJsonObject, Silent);
+        TryParseInstallerSwitchField(installerSwitches, InstallerSwitchType::SilentWithProgress, installerSwitchesJsonObject, SilentWithProgress);
+        TryParseInstallerSwitchField(installerSwitches, InstallerSwitchType::Interactive, installerSwitchesJsonObject, Interactive);
+        TryParseInstallerSwitchField(installerSwitches, InstallerSwitchType::InstallLocation, installerSwitchesJsonObject, InstallLocation);
+        TryParseInstallerSwitchField(installerSwitches, InstallerSwitchType::Log, installerSwitchesJsonObject, Log);
+        TryParseInstallerSwitchField(installerSwitches, InstallerSwitchType::Update, installerSwitchesJsonObject, Upgrade);
+        TryParseInstallerSwitchField(installerSwitches, InstallerSwitchType::Custom, installerSwitchesJsonObject, Custom);
+
+        return installerSwitches;
     }
 
     std::optional<Manifest::DependencyList> ManifestDeserializer::DeserializeDependency(const web::json::value& dependenciesObject) const
@@ -510,6 +546,22 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
         return InstallerTypeEnum::Unknown;
     }
 
+    Manifest::UpdateBehaviorEnum ManifestDeserializer::ConvertToUpdateBehavior(std::string_view in) const
+    {
+        std::string inStrLower = Utility::ToLower(in);
+
+        if (inStrLower == "install")
+        {
+            return UpdateBehaviorEnum::Install;
+        }
+        else if (inStrLower == "uninstallprevious")
+        {
+            return UpdateBehaviorEnum::UninstallPrevious;
+        }
+
+        return UpdateBehaviorEnum::Unknown;
+    }
+
     std::vector<Manifest::string_t> ManifestDeserializer::ConvertToManifestStringArray(const std::vector<std::string>& values) const
     {
         std::vector<Manifest::string_t> result;
@@ -519,5 +571,10 @@ namespace AppInstaller::Repository::Rest::Schema::V1_0::Json
         }
 
         return result;
+    }
+
+    Manifest::ManifestVer ManifestDeserializer::GetManifestVersion() const
+    {
+        return Manifest::s_ManifestVersionV1;
     }
 }

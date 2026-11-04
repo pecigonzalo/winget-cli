@@ -84,7 +84,7 @@ TEST_CASE("MsixInfo_ValidateMsixTrustInfo", "[msixinfo]")
 
     TestCommon::TempFile microsoftSigned{ "testIndex"s, ".msix"s };
     ProgressCallback callback;
-    Utility::Download("https://cdn.winget.microsoft.com/cache/source.msix", microsoftSigned.GetPath(), Utility::DownloadType::Index, callback);
+    Utility::Download("https://cdn.winget.microsoft.com/cache/source2.msix", microsoftSigned.GetPath(), Utility::DownloadType::Index, callback);
 
     Msix::WriteLockedMsixFile microsoftSignedWriteLocked{ microsoftSigned };
     REQUIRE(microsoftSignedWriteLocked.ValidateTrustInfo(true));
@@ -93,4 +93,15 @@ TEST_CASE("MsixInfo_ValidateMsixTrustInfo", "[msixinfo]")
     {
         UninstallCertFromSignedPackage(testSigned);
     }
+}
+
+TEST_CASE("MsixInfo_GetPackageIdInfoFromFullName", "[msixinfo]")
+{
+    auto testPackageIdInfo = Msix::GetPackageIdInfoFromFullName("Microsoft.NET.Native.Framework.2.2_2.2.29512.0_arm64__8wekyb3d8bbwe");
+    REQUIRE(testPackageIdInfo.Name == "Microsoft.NET.Native.Framework.2.2");
+    REQUIRE(testPackageIdInfo.Version == Utility::UInt64Version{ "2.2.29512.0" });
+
+    auto testPackageIdInfo2 = Msix::GetPackageIdInfoFromFullName("Microsoft.DoesNotExist_1.2.3.4_neutral_~_8wekyb3d8bbwe");
+    REQUIRE(testPackageIdInfo2.Name == "Microsoft.DoesNotExist");
+    REQUIRE(testPackageIdInfo2.Version == Utility::UInt64Version{ "1.2.3.4" });
 }

@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 #include "pch.h"
 #include "DependenciesTable.h"
-#include "SQLiteStatementBuilder.h"
+#include <winget/SQLiteStatementBuilder.h>
 #include "winget\DependenciesGraph.h"
 #include "Microsoft/Schema/1_0/OneToOneTable.h"
 #include "Microsoft/Schema/1_0/IdTable.h"
@@ -48,11 +48,11 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_4
         {
             if (!missingPackageNodes.empty())
             {
-                std::string missingPackages{ missingPackageNodes.begin()->Id };
+                std::string missingPackages{ missingPackageNodes.begin()->Id()};
                 std::for_each(
                     missingPackageNodes.begin() + 1,
                     missingPackageNodes.end(),
-                    [&](auto& dep) { missingPackages.append(", " + dep.Id);  });
+                    [&](auto& dep) { missingPackages.append(", " + dep.Id()); });
                 THROW_HR_MSG(APPINSTALLER_CLI_ERROR_MISSING_PACKAGE, "Missing packages: %hs", missingPackages.c_str());
             }
         }
@@ -70,9 +70,9 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_4
             {
                 installer.Dependencies.ApplyToType(dependencyType, [&](Manifest::Dependency dependency)
                 {
-                    auto packageRowId = IdTable::SelectIdByValue(connection, dependency.Id);
+                    auto packageRowId = IdTable::SelectIdByValue(connection, dependency.Id(), true);
                     std::optional<Utility::NormalizedString> version;
-                        
+
                     if (!packageRowId.has_value())
                     {
                         missingPackageNodes.emplace_back(dependency);
@@ -164,15 +164,7 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_4
 
     bool DependenciesTable::Exists(const SQLite::Connection& connection)
     {
-        using namespace SQLite;
-
-        Builder::StatementBuilder builder;
-        builder.Select(Builder::RowCount).From(Builder::Schema::MainTable).
-            Where(Builder::Schema::TypeColumn).Equals(Builder::Schema::Type_Table).And(Builder::Schema::NameColumn).Equals(s_DependenciesTable_Table_Name);
-
-        Statement statement = builder.Prepare(connection);
-        THROW_HR_IF(E_UNEXPECTED, !statement.Step());
-        return statement.GetColumn<int64_t>(0) != 0;
+        return SQLite::Builder::Schema::TableExists(connection, s_DependenciesTable_Table_Name);
     }
 
     std::string_view DependenciesTable::TableName()
@@ -234,6 +226,14 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_4
         createIndexByPackageIdBuilder.Execute(connection);
 
         savepoint.Commit();
+    }
+
+    void DependenciesTable::Drop(SQLite::Connection& connection)
+    {
+        SQLite::Builder::StatementBuilder dropTableBuilder;
+        dropTableBuilder.DropTableIfExists(s_DependenciesTable_Table_Name);
+
+        dropTableBuilder.Execute(connection);
     }
 
     void DependenciesTable::AddDependencies(SQLite::Connection& connection, const Manifest::Manifest& manifest, SQLite::rowid_t manifestRowId)

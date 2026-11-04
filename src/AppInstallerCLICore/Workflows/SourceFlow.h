@@ -66,6 +66,12 @@ namespace AppInstaller::CLI::Workflow
     // Outputs: None
     void ResetSourceList(Execution::Context& context);
 
+    // Drops a single source by name, including hidden tombstoned default sources.
+    // Required Args: SourceName
+    // Inputs: None
+    // Outputs: None
+    void ResetNamedSource(Execution::Context& context);
+
     // Drops all sources.
     // Required Args: None
     // Inputs: None
@@ -77,4 +83,16 @@ namespace AppInstaller::CLI::Workflow
     // Inputs: SourceList
     // Outputs: None
     void ExportSourceList(Execution::Context& context);
+
+    // Forces an update to the cache of installed packages.
+    // Required Args: None
+    // Inputs: None
+    // Outputs: None
+    void ForceInstalledCacheUpdate(Execution::Context& context);
+
+    // Edits a source in SourceList.
+    // Required Args: SourceName
+    // Inputs: SourceList
+    // Outputs: None
+    void EditSources(Execution::Context& context);
 }

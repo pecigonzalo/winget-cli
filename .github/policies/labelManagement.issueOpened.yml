@@ -1,0 +1,329 @@
+id: labelManagement.issueOpened
+name: GitOps.PullRequestIssueManagement
+description: Handlers for when an issue is first opened
+owner:
+resource: repository
+disabled: false
+where:
+configuration:
+  resourceManagementConfiguration:
+    eventResponderTasks:
+      - description: Add CodeFlow link to new PRs
+        if:
+          - payloadType: Pull_Request
+          - isAction:
+              action: Opened
+        then:
+          - addCodeFlowLink
+      - description: Add Copilot-Instructions label to PRs modifying Copilot instruction files
+        if:
+          - payloadType: Pull_Request
+          - or:
+              - isAction:
+                  action: Opened
+              - isAction:
+                  action: Synchronize
+          - filesMatchPattern:
+              pattern: ^\.github/(copilot-instructions\.md|instructions/.+\.instructions\.md)$
+              matchAny: true
+          - not:
+              hasLabel:
+                label: Copilot-Instructions
+        then:
+          - addLabel:
+              label: Copilot-Instructions
+      - description: Check for modifications of Localization files in new PRs
+        if:
+          - payloadType: Pull_Request
+          - isAction:
+              action: Opened
+          - filesMatchPattern:
+              pattern: Localization/Resources/*
+          - not:
+              activitySenderHasPermission: # Only trigger if the sender doesn't have write permissions,
+                permission: Write          # to avoid adding the label for PRs from MSFT intentionally updating these files
+        then:
+          - addLabel:
+              label: Needs-Author-Feedback
+          - addLabel:
+              label: Blocking-Issue
+          - addReply:
+              reply: >-
+                Hello ${issueAuthor},
+
+
+                Thank you for your contribution! It looks like your PR includes changes to localization files.
+
+
+                The English resource file [**/en-us/winget.resw](https://github.com/microsoft/winget-cli/blob/master/src/AppInstallerCLIPackage/Shared/Strings/en-us/winget.resw) is the only file contributors should edit for string changes. It feeds the Microsoft localization pipeline. The files under [Localization\Resources\<locale>\](https://github.com/microsoft/winget-cli/tree/master/Localization/Resources) are **automatically synced from Microsoft's internal localization system and must not be edited**. Any manual edits will be overwritten on the next sync.
+
+
+                Instead of this PR, it would be helpful if you could [open an issue](https://github.com/microsoft/winget-cli/issues/new?template=Localization_Issue.yml) and it will be forwarded to the internal localization team for review. For more information, please see the [Development Guide](https://github.com/microsoft/winget-cli/blob/master/doc/Developing.md#localization).
+
+
+                ###### Template: msftbot/PullRequests/LocalizationFileChange
+      - description: Add Needs-Triage to new issues
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+        then:
+          - addLabel:
+              label: Needs-Triage
+      ### Area Labels
+      - description: Add area label for PowerShell Module
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant area\(s\)\s*\n.*PowerShell Module'
+              isRegex: True
+        then:
+          - addLabel:
+              label: PowerShell
+      - description: Add area label for COM API
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant area\(s\)\s*\n.*COM API'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Area-COM-API
+      - description: Add area label for WinGet DSC Resources
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant area\(s\)\s*\n.*DSC Resource'
+              isRegex: True
+        then:
+          - addLabel:
+              label: DSC-Resource
+      ### Commands Labels
+      - description: Add command label for 'winget configure'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget configure'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Configure
+      - description: Add command label for 'winget download'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget download'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Download
+      - description: Add command label for 'winget dscv3'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget dscv3'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-DSCv3
+      - description: Add command label for 'winget export'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget export'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Export
+      - description: Add command label for 'winget features'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget features'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Features
+      - description: Add command label for 'winget font'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget font'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Font
+      - description: Add command label for 'winget hash'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget hash'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Hash
+      - description: Add command label for 'winget import'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget import'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Import
+      - description: Add command label for 'winget install'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget install'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Install
+      - description: Add command label for 'winget list'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget list'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-List
+      - description: Add command label for 'winget mcp'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget mcp'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-MCP
+      - description: Add command label for 'winget pin'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget pin'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Pin
+      - description: Add command label for 'winget repair'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget repair'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Repair
+      - description: Add command label for 'winget search'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget search'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Search
+      - description: Add command label for 'winget settings'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget settings'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Settings
+      - description: Add command label for 'winget show'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget show'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Show
+      - description: Add command label for 'winget source'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget source'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Source
+      - description: Add command label for 'winget uninstall'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget uninstall'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Uninstall
+      - description: Add command label for 'winget upgrade'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget upgrade'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Upgrade
+      - description: Add command label for 'winget validate'
+        if:
+          - payloadType: Issues
+          - isAction:
+              action: Opened
+          - bodyContains:
+              pattern: 'Relevant command\(s\)\s*\n.*winget validate'
+              isRegex: True
+        then:
+          - addLabel:
+              label: Command-Validate
+onFailure:
+onSuccess:

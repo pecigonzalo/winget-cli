@@ -2,7 +2,7 @@
 // Licensed under the MIT License.
 #include "pch.h"
 #include "PathPartTable.h"
-#include "SQLiteStatementBuilder.h"
+#include <winget/SQLiteStatementBuilder.h>
 
 
 namespace AppInstaller::Repository::Microsoft::Schema::V1_0
@@ -157,6 +157,14 @@ namespace AppInstaller::Repository::Microsoft::Schema::V1_0
         createIndexBuilder.Execute(connection);
 
         savepoint.Commit();
+    }
+
+    void PathPartTable::Drop(SQLite::Connection& connection)
+    {
+        SQLite::Builder::StatementBuilder dropTableBuilder;
+        dropTableBuilder.DropTable(s_PathPartTable_Table_Name);
+
+        dropTableBuilder.Execute(connection);
     }
 
     std::string_view PathPartTable::TableName()

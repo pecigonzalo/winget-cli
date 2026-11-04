@@ -18,6 +18,9 @@
     <Filter Include="Workflows">
       <UniqueIdentifier>{fdeb940e-93e2-4bb0-a59c-1e2d1c0588d1}</UniqueIdentifier>
     </Filter>
+    <Filter Include="Commands\Configuration">
+      <UniqueIdentifier>{bd9d8dfe-7a37-4a53-b4e7-ddbd9694c0ab}</UniqueIdentifier>
+    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="pch.h">
@@ -44,10 +47,10 @@
     <ClInclude Include="Workflows\InstallFlow.h">
       <Filter>Workflows</Filter>
     </ClInclude>
-    <ClInclude Include="Workflows\ManifestComparator.h">
+    <ClInclude Include="Workflows\ShellExecuteInstallerHandler.h">
       <Filter>Workflows</Filter>
     </ClInclude>
-    <ClInclude Include="Workflows\ShellExecuteInstallerHandler.h">
+    <ClInclude Include="Workflows\PackageTableSortHelper.h">
       <Filter>Workflows</Filter>
     </ClInclude>
     <ClInclude Include="Workflows\WorkflowBase.h">
@@ -185,6 +188,120 @@
     <ClInclude Include="Workflows\PromptFlow.h">
       <Filter>Workflows</Filter>
     </ClInclude>
+    <ClInclude Include="PortableInstaller.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\PinCommand.h">
+      <Filter>Commands</Filter>
+    </ClInclude>
+    <ClInclude Include="Workflows\PinFlow.h">
+      <Filter>Workflows</Filter>
+    </ClInclude>
+    <ClInclude Include="Workflows\MultiQueryFlow.h">
+      <Filter>Workflows</Filter>
+    </ClInclude>
+    <ClInclude Include="ConfigurationContext.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Workflows\ConfigurationFlow.h">
+      <Filter>Workflows</Filter>
+    </ClInclude>
+    <ClInclude Include="Public\ConfigurationSetProcessorFactoryRemoting.h">
+      <Filter>Public</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\DebugCommand.h">
+      <Filter>Commands</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\TestCommand.h">
+      <Filter>Commands</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\DownloadCommand.h">
+      <Filter>Commands</Filter>
+    </ClInclude>
+    <ClInclude Include="ConfigurationCommon.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\ErrorCommand.h">
+      <Filter>Commands</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\ResumeCommand.h">
+      <Filter>Commands</Filter>
+    </ClInclude>
+    <ClInclude Include="Workflows\ResumeFlow.h">
+      <Filter>Workflows</Filter>
+    </ClInclude>
+    <ClInclude Include="CheckpointManager.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\RepairCommand.h">
+      <Filter>Commands</Filter>
+    </ClInclude>
+    <ClInclude Include="Workflows\RepairFlow.h">
+      <Filter>Workflows</Filter>
+    </ClInclude>
+    <ClInclude Include="ConfigurationWingetDscModuleUnitValidation.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Sixel.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\FontCommand.h">
+      <Filter>Commands</Filter>
+    </ClInclude>
+    <ClInclude Include="Workflows\FontFlow.h">
+      <Filter>Workflows</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\ConfigureCommand.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="ConfigureExportCommand.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\ConfigureListCommand.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\ConfigureShowCommand.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\ConfigureTestCommand.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\ConfigureValidateCommand.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\DscCommand.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\DscCommandBase.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\DscTestFileResource.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\DscComposableObject.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\DscTestJsonResource.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\DscPackageResource.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\DscSourceResource.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\DscUserSettingsFileResource.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\DscAdminSettingsResource.h">
+      <Filter>Commands\Configuration</Filter>
+    </ClInclude>
+    <ClInclude Include="Public\ShutdownMonitoring.h">
+      <Filter>Public</Filter>
+    </ClInclude>
+    <ClInclude Include="Commands\McpCommand.h">
+      <Filter>Commands</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="pch.cpp">
@@ -202,13 +319,13 @@
     <ClCompile Include="Core.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="Workflows\ManifestComparator.cpp">
-      <Filter>Workflows</Filter>
-    </ClCompile>
     <ClCompile Include="Workflows\ShellExecuteInstallerHandler.cpp">
       <Filter>Workflows</Filter>
     </ClCompile>
     <ClCompile Include="Workflows\WorkflowBase.cpp">
+      <Filter>Workflows</Filter>
+    </ClCompile>
+    <ClCompile Include="Workflows\PackageTableSortHelper.cpp">
       <Filter>Workflows</Filter>
     </ClCompile>
     <ClCompile Include="Commands\ShowCommand.cpp">
@@ -227,6 +344,9 @@
       <Filter>Workflows</Filter>
     </ClCompile>
     <ClCompile Include="ExecutionReporter.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="TableOutput.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="Commands\HashCommand.cpp">
@@ -336,6 +456,123 @@
     </ClCompile>
     <ClCompile Include="Workflows\ArchiveFlow.cpp">
       <Filter>Workflows</Filter>
+    </ClCompile>
+    <ClCompile Include="PortableInstaller.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Workflows\PinFlow.cpp">
+      <Filter>Workflows</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\PinCommand.cpp">
+      <Filter>Commands</Filter>
+    </ClCompile>
+    <ClCompile Include="Workflows\MultiQueryFlow.cpp">
+      <Filter>Workflows</Filter>
+    </ClCompile>
+    <ClCompile Include="ConfigurationContext.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Workflows\ConfigurationFlow.cpp">
+      <Filter>Workflows</Filter>
+    </ClCompile>
+    <ClCompile Include="ConfigurationSetProcessorFactoryRemoting.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\DebugCommand.cpp">
+      <Filter>Commands</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\TestCommand.cpp">
+      <Filter>Commands</Filter>
+    </ClCompile>
+    <ClCompile Include="ConfigurationCommon.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\DownloadCommand.cpp">
+      <Filter>Commands</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\ResumeCommand.cpp">
+      <Filter>Commands</Filter>
+    </ClCompile>
+    <ClCompile Include="Workflows\ResumeFlow.cpp">
+      <Filter>Workflows</Filter>
+    </ClCompile>
+    <ClCompile Include="CheckpointManager.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\ErrorCommand.cpp">
+      <Filter>Commands</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\RepairCommand.cpp">
+      <Filter>Commands</Filter>
+    </ClCompile>
+    <ClCompile Include="Workflows\RepairFlow.cpp">
+      <Filter>Workflows</Filter>
+    </ClCompile>
+    <ClCompile Include="ConfigurationWingetDscModuleUnitValidation.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="ConfigurationDynamicRuntimeFactory.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Sixel.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\FontCommand.cpp">
+      <Filter>Commands</Filter>
+    </ClCompile>
+    <ClCompile Include="Workflows\FontFlow.cpp">
+      <Filter>Workflows</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\ConfigureCommand.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="ConfigureExportCommand.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\ConfigureListCommand.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\ConfigureShowCommand.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\ConfigureTestCommand.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\ConfigureValidateCommand.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\DscCommand.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\DscCommandBase.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\DscTestFileResource.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\DscComposableObject.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\DscTestJsonResource.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\DscPackageResource.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\DscSourceResource.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\DscUserSettingsFileResource.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\DscAdminSettingsResource.cpp">
+      <Filter>Commands\Configuration</Filter>
+    </ClCompile>
+    <ClCompile Include="ShutdownMonitoring.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Commands\McpCommand.cpp">
+      <Filter>Commands</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>

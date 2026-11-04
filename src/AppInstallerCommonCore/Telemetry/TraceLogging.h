@@ -1,12 +1,12 @@
-﻿// Copyright (c) Microsoft Corporation. All rights reserved.
+// Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License. See LICENSE in the project root for license information.
 
 #pragma once
 
-#include "WinEventLogLevels.h"
+#include <Telemetry/WinEventLogLevels.h>
 #include <TraceLoggingProvider.h>
 
-#include "MicrosoftTelemetry.h"
+#include <Telemetry/MicrosoftTelemetry.h>
 
 // Keywords
 #define KEYWORD_REPEATER         0x0000000000000001
@@ -64,3 +64,6 @@ TRACELOGGING_DECLARE_PROVIDER(g_hTraceProvider);
 extern bool g_IsTelemetryProviderEnabled;
 extern UCHAR g_TelemetryProviderLevel;
 extern ULONGLONG g_TelemetryProviderMatchAnyKeyword;
+
+TRACELOGGING_DECLARE_PROVIDER(g_hWindowsStoreProvider);
+extern bool g_IsStoreTelemetryProviderEnabled;

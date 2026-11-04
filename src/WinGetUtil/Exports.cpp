@@ -28,6 +28,23 @@ namespace
     {
         return potentiallyNullPath ? std::filesystem::path{ potentiallyNullPath } : std::filesystem::path{};
     }
+
+    SQLiteIndex::Property GetSQLiteIndexProperty(WinGetSQLiteIndexProperty property)
+    {
+        switch (property)
+        {
+        case WinGetSQLiteIndexProperty_PackageUpdateTrackingBaseTime: return SQLiteIndex::Property::PackageUpdateTrackingBaseTime;
+        case WinGetSQLiteIndexProperty_IntermediateFileOutputPath: return SQLiteIndex::Property::IntermediateFileOutputPath;
+        case WinGetSQLiteIndexProperty_DeltaBaselineIndexPath: return SQLiteIndex::Property::DeltaBaselineIndexPath;
+        case WinGetSQLiteIndexProperty_DeltaOutputPath: return SQLiteIndex::Property::DeltaOutputPath;
+        case WinGetSQLiteIndexProperty_DeltaBaselineRelativeSourcePath: return SQLiteIndex::Property::DeltaBaselineRelativeSourcePath;
+        case WinGetSQLiteIndexProperty_DeltaBaselinePackageVersion: return SQLiteIndex::Property::DeltaBaselinePackageVersion;
+        case WinGetSQLiteIndexProperty_DeltaMarkAsBaseline: return SQLiteIndex::Property::DeltaMarkAsBaseline;
+        case WinGetSQLiteIndexProperty_DeltaComparisonIndexPath: return SQLiteIndex::Property::DeltaComparisonIndexPath;
+        }
+
+        THROW_HR(E_INVALIDARG);
+    }
 }
 
 extern "C"
@@ -36,7 +53,7 @@ extern "C"
     {
         THROW_HR_IF(E_INVALIDARG, !logPath);
 
-        thread_local AppInstaller::ThreadLocalStorage::ThreadGlobals threadGlobals;
+        thread_local AppInstaller::ThreadLocalStorage::WingetThreadGlobals threadGlobals;
         thread_local std::once_flag initLogging;
 
         std::call_once(initLogging, []() {
@@ -44,7 +61,7 @@ extern "C"
             // Intentionally release to leave the local ThreadGlobals.
             previous.release();
             // Enable all logs for now.
-            AppInstaller::Logging::Log().EnableChannel(AppInstaller::Logging::Channel::All);
+            AppInstaller::Logging::Log().SetEnabledChannels(AppInstaller::Logging::Channel::All);
             AppInstaller::Logging::Log().SetLevel(AppInstaller::Logging::Level::Verbose);
             AppInstaller::Logging::EnableWilFailureTelemetry();
             });
@@ -55,7 +72,7 @@ extern "C"
         if (!AppInstaller::Logging::Log().ContainsLogger(loggerName))
         {
             // Let FileLogger use default file prefix
-            AppInstaller::Logging::AddFileLogger(pathAsPath);
+            AppInstaller::Logging::FileLogger::Add(pathAsPath);
         }
 
         return S_OK;
@@ -85,7 +102,7 @@ extern "C"
         THROW_HR_IF(E_INVALIDARG, !!*index);
 
         std::string filePathUtf8 = ConvertToUTF8(filePath);
-        Schema::Version internalVersion{ majorVersion, minorVersion };
+        AppInstaller::SQLite::Version internalVersion{ majorVersion, minorVersion };
 
         std::unique_ptr<SQLiteIndex> result = std::make_unique<SQLiteIndex>(SQLiteIndex::CreateNew(filePathUtf8, internalVersion));
 
@@ -119,6 +136,34 @@ extern "C"
     }
     CATCH_RETURN()
 
+    WINGET_UTIL_API WinGetSQLiteIndexMigrate(
+        WINGET_SQLITE_INDEX_HANDLE index,
+        UINT32 majorVersion,
+        UINT32 minorVersion) try
+    {
+        THROW_HR_IF(E_INVALIDARG, !index);
+
+        return reinterpret_cast<SQLiteIndex*>(index)->MigrateTo({ majorVersion, minorVersion }) ? S_OK : HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
+    }
+    CATCH_RETURN()
+
+
+    WINGET_UTIL_API WinGetSQLiteIndexSetProperty(
+        WINGET_SQLITE_INDEX_HANDLE index,
+        WinGetSQLiteIndexProperty property,
+        WINGET_STRING value) try
+    {
+        THROW_HR_IF(E_INVALIDARG, !index);
+        THROW_HR_IF(E_INVALIDARG, !value);
+
+        std::string valueUtf8 = ConvertToUTF8(value);
+
+        reinterpret_cast<SQLiteIndex*>(index)->SetProperty(GetSQLiteIndexProperty(property), valueUtf8);
+
+        return S_OK;
+    }
+    CATCH_RETURN()
+
     WINGET_UTIL_API WinGetSQLiteIndexAddManifest(
         WINGET_SQLITE_INDEX_HANDLE index, 
         WINGET_STRING manifestPath, WINGET_STRING relativePath) try
@@ -144,6 +189,26 @@ extern "C"
         THROW_HR_IF(E_INVALIDARG, !relativePath);
 
         bool result = reinterpret_cast<SQLiteIndex*>(index)->UpdateManifest(manifestPath, relativePath);
+        if (indexModified)
+        {
+            *indexModified = (result ? TRUE : FALSE);
+        }
+
+        return S_OK;
+    }
+    CATCH_RETURN()
+
+    WINGET_UTIL_API WinGetSQLiteIndexAddOrUpdateManifest(
+        WINGET_SQLITE_INDEX_HANDLE index,
+        WINGET_STRING manifestPath,
+        WINGET_STRING relativePath,
+        BOOL* indexModified) try
+    {
+        THROW_HR_IF(E_INVALIDARG, !index);
+        THROW_HR_IF(E_INVALIDARG, !manifestPath);
+        THROW_HR_IF(E_INVALIDARG, !relativePath);
+
+        bool result = reinterpret_cast<SQLiteIndex*>(index)->AddOrUpdateManifest(manifestPath, relativePath);
         if (indexModified)
         {
             *indexModified = (result ? TRUE : FALSE);
@@ -244,6 +309,7 @@ extern "C"
             validateOption.SchemaValidationOnly = WI_IsFlagSet(option, WinGetValidateManifestOption::SchemaValidationOnly);
             validateOption.ErrorOnVerifiedPublisherFields = WI_IsFlagSet(option, WinGetValidateManifestOption::ErrorOnVerifiedPublisherFields);
             validateOption.InstallerValidation = WI_IsFlagSet(option, WinGetValidateManifestOption::InstallerValidations);
+            validateOption.ErrorOnNetworkAddressInSwitches = WI_IsFlagSet(option, WinGetValidateManifestOption::ErrorOnNetworkAddressInSwitches);
 
             (void)YamlParser::CreateFromPath(inputPath, validateOption, mergedManifestPath ? mergedManifestPath : L"");
 
@@ -289,6 +355,12 @@ extern "C"
                 validateOption.ThrowOnWarning = true;
                 validateOption.SchemaValidationOnly = WI_IsFlagClear(option, WinGetCreateManifestOption::SchemaAndSemanticValidation);
                 validateOption.ErrorOnVerifiedPublisherFields = WI_IsFlagSet(option, WinGetCreateManifestOption::ReturnErrorOnVerifiedPublisherFields);
+                validateOption.ErrorOnNetworkAddressInSwitches = WI_IsFlagSet(option, WinGetCreateManifestOption::ReturnErrorOnNetworkAddressInSwitches);
+            }
+
+            if (WI_IsFlagSet(option, WinGetCreateManifestOption::AllowShadowManifest))
+            {
+                validateOption.AllowShadowManifest = true;
             }
 
             std::unique_ptr<Manifest> result = std::make_unique<Manifest>(YamlParser::CreateFromPath(inputPath, validateOption, mergedManifestPath ? mergedManifestPath : L""));
@@ -299,9 +371,27 @@ extern "C"
         catch (const ManifestException& e)
         {
             *succeeded = e.IsWarningOnly();
+            if (*succeeded)
+            {
+                ManifestValidateOption validateOption;
+                if (WI_IsFlagSet(option, WinGetCreateManifestOption::AllowShadowManifest))
+                {
+                    validateOption.AllowShadowManifest = true;
+                }
+
+                std::unique_ptr<Manifest> result = std::make_unique<Manifest>(YamlParser::CreateFromPath(inputPath, validateOption));
+                *manifest = static_cast<WINGET_MANIFEST_HANDLE>(result.release());
+            }
             if (message)
             {
-                *message = ::SysAllocString(ConvertToUTF16(e.GetManifestErrorMessage()).c_str());
+                if (WI_IsFlagSet(option, WinGetCreateManifestOption::ReturnResponseAsJson))
+                {
+                    *message = ::SysAllocString(ConvertToUTF16(e.GetManifestErrorJson()).c_str());
+                }
+                else
+                {
+                    *message = ::SysAllocString(ConvertToUTF16(e.GetManifestErrorMessage()).c_str());
+                }
             }
         }
 
@@ -474,12 +564,12 @@ extern "C"
         THROW_HR_IF(E_INVALIDARG, computeHash && sha256HashLength != 32);
 
         AppInstaller::ProgressCallback callback;
-        auto hashValue = Download(ConvertToUTF8(url), filePath, DownloadType::WinGetUtil, callback, computeHash);
+        auto downloadResult = Download(ConvertToUTF8(url), filePath, DownloadType::WinGetUtil, callback);
 
         // At this point, if computeHash is set we have verified that the buffer is valid and 32 bytes.
         if (computeHash)
         {
-            const auto& hash = hashValue.value();
+            const auto& hash = downloadResult.Sha256Hash;
 
             // The SHA 256 hash length should always be 32 bytes.
             THROW_HR_IF(E_UNEXPECTED, hash.size() != sha256HashLength);

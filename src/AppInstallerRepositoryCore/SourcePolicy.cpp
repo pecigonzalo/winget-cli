@@ -40,13 +40,13 @@ namespace AppInstaller::Repository
         template<ValuePolicy P>
         std::optional<SourceFromPolicy> FindSourceInPolicy(std::string_view name, std::string_view type, std::string_view arg)
         {
-            auto sourcesOpt = GroupPolicies().GetValueRef<P>();
+            auto sourcesOpt = GroupPolicies().GetValue<P>();
             if (!sourcesOpt.has_value())
             {
                 return std::nullopt;
             }
 
-            const auto& sources = sourcesOpt->get();
+            const auto& sources = sourcesOpt.value();
             auto source = std::find_if(
                 sources.begin(),
                 sources.end(),
@@ -101,6 +101,11 @@ namespace AppInstaller::Repository
                 return TogglePolicy::Policy::MSStoreSource;
             }
 
+            if (name == GetWellKnownSourceName(WellKnownSource::WinGetFont) && IsWellKnownSourceEnabled(WellKnownSource::WinGetFont, true))
+            {
+                return TogglePolicy::Policy::FontSource;
+            }
+
             // Any other tombstone is allowed
             return TogglePolicy::Policy::None;
         }
@@ -108,7 +113,7 @@ namespace AppInstaller::Repository
         // Case 2:
         //  - The source is not a tombstone and we don't need the policy to be explicitly enabled.
         //  - Check only against the source argument and type as the user source may have a different name.
-        //  - Do a case insensitive check as the domain portion of the URL is case insensitive,
+        //  - Do a case-insensitive check as the domain portion of the URL is case-insensitive,
         //    and we don't need case sensitivity for the rest as we control the domain.
         if (Utility::CaseInsensitiveEquals(arg, GetWellKnownSourceArg(WellKnownSource::WinGet)) &&
             Utility::CaseInsensitiveEquals(type, Microsoft::PreIndexedPackageSourceFactory::Type()))
@@ -120,6 +125,12 @@ namespace AppInstaller::Repository
             Utility::CaseInsensitiveEquals(type, Rest::RestSourceFactory::Type()))
         {
             return IsWellKnownSourceEnabled(WellKnownSource::MicrosoftStore) ? TogglePolicy::Policy::None : TogglePolicy::Policy::MSStoreSource;
+        }
+
+        if (Utility::CaseInsensitiveEquals(arg, GetWellKnownSourceArg(WellKnownSource::WinGetFont)) &&
+            Utility::CaseInsensitiveEquals(type, Microsoft::PreIndexedPackageSourceFactory::Type()))
+        {
+            return IsWellKnownSourceEnabled(WellKnownSource::WinGetFont) ? TogglePolicy::Policy::None : TogglePolicy::Policy::FontSource;
         }
 
         // Case 3:
@@ -135,6 +146,12 @@ namespace AppInstaller::Repository
         {
             AICLI_LOG(Repo, Warning, << "User source is not allowed as it shadows a default MS Store source. Name [" << name << "]. Arg [" << arg << "] Type [" << type << ']');
             return TogglePolicy::Policy::MSStoreSource;
+        }
+
+        if (name == GetWellKnownSourceName(WellKnownSource::WinGetFont) && IsWellKnownSourceEnabled(WellKnownSource::WinGetFont, true))
+        {
+            AICLI_LOG(Repo, Warning, << "User source is not allowed as it shadows a default font source. Name [" << name << "]. Arg [" << arg << "] Type [" << type << ']');
+            return TogglePolicy::Policy::FontSource;
         }
 
         // Case 4:
@@ -173,6 +190,11 @@ namespace AppInstaller::Repository
             return IsDefaultSourceEnabled(source, ExperimentalFeature::Feature::None, onlyExplicit, TogglePolicy::Policy::DefaultSource);
         case AppInstaller::Repository::WellKnownSource::MicrosoftStore:
             return IsDefaultSourceEnabled(source, ExperimentalFeature::Feature::None, onlyExplicit, TogglePolicy::Policy::MSStoreSource);
+        case AppInstaller::Repository::WellKnownSource::WinGetFont:
+            return IsDefaultSourceEnabled(source, ExperimentalFeature::Feature::None, onlyExplicit, TogglePolicy::Policy::FontSource);
+        case AppInstaller::Repository::WellKnownSource::DesktopFrameworks:
+            // No corresponding policy available for this source.
+            return true;
         }
 
         return false;
@@ -200,6 +222,12 @@ namespace AppInstaller::Repository
                 source.Identifier == GetWellKnownSourceIdentifier(WellKnownSource::MicrosoftStore))
             {
                 throw GroupPolicyException(TogglePolicy::Policy::MSStoreSource);
+            }
+
+            if (GroupPolicies().GetState(TogglePolicy::Policy::FontSource) == PolicyState::Enabled &&
+                source.Identifier == GetWellKnownSourceIdentifier(WellKnownSource::WinGetFont))
+            {
+                throw GroupPolicyException(TogglePolicy::Policy::FontSource);
             }
         }
     }

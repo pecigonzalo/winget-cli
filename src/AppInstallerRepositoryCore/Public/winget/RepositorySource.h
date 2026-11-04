@@ -5,6 +5,8 @@
 #include <winget/PackageTrackingCatalog.h>
 #include <AppInstallerProgress.h>
 #include <winget/Certificates.h>
+#include <winget/Authentication.h>
+#include <winget/SharedThreadGlobals.h>
 
 #include <chrono>
 #include <filesystem>
@@ -17,6 +19,9 @@
 
 namespace AppInstaller::Repository
 {
+    // The interval is of 100 nano seconds precision.This is used by file date period and the Windows::Foundation::TimeSpan exposed in COM api.
+    using TimeSpan = std::chrono::duration<int64_t, std::ratio_multiply<std::ratio<100>, std::nano>>;
+
     struct ISourceReference;
     struct ISource;
 
@@ -41,6 +46,21 @@ namespace AppInstaller::Repository
 
     DEFINE_ENUM_FLAG_OPERATORS(SourceTrustLevel);
 
+    // Converts a string_view to the corresponding SourceTrustLevel enum.
+    SourceTrustLevel ConvertToSourceTrustLevelEnum(std::string_view trustLevel);
+
+    // Converts a vector of trust level strings to the corresponding SourceTrustLevel enum flag.
+    SourceTrustLevel ConvertToSourceTrustLevelFlag(std::vector<std::string> values);
+
+    // Converts a SourceTrustLevel flag to a list of trust level strings.
+    std::vector<std::string_view> SourceTrustLevelFlagToList(SourceTrustLevel trustLevel);
+
+    // Converts a SourceTrustLevel enum to the corresponding string.
+    std::string_view SourceTrustLevelEnumToString(SourceTrustLevel trustLevel);
+
+    // Gets the full trust level string name for display.
+    std::string GetSourceTrustLevelForDisplay(SourceTrustLevel trustLevel);
+
     std::string_view ToString(SourceOrigin origin);
 
     // Fields that require user agreements.
@@ -56,10 +76,18 @@ namespace AppInstaller::Repository
     // These sources are not under the direct control of the user, such as packages installed on the system.
     enum class PredefinedSource
     {
+        // Default behavior. Contains ARP packages installed as for user and for machine, MSIX packages for current user.
         Installed,
+        // Only contains packages installed as for user
+        InstalledUser,
+        // Only contains packages installed as for machine
+        InstalledMachine,
         ARP,
         MSIX,
         Installing,
+        // Same as `Installed`, but creating the source reference for this is sufficient to cause the cache to be updated
+        // on next Open of any `Installed` or `InstalledForceCacheUpdate`.
+        InstalledForceCacheUpdate,
     };
 
     // A well known source.
@@ -69,6 +97,7 @@ namespace AppInstaller::Repository
         WinGet,
         MicrosoftStore,
         DesktopFrameworks,
+        WinGetFont,
     };
 
     // Search behavior for composite sources.
@@ -111,22 +140,46 @@ namespace AppInstaller::Repository
         // The last time that this source was updated.
         std::chrono::system_clock::time_point LastUpdateTime = {};
 
+        // Stores the earliest time that a background update should be attempted.
+        std::chrono::system_clock::time_point DoNotUpdateBefore = {};
+
         // Whether the source supports InstalledSource correlation.
         bool SupportInstalledSearchCorrelation = true;
 
         // The configuration of how the server certificate will be validated.
         Certificates::PinningConfiguration CertificatePinningConfiguration;
+
+        // This value is used as an alternative to the `Arg` value if it is failing to function properly.
+        // The alternate location must point to identical data or inconsistencies may arise.
+        std::string AlternateArg;
+
+        // Whether the source should be hidden by default unless explicitly declared.
+        bool Explicit = false;
+
+        // Value used for sorting the sources and making decisions
+        // (like preferring one source over the other if both have a package to install).
+        // Higher values come first in priority order.
+        int32_t Priority = 0;
     };
+
+    // Check if a source matches a well known source
+    std::optional<WellKnownSource> CheckForWellKnownSource(const SourceDetails& sourceDetails);
+
+    // Gets the details for a well known source, including its certificate pinning configuration.
+    // The details are not populated with any locally stored metadata.
+    SourceDetails GetWellKnownSourceDetails(WellKnownSource source);
 
     // Individual source agreement entry. Label will be highlighted in the display as the key of the agreement entry.
     struct SourceAgreement
     {
-        std::string Label;
-        std::string Text;
-        std::string Url;
+        SourceAgreement() = default;
 
         SourceAgreement(std::string label, std::string text, std::string url) :
             Label(std::move(label)), Text(std::move(text)), Url(std::move(url)) {}
+
+        std::string Label;
+        std::string Text;
+        std::string Url;
     };
 
     // Interface for retrieving information about a source after opening the source.
@@ -149,6 +202,30 @@ namespace AppInstaller::Repository
 
         // Required query parameters in get manifest request.
         std::vector<std::string> RequiredQueryParameters;
+
+        // Source authentication info.
+        Authentication::AuthenticationInfo Authentication;
+    };
+
+    // Contains information about edits to a source.
+    struct SourceEdit
+    {
+        SourceEdit() = default;
+
+        // The Explicit property of a source.
+        std::optional<bool> Explicit;
+
+        // The Priority property of a source.
+        std::optional<int32_t> Priority;
+    };
+
+    // Allows calling code to inquire about specific features of an ISource implementation.
+    // The default state of any new flag is false.
+    enum class SourceFeatureFlag
+    {
+        // If true, the manifests for this source may contain more data than is available from just the
+        // version information found from a search.
+        ManifestMayContainAdditionalSystemReferenceStrings,
     };
 
     // Represents a source which would be interacted from outside of repository lib.
@@ -167,7 +244,7 @@ namespace AppInstaller::Repository
         Source(WellKnownSource source);
 
         // Constructor for a source to be added.
-        Source(std::string_view name, std::string_view arg, std::string_view type);
+        Source(std::string_view name, std::string_view arg, std::string_view type, SourceTrustLevel trustLevel, const SourceEdit& additionalProperties);
 
         // Constructor for creating a composite source from a list of available sources.
         Source(const std::vector<Source>& availableSources);
@@ -187,6 +264,11 @@ namespace AppInstaller::Repository
         // To avoid putting try catch everywhere, we use bool operator here.
         operator bool() const;
 
+        // Determines if the sources are equivalent.
+        // Currently only works for individual sources, not composites.
+        bool operator==(const Source& other) const;
+        bool operator!=(const Source& other) const;
+
         // Gets the source's identifier; a unique identifier independent of the name
         // that will not change between a remove/add or between additional adds.
         // Must be suitable for filesystem names unless the source is internal to winget,
@@ -194,16 +276,44 @@ namespace AppInstaller::Repository
         std::string GetIdentifier() const;
 
         // Get the source's configuration details from settings.
-        SourceDetails GetDetails() const;
+        const SourceDetails& GetDetails() const;
 
         // Get the source's information.
         SourceInformation GetInformation() const;
 
+        // Query the value of the given feature flag.
+        // The default state of any new flag is false.
+        bool QueryFeatureFlag(SourceFeatureFlag flag) const;
+
         // Returns true if the origin type can contain available packages.
         bool ContainsAvailablePackages() const;
 
-        // Set custom header.
+        // Set custom header. Must be set before Open to have effect.
         bool SetCustomHeader(std::optional<std::string> header);
+
+        // Set caller. Must be set before Open to have effect.
+        void SetCaller(std::string caller);
+
+        // Set authentication arguments. Must be set before Open to have effect.
+        void SetAuthenticationArguments(Authentication::AuthenticationArguments args);
+
+        // Set a custom server certificate validation callback. Must be set before Open to have effect.
+        // Return true from the callback to accept the connection, false to reject.
+        // Only invoked when the certificate pinning group policy is not configured.
+        void SetServerCertificateValidationCallback(std::function<bool(PCCERT_CONTEXT)> callback);
+
+        // Set thread globals. Must be set before Open to have effect.
+        void SetThreadGlobals(const std::shared_ptr<ThreadLocalStorage::ThreadGlobals>& threadGlobals);
+
+        // Set background update check interval.
+        void SetBackgroundUpdateInterval(TimeSpan interval);
+
+        // Indicates that we are only interested in the PackageTrackingCatalog for the source.
+        // Must be set before Open to have effect, and will prevent the underlying source from being updated or opened.
+        void InstalledPackageInformationOnly(bool value);
+
+        // Determines if this source refers to the given well known source.
+        bool IsWellKnownSource(WellKnownSource wellKnownSource) const;
 
         // Execute a search on the source.
         SearchResult Search(const SearchRequest& request) const;
@@ -250,6 +360,13 @@ namespace AppInstaller::Repository
         // Remove source. Source remove command.
         bool Remove(IProgressCallback& progress);
 
+        // Edit source. Source edit command.
+        void Edit(const SourceEdit& edits);
+
+        // Determines if this source is a valid edit of otherSource.
+        // Returns true if this source qualifies as an edit of the other source.
+        bool RequiresChanges(const SourceEdit& edits);
+
         // Gets the tracking catalog for the current source.
         PackageTrackingCatalog GetTrackingCatalog() const;
 
@@ -259,6 +376,9 @@ namespace AppInstaller::Repository
         // Get a list of all available SourceDetails.
         static std::vector<SourceDetails> GetCurrentSources();
 
+        // Get a default source type is the source type used when adding a source without specifying a type.
+        static std::string_view GetDefaultSourceType();
+
     private:
         void InitializeSourceReference(std::string_view name);
 
@@ -266,6 +386,8 @@ namespace AppInstaller::Repository
         std::shared_ptr<ISource> m_source;
         bool m_isSourceToBeAdded = false;
         bool m_isComposite = false;
-        mutable PackageTrackingCatalog m_trackingCatalog;
+        std::optional<TimeSpan> m_backgroundUpdateInterval;
+        bool m_installedPackageInformationOnly = false;
+        mutable std::shared_ptr<PackageTrackingCatalog> m_trackingCatalog;
     };
 }

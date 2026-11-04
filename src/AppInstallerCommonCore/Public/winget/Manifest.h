@@ -2,11 +2,13 @@
 // Licensed under the MIT License.
 #pragma once
 #include <AppInstallerStrings.h>
-#include <AppInstallerSHA256.h>
 #include <AppInstallerVersions.h>
+#include <winget/Hash.h>
 #include <winget/ManifestInstaller.h>
 #include <winget/ManifestLocalization.h>
 
+#include <filesystem>
+#include <utility>
 #include <vector>
 
 namespace AppInstaller::Manifest
@@ -49,7 +51,40 @@ namespace AppInstaller::Manifest
         // Gets ARP version range if declared, otherwise an empty range is returned
         Utility::VersionRange GetArpVersionRange() const;
 
+        // Get package family names across installers, Case folded.
+        std::vector<string_t> GetPackageFamilyNames() const;
+
+        // Get product codes across installers, Case folded.
+        std::vector<string_t> GetProductCodes() const;
+
+        // Get upgrade codes across installers, Case folded.
+        std::vector<string_t> GetUpgradeCodes() const;
+
+        // Get package names across localizations and installers, Case folded.
+        std::vector<string_t> GetPackageNames() const;
+
+        // Get unique, non-empty package names across localizations and installers, preserving case.
+        std::vector<string_t> GetOriginalPackageNames() const;
+
+        // Get publishers across localizations and installers, Case folded.
+        std::vector<string_t> GetPublishers() const;
+
+        // Gets name/publisher pairs with non-empty names and default fallbacks, preserving case.
+        std::vector<std::pair<string_t, string_t>> GetNameAndPublisherPairs() const;
+
         // If not empty, the SHA256 hash of the manifest stream itself.
         Utility::SHA256::HashBuffer StreamSha256;
+
+    private:
+        std::vector<string_t> GetSystemReferenceStrings(
+            std::function<const string_t& (const ManifestInstaller&)> extractStringFromInstaller = {},
+            std::function<const string_t& (const AppsAndFeaturesEntry&)> extractStringFromAppsAndFeaturesEntry = {}) const;
     };
+
+    // Creates a file system path part for the manifest in the form `<PackageIdentifier><separator><PackageVersion>`,
+    // or just `<PackageIdentifier>` when the version is unknown and the drop is requested.
+    // Manifest validation rejects values that are not safe to use in a path, but the values can also come from
+    // sources that do not go through it (for instance, installed package data), so they are sanitized here as
+    // well. Throws if the result would point outside of the directory that it is used in.
+    std::filesystem::path GetPathPart(const Manifest& manifest, char separator = '.', bool dropUnknownVersion = false);
 }

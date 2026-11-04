@@ -1,49 +1,54 @@
-﻿// Copyright (c) Microsoft Corporation.
+// Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
-#define CATCH_CONFIG_RUNNER
-#include <catch.hpp>
-#include <winrt/Windows.Foundation.h>
-#include <iostream>
-#include <string>
-#include <vector>
-
-#include <Public/AppInstallerLogging.h>
+#include "pch.h"
+#include <AppInstallerLogging.h>
+#include <AppInstallerFileLogger.h>
 #include <Public/AppInstallerTelemetry.h>
 #include <Telemetry/TraceLogging.h>
-
+#include <winget/Debugging.h>
 #include "TestCommon.h"
-#include "TestHooks.h"
+#include "TestSettings.h"
 
 using namespace winrt;
-using namespace Windows::Foundation;
+using namespace winrt::Windows::Foundation;
 using namespace std::string_literals;
 using namespace AppInstaller;
 
 
 // Logs the AppInstaller log target to break up individual tests
-struct LoggingBreakListener : public Catch::TestEventListenerBase
+struct LoggingBreakListener : public Catch::EventListenerBase
 {
-    using TestEventListenerBase::TestEventListenerBase;
+    using EventListenerBase::EventListenerBase;
 
     void testCaseStarting(const Catch::TestCaseInfo& info) override
     {
-        Catch::TestEventListenerBase::testCaseStarting(info);
+        Catch::EventListenerBase::testCaseStarting(info);
         AICLI_LOG(Test, Info, << "========== Test Case Begins :: " << info.name << " ==========");
         TestCommon::TempFile::SetTestFailed(false);
     }
 
     void testCaseEnded(const Catch::TestCaseStats& testCaseStats) override
     {
-        AICLI_LOG(Test, Info, << "========== Test Case Ends :: " << currentTestCaseInfo->name << " ==========");
+        AICLI_LOG(Test, Info, << "========== Test Case Ends ==========");
         if (!testCaseStats.totals.delta(lastTotals).testCases.allOk())
         {
             TestCommon::TempFile::SetTestFailed(true);
+            if (testCaseStats.testInfo)
+            {
+                GetFailedTests().push_back(testCaseStats.testInfo->name);
+            }
         }
         lastTotals = testCaseStats.totals;
-        Catch::TestEventListenerBase::testCaseEnded(testCaseStats);
+        Catch::EventListenerBase::testCaseEnded(testCaseStats);
     }
 
     Catch::Totals lastTotals{};
+
+    static std::vector<std::string>& GetFailedTests()
+    {
+        static std::vector<std::string> failedTests;
+        return failedTests;
+    }
 };
 CATCH_REGISTER_LISTENER(LoggingBreakListener);
 
@@ -72,9 +77,18 @@ int main(int argc, char** argv)
 {
     init_apartment();
 
+    // Enable ProcessRedirectionTrustPolicy to match the MSIX packaged process context in which
+    // WinGet runs in production. This policy causes Windows to block traversal of user-created
+    // symlinks (e.g. via weakly_canonical), so enabling it here surfaces bugs that would only
+    // manifest in the real product environment. The policy is one-way; it cannot be reversed.
+    PROCESS_MITIGATION_REDIRECTION_TRUST_POLICY redirectionPolicy{};
+    redirectionPolicy.EnforceRedirectionTrust = 1;
+    SetProcessMitigationPolicy(ProcessRedirectionTrustPolicy, &redirectionPolicy, sizeof(redirectionPolicy));
+
     bool hasSetTestDataBasePath = false;
     bool waitBeforeReturn = false;
     bool keepSQLLogging = false;
+    bool printSummary = false;
 
     std::vector<char*> args;
     for (int i = 0; i < argc; ++i)
@@ -89,17 +103,22 @@ int main(int argc, char** argv)
         }
         else if ("-log"s == argv[i])
         {
-            Logging::AddFileLogger();
+            auto logger = std::make_unique<Logging::FileLogger>();
+            logger->SetMaximumSize(0);
+            Logging::Log().AddLogger(std::move(logger));
         }
         else if ("-logto"s == argv[i])
         {
-            ++i;
-            Logging::AddFileLogger(std::filesystem::path{ argv[i] });
+            if (++i < argc)
+            {
+                auto logger = std::make_unique<Logging::FileLogger>(std::filesystem::path{ argv[i] });
+                logger->SetMaximumSize(0);
+                Logging::Log().AddLogger(std::move(logger));
+            }
         }
         else if ("-tdd"s == argv[i])
         {
-            ++i;
-            if (i < argc)
+            if (++i < argc)
             {
                 TestCommon::TestDataFile::SetTestDataBasePath(argv[i]);
                 hasSetTestDataBasePath = true;
@@ -112,6 +131,21 @@ int main(int argc, char** argv)
         else if ("-logsql"s == argv[i])
         {
             keepSQLLogging = true;
+        }
+        else if ("-mdmp"s == argv[i])
+        {
+            Debugging::EnableSelfInitiatedMinidump();
+        }
+        else if ("-mdmpto"s == argv[i])
+        {
+            if (++i < argc)
+            {
+                Debugging::EnableSelfInitiatedMinidump(std::filesystem::path{ argv[i] });
+            }
+        }
+        else if ("-summary"s == argv[i])
+        {
+            printSummary = true;
         }
         else
         {
@@ -136,7 +170,7 @@ int main(int argc, char** argv)
     // Disable SQL by default, as it generates 10s of MBs of log file and
     // increases the full test run time by 60% or more.
     // By not creating a log target, it will all be thrown away.
-    Logging::Log().EnableChannel(Logging::Channel::All);
+    Logging::Log().SetEnabledChannels(Logging::Channel::All);
     if (!keepSQLLogging)
     {
         Logging::Log().DisableChannel(Logging::Channel::SQL);
@@ -149,15 +183,21 @@ int main(int argc, char** argv)
     // Forcibly enable event writing to catch bugs in that code
     g_IsTelemetryProviderEnabled = true;
 
-    // Force all tests to run against settings inside this container.
-    // This prevents test runs from trashing the users actual settings.
-    Runtime::TestHook_SetPathOverride(Runtime::PathName::LocalState, Runtime::GetPathTo(Runtime::PathName::LocalState) / "Tests");
-    Runtime::TestHook_SetPathOverride(Runtime::PathName::UserFileSettings, Runtime::GetPathTo(Runtime::PathName::UserFileSettings) / "Tests");
-    Runtime::TestHook_SetPathOverride(Runtime::PathName::StandardSettings, Runtime::GetPathTo(Runtime::PathName::StandardSettings) / "Tests");
-    Runtime::TestHook_SetPathOverride(Runtime::PathName::SecureSettingsForRead, Runtime::GetPathTo(Runtime::PathName::StandardSettings) / "WinGet_SecureSettings_Tests");
-    Runtime::TestHook_SetPathOverride(Runtime::PathName::SecureSettingsForWrite, Runtime::GetPathDetailsFor(Runtime::PathName::SecureSettingsForRead));
+    TestCommon::SetTestPathOverrides();
+
+    // Remove any existing settings files in the new tests path
+    TestCommon::UserSettingsFileGuard settingsGuard;
 
     int result = Catch::Session().run(static_cast<int>(args.size()), args.data());
+
+    if (printSummary)
+    {
+        std::cout << "\nFailed tests:\n";
+        for (const auto& test : LoggingBreakListener::GetFailedTests())
+        {
+            std::cout << "  " << test << "\n";
+        }
+    }
 
     if (waitBeforeReturn)
     {
